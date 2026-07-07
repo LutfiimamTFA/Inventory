@@ -1,0 +1,113 @@
+rules_version = '2';
+
+// Firestore rules AssetView.
+// Berjalan di project Firebase HRP yang sama. Rules ini HANYA menambah
+// aturan untuk collection AssetView (assets, asset_categories, asset_users, dst)
+// dan TIDAK mengubah/menghapus aturan collection HRP yang sudah ada — gabungkan
+// blok match di bawah ini ke dalam firestore.rules HRP yang sudah berjalan,
+// jangan menimpanya.
+//
+// AssetView bersifat mandiri: akses & role ditentukan sepenuhnya dari
+// collection asset_users, BUKAN dari data karyawan HRP. HRP hanya dipakai
+// sebagai sumber Firebase Auth (project yang sama).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Daftar email bootstrap Super Admin pertama AssetView.
+    // WAJIB disamakan dengan NEXT_PUBLIC_ASSETVIEW_SUPER_ADMIN_EMAILS di .env.local.
+    function isBootstrapSuperAdminEmail() {
+      return request.auth.token.email in [
+        "super_admin@gmail.com"
+      ];
+    }
+
+    function assetUserDoc() {
+      return get(/databases/$(database)/documents/asset_users/$(request.auth.uid)).data;
+    }
+
+    function isActiveAssetUser() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/asset_users/$(request.auth.uid)) &&
+        assetUserDoc().status == "active";
+    }
+
+    function isSuperAdmin() {
+      return isActiveAssetUser() && assetUserDoc().role == "super_admin";
+    }
+
+    function isAssetAdmin() {
+      return isActiveAssetUser() && assetUserDoc().role == "asset_admin";
+    }
+
+    function isManager() {
+      return isSuperAdmin() || isAssetAdmin();
+    }
+
+    // asset_users: sumber tunggal role & status akses AssetView.
+    match /asset_users/{uid} {
+      allow read: if isActiveAssetUser();
+      // Bootstrap: user boleh membuat dokumennya sendiri sebagai super_admin
+      // HANYA saat dokumen belum ada dan emailnya ada di daftar bootstrap.
+      allow create: if isSignedIn() && uid == request.auth.uid &&
+        !exists(/databases/$(database)/documents/asset_users/$(uid)) &&
+        isBootstrapSuperAdminEmail() &&
+        request.resource.data.role == "super_admin" &&
+        request.resource.data.status == "active";
+      // Super Admin boleh membuat/mengubah dokumen user lain (Tambah User,
+      // ubah role, aktif/nonaktif). User biasa hanya boleh update lastLoginAt
+      // miliknya sendiri.
+      allow create, update: if isSuperAdmin() ||
+        (isActiveAssetUser() && uid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["lastLoginAt"]));
+      allow delete: if false;
+    }
+
+    match /asset_user_logs/{logId} {
+      allow read: if isSuperAdmin();
+      allow create: if isSuperAdmin();
+      allow update, delete: if false;
+    }
+
+    // employee_profiles / usersdev / users: hanya dipakai untuk dropdown
+    // "Penanggung Jawab" di form aset, read-only, TIDAK dipakai untuk auth/role.
+    match /{employeeCollection}/{uid} {
+      allow read: if isActiveAssetUser() &&
+        employeeCollection in ["employee_profiles", "usersdev", "users"];
+      allow write: if false;
+    }
+
+    match /asset_categories/{categoryId} {
+      allow read: if isActiveAssetUser();
+      allow write: if isManager();
+    }
+
+    match /assets/{assetId} {
+      allow read: if isActiveAssetUser();
+      allow create, update: if isManager() ||
+        (isActiveAssetUser() &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(["assetStatus", "condition", "currentBorrowingId",
+                      "currentBorrowerUid", "currentBorrowerName", "updatedAt"]));
+      allow delete: if isSuperAdmin();
+    }
+
+    match /asset_borrowings/{borrowingId} {
+      allow read: if isActiveAssetUser();
+      allow create: if isActiveAssetUser() &&
+        request.resource.data.borrowedByUid == request.auth.uid;
+      allow update: if isManager() ||
+        (isActiveAssetUser() && resource.data.borrowedByUid == request.auth.uid);
+      allow delete: if isSuperAdmin();
+    }
+
+    match /asset_logs/{logId} {
+      allow read: if isActiveAssetUser();
+      allow create: if isActiveAssetUser();
+      allow update, delete: if false;
+    }
+  }
+}
