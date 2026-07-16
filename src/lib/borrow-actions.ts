@@ -7,7 +7,37 @@ import {
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { Asset, AssetCondition } from "@/lib/types";
-import { writeAssetLog } from "@/lib/firestore-helpers";
+import { fetchActiveUsersByRoles, writeAssetLog } from "@/lib/firestore-helpers";
+import { createAssetNotification } from "@/lib/notifications";
+
+async function notifyManagers(params: {
+  title: string;
+  message: string;
+  type: "asset_borrowed" | "asset_returned";
+  relatedId: string;
+  createdByUid?: string;
+  createdByName?: string;
+}) {
+  const managers = await fetchActiveUsersByRoles(["asset_admin", "super_admin"]);
+  await Promise.all(
+    managers.map((m) =>
+      createAssetNotification({
+        recipientUid: m.uid,
+        recipientName: m.name,
+        recipientRole: m.role,
+        title: params.title,
+        message: params.message,
+        type: params.type,
+        priority: "low",
+        linkUrl: `/borrowings`,
+        relatedType: "borrowing",
+        relatedId: params.relatedId,
+        createdByUid: params.createdByUid,
+        createdByName: params.createdByName,
+      })
+    )
+  );
+}
 
 export async function borrowAsset(params: {
   asset: Asset;
@@ -50,6 +80,15 @@ export async function borrowAsset(params: {
     userUid,
     userName,
     detail: borrowNotes || "Aset dipinjam",
+  });
+
+  await notifyManagers({
+    title: "Asset Dipinjam",
+    message: `${userName} meminjam ${asset.assetName}.`,
+    type: "asset_borrowed",
+    relatedId: borrowingRef.id,
+    createdByUid: userUid,
+    createdByName: userName,
   });
 
   return borrowingRef.id;
@@ -95,5 +134,14 @@ export async function returnAsset(params: {
     userUid,
     userName,
     detail: returnNotes || "Aset dikembalikan",
+  });
+
+  await notifyManagers({
+    title: "Asset Dikembalikan",
+    message: `${userName} mengembalikan ${asset.assetName}.`,
+    type: "asset_returned",
+    relatedId: asset.currentBorrowingId,
+    createdByUid: userUid,
+    createdByName: userName,
   });
 }

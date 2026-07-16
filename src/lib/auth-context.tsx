@@ -48,6 +48,24 @@ function isPermissionDenied(err: unknown): boolean {
   );
 }
 
+async function safeGetDoc(label: string, ref: ReturnType<typeof doc>) {
+  try {
+    console.log(`[Auth SafeGet] START ${label}`, ref.path);
+    const snap = await getDoc(ref);
+    console.log(`[Auth SafeGet] SUCCESS ${label}`, {
+      path: ref.path,
+      exists: snap.exists(),
+    });
+    return snap;
+  } catch (error) {
+    console.error(`[Auth SafeGet] ERROR ${label}`, {
+      path: ref.path,
+      error,
+    });
+    return null;
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [assetUser, setAssetUser] = useState<AssetUser | null>(null);
@@ -77,10 +95,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       try {
         const ref = doc(db, "asset_users", user.uid);
-        const snap = await getDoc(ref);
-        console.debug("[AssetView Auth] asset_users exists", snap.exists());
+        const snap = await safeGetDoc("asset_users current user", ref);
+        console.debug("[AssetView Auth] asset_users exists", !!snap?.exists());
 
-        if (snap.exists()) {
+        if (snap?.exists()) {
           const data = snap.data() as Omit<AssetUser, "uid">;
 
           if (data.status !== "active") {
@@ -147,8 +165,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           createdAt: now,
           updatedAt: now,
         });
-        const createdSnap = await getDoc(ref);
-        const createdData = createdSnap.data() as Omit<AssetUser, "uid">;
+        const createdSnap = await safeGetDoc("asset_users bootstrap created user", ref);
+        const createdData = createdSnap?.data() as Omit<AssetUser, "uid"> | undefined;
+        if (!createdData) {
+          setAssetUser(null);
+          setRole(null);
+          setAccessDenied(true);
+          setAccessDeniedReason("Gagal membuat akses bootstrap AssetView.");
+          return;
+        }
         setAssetUser({ uid: user.uid, ...createdData });
         setRole(createdData.role);
         console.debug("[AssetView Auth] final role", createdData.role);

@@ -13,6 +13,7 @@ import { Search, ShieldCheck, ShieldOff, Power, Users, RefreshCw } from "lucide-
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { AppRole, AssetUser } from "@/lib/types";
+import { ROLE_BADGE_COLOR, ROLE_LABEL } from "@/lib/roles";
 import { writeAssetUserLog } from "@/lib/firestore-helpers";
 import { fetchAllActiveHrpEmployees, HrpEmployeeInfo } from "@/lib/hrp";
 import { formatDate } from "@/lib/utils";
@@ -22,18 +23,6 @@ import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 import ConfirmModal from "@/components/ConfirmModal";
 import { Toast, ToastState } from "@/components/Toast";
-
-const ROLE_LABEL: Record<AppRole, string> = {
-  super_admin: "Super Admin",
-  asset_admin: "Asset Admin",
-  staff: "Staff",
-};
-
-const ROLE_BADGE_COLOR: Record<AppRole, string> = {
-  super_admin: "bg-purple-50 text-purple-700 border-purple-200",
-  asset_admin: "bg-blue-50 text-blue-700 border-blue-200",
-  staff: "bg-slate-100 text-slate-500 border-slate-200",
-};
 
 // Baris gabungan: satu karyawan HRP aktif + status role AssetView-nya
 // (atau akun bootstrap Super Admin eksternal yang tidak terdaftar di HRP).
@@ -177,7 +166,9 @@ export default function AccessPage() {
 
   const counters = {
     total: rows.length,
+    superAdmin: rows.filter((r) => r.role === "super_admin").length,
     assetAdmin: rows.filter((r) => r.role === "asset_admin").length,
+    itTeam: rows.filter((r) => r.role === "it_team").length,
     staff: rows.filter((r) => r.role === "staff").length,
     inactive: rows.filter((r) => !r.isDefaultStaff && r.effectiveStatus === "inactive").length,
   };
@@ -239,10 +230,7 @@ export default function AccessPage() {
         });
         setToast({
           type: "success",
-          message:
-            pending.newRole === "asset_admin"
-              ? "User berhasil dijadikan Asset Admin."
-              : "User berhasil dijadikan Staff.",
+          message: `User berhasil dijadikan ${ROLE_LABEL[pending.newRole]}.`,
         });
       } else {
         await upsertAssetUser(pending.target, {
@@ -283,7 +271,7 @@ export default function AccessPage() {
     <ProtectedLayout>
       <PageHeader
         title="User Access"
-        subtitle="Tunjuk karyawan HRP mana yang menjadi Asset Admin di AssetView."
+        subtitle="Kelola akses Super Admin, Asset Admin/QHSE, Tim IT, dan Staff di AssetView."
         actions={
           <button
             type="button"
@@ -297,9 +285,11 @@ export default function AccessPage() {
         }
       />
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-5">
         <CounterCard label="Total Karyawan Aktif" value={counters.total} />
+        <CounterCard label="Super Admin" value={counters.superAdmin} tone="purple" />
         <CounterCard label="Asset Admin" value={counters.assetAdmin} tone="blue" />
+        <CounterCard label="Tim IT" value={counters.itTeam} tone="emerald" />
         <CounterCard label="Staff" value={counters.staff} tone="slate" />
         <CounterCard label="Inactive" value={counters.inactive} tone="red" />
       </div>
@@ -325,6 +315,7 @@ export default function AccessPage() {
           <option value="">Semua Role</option>
           <option value="super_admin">Super Admin</option>
           <option value="asset_admin">Asset Admin</option>
+          <option value="it_team">Tim IT</option>
           <option value="staff">Staff</option>
         </select>
         <select
@@ -381,8 +372,14 @@ export default function AccessPage() {
                 {filtered.map((r) => {
                   const isSelf = r.uid === currentUser?.uid;
                   const isSelfSuperAdmin = isSelf && r.role === "super_admin";
-                  const canToggleRole =
-                    (r.role === "staff" || r.role === "asset_admin") && !isSelfSuperAdmin;
+                  const roleActions: AppRole[] =
+                    r.role === "staff"
+                      ? ["asset_admin", "it_team"]
+                      : r.role === "asset_admin"
+                      ? ["staff", "it_team"]
+                      : r.role === "it_team"
+                      ? ["staff", "asset_admin"]
+                      : [];
                   const canToggleStatus = !isSelfSuperAdmin && !isSelf;
                   const statusLabel = r.isDefaultStaff
                     ? "Default Staff"
@@ -428,26 +425,23 @@ export default function AccessPage() {
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex items-center justify-end gap-2 flex-wrap">
-                          {canToggleRole && (
+                          {roleActions.map((newRole) => (
                             <button
+                              key={newRole}
                               type="button"
                               onClick={() =>
                                 setPending({
                                   type: "role",
                                   target: r,
-                                  newRole: r.role === "staff" ? "asset_admin" : "staff",
+                                  newRole,
                                 })
                               }
-                              className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
-                                r.role === "staff"
-                                  ? "text-blue-600 hover:bg-blue-50 active:bg-blue-100"
-                                  : "text-slate-600 hover:bg-slate-100 active:bg-slate-200"
-                              }`}
+                              className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-slate-600 cursor-pointer transition-colors hover:bg-slate-100 active:bg-slate-200"
                             >
                               <ShieldCheck size={14} />
-                              {r.role === "staff" ? "Jadikan Asset Admin" : "Jadikan Staff"}
+                              Jadikan {ROLE_LABEL[newRole]}
                             </button>
-                          )}
+                          ))}
                           {canToggleStatus && (
                             <button
                               type="button"
@@ -513,11 +507,13 @@ function CounterCard({
 }: {
   label: string;
   value: number;
-  tone?: "slate" | "blue" | "red";
+  tone?: "slate" | "blue" | "emerald" | "purple" | "red";
 }) {
   const toneClass = {
     slate: "text-slate-800",
     blue: "text-blue-600",
+    emerald: "text-emerald-600",
+    purple: "text-purple-600",
     red: "text-red-600",
   }[tone];
 

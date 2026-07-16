@@ -43,8 +43,97 @@ service cloud.firestore {
       return isActiveAssetUser() && assetUserDoc().role == "asset_admin";
     }
 
+    function isAssetViewSuperAdmin() {
+      return isSuperAdmin();
+    }
+
+    function isAssetViewAssetAdmin() {
+      return isAssetAdmin();
+    }
+
+    function isAssetViewItTeam() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/asset_users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/asset_users/$(request.auth.uid)).data.role == "it_team"
+        && get(/databases/$(database)/documents/asset_users/$(request.auth.uid)).data.status == "active";
+    }
+
+    function isAssetBootstrapSuperAdminEmail() {
+      return isBootstrapSuperAdminEmail();
+    }
+
+    function isAssetQhseAdmin() {
+      return isAssetViewAssetAdmin() || isAssetAdmin();
+    }
+
     function isManager() {
       return isSuperAdmin() || isAssetAdmin();
+    }
+
+    function canViewAssetMaintenance() {
+      return isAssetViewSuperAdmin()
+        || isAssetQhseAdmin()
+        || isAssetViewItTeam()
+        || isAssetBootstrapSuperAdminEmail();
+    }
+
+    function canEditMaintenanceSchedule() {
+      return isAssetQhseAdmin()
+        || isAssetViewSuperAdmin()
+        || isAssetBootstrapSuperAdminEmail();
+    }
+
+    function isAssignedMaintenanceTechnician(data) {
+      return isSignedIn()
+        && isAssetViewItTeam()
+        && (
+          data.get("assignedToUid", "") == request.auth.uid ||
+          data.get("technicianUid", "") == request.auth.uid
+        );
+    }
+
+    function isTechnicianMaintenanceUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+
+      return isAssignedMaintenanceTechnician(resource.data)
+        && changed.hasOnly([
+          "status",
+
+          "acceptedAt",
+          "acceptedByUid",
+          "acceptedByName",
+
+          "plannedWorkDate",
+          "plannedStartTime",
+          "plannedEndTime",
+          "plannedNote",
+          "willInterruptUser",
+          "scheduledByItAt",
+          "scheduledByItUid",
+          "scheduledByItName",
+
+          "startedAt",
+          "startedByUid",
+          "startedByName",
+
+          "report",
+          "reportNote",
+          "reportSummary",
+          "reportSubmittedAt",
+          "reportSubmittedByUid",
+          "reportSubmittedByName",
+
+          "previousStatus",
+          "reopenedAt",
+          "reopenedByUid",
+          "reopenedByName",
+          "reopenReason",
+          "retryCount",
+
+          "updatedAt",
+          "updatedByUid",
+          "updatedByName"
+        ]);
     }
 
     // asset_users: sumber tunggal role & status akses AssetView.
@@ -85,13 +174,23 @@ service cloud.firestore {
       allow write: if isManager();
     }
 
+    // asset_locations: Master Lokasi (Gedung/Lantai/Ruangan/Area). Super
+    // Admin & Asset Admin/QHSE boleh create/update; hanya Super Admin boleh
+    // hapus (UI sendiri tidak menyediakan hard delete, hanya nonaktifkan).
+    match /asset_locations/{locationId} {
+      allow read: if isActiveAssetUser();
+      allow create, update: if isManager();
+      allow delete: if isSuperAdmin();
+    }
+
     match /assets/{assetId} {
       allow read: if isActiveAssetUser();
       allow create, update: if isManager() ||
         (isActiveAssetUser() &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(["assetStatus", "condition", "currentBorrowingId",
-                      "currentBorrowerUid", "currentBorrowerName", "updatedAt"]));
+                      "currentBorrowerUid", "currentBorrowerName",
+                      "lastMaintenanceAt", "nextMaintenanceAt", "updatedAt"]));
       allow delete: if isSuperAdmin();
     }
 
@@ -107,6 +206,93 @@ service cloud.firestore {
     match /asset_logs/{logId} {
       allow read: if isActiveAssetUser();
       allow create: if isActiveAssetUser();
+      allow update, delete: if false;
+    }
+
+    // asset_issue_tickets: laporan kendala dari Scan QR (staff) sampai ditangani
+    // Tim IT. Staff hanya boleh membuat tiket miliknya sendiri
+    // dan membaca semua tiket (dibatasi query "reportedByUid == uid" di client
+    // untuk /my-reports); status/diagnosa hanya boleh diubah oleh manager.
+    match /asset_issue_tickets/{ticketId} {
+      allow read: if isActiveAssetUser();
+      allow create: if isActiveAssetUser() &&
+        request.resource.data.reportedByUid == request.auth.uid;
+      allow update: if isManager() || isAssetViewItTeam();
+      allow delete: if false;
+    }
+
+    match /asset_issue_logs/{logId} {
+      allow read: if isActiveAssetUser();
+      allow create: if isActiveAssetUser();
+      allow update, delete: if false;
+    }
+
+    // asset_maintenance_work_orders: jadwal dibuat oleh Asset Admin/QHSE,
+    // dikerjakan oleh Tim IT yang menjadi assignedToUid.
+    match /asset_maintenance_work_orders/{workOrderId} {
+      allow get, list: if canViewAssetMaintenance();
+
+      allow create: if canEditMaintenanceSchedule();
+
+      allow update: if canEditMaintenanceSchedule()
+        || isTechnicianMaintenanceUpdate();
+
+      allow delete: if canEditMaintenanceSchedule();
+
+      match /items/{itemId} {
+        allow get, list: if canViewAssetMaintenance();
+
+        allow create, update: if canEditMaintenanceSchedule()
+          || isAssignedMaintenanceTechnician(
+            get(/databases/$(database)/documents/asset_maintenance_work_orders/$(workOrderId)).data
+          );
+
+        allow delete: if canEditMaintenanceSchedule();
+      }
+    }
+
+    // collectionGroup(db, "items") dipakai halaman Maintenance & Reports
+    // untuk membaca item work order lintas dokumen parent.
+    match /{path=**}/items/{itemId} {
+      allow get, list: if canViewAssetMaintenance();
+      allow create, update, delete: if false;
+    }
+
+    match /asset_maintenance_work_order_logs/{logId} {
+      allow read: if canViewAssetMaintenance();
+      allow create: if canViewAssetMaintenance();
+      allow update, delete: if false;
+    }
+
+    // asset_notifications: siapa saja yang aktif boleh membuat notifikasi
+    // (staff lapor kendala men-trigger notifikasi ke QHSE, dst). Recipient
+    // hanya boleh membaca/menandai-dibaca notifikasi miliknya sendiri.
+    match /asset_notifications/{notificationId} {
+      allow get, list: if isActiveAssetUser() && (
+        resource.data.recipientUid == request.auth.uid ||
+        (canViewAssetMaintenance() && resource.data.keys().hasAny(["dedupeKey"]))
+      );
+      allow create: if isActiveAssetUser();
+      allow update: if isActiveAssetUser() &&
+        resource.data.recipientUid == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["isRead", "readAt"]);
+      allow delete: if isSuperAdmin();
+    }
+
+    // asset_notification_tokens: token push milik masing-masing user, tidak
+    // boleh dibaca/diubah user lain. Super Admin boleh list untuk debugging.
+    match /asset_notification_tokens/{tokenId} {
+      allow read: if isSuperAdmin() ||
+        (isActiveAssetUser() && resource.data.uid == request.auth.uid);
+      allow create: if isActiveAssetUser() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isActiveAssetUser() && resource.data.uid == request.auth.uid;
+    }
+
+    // asset_report_snapshots: snapshot bulanan Reports & Analytics, dibuat
+    // oleh Super Admin/Asset Admin dari halaman /reports.
+    match /asset_report_snapshots/{snapshotId} {
+      allow read: if isActiveAssetUser();
+      allow create: if isManager();
       allow update, delete: if false;
     }
   }

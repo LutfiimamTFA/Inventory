@@ -9,6 +9,7 @@ import { db, EMPLOYEE_PROFILES_COLLECTION } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import {
   AssetCategory,
+  AssetLocationNode,
   AssetStatus,
   AssetCondition,
   DriveUploadResult,
@@ -24,6 +25,7 @@ import {
   isAssetCodeTaken,
   writeAssetLog,
 } from "@/lib/firestore-helpers";
+import { buildFullPath } from "@/lib/locations";
 import {
   ASSET_STATUS_HELPER,
   ASSET_STATUS_LABEL,
@@ -36,6 +38,10 @@ import { FormSection, Field } from "@/components/FormSection";
 import Toggle from "@/components/Toggle";
 import CurrencyInput from "@/components/CurrencyInput";
 import SearchableSelect, { SearchableSelectItem } from "@/components/SearchableSelect";
+import LocationCascadeFields, {
+  EMPTY_LOCATION_SELECTION,
+  LocationSelection,
+} from "@/components/LocationCascadeFields";
 import FileUploadField from "@/components/FileUploadField";
 import { Toast, ToastState } from "@/components/Toast";
 
@@ -110,7 +116,10 @@ export default function NewAssetPage() {
   // B. Kepemilikan & Lokasi
   const [companyOwnerId, setCompanyOwnerId] = useState("");
   const [divisionOwnerId, setDivisionOwnerId] = useState("");
-  const [location, setLocation] = useState("");
+  const [locations, setLocations] = useState<AssetLocationNode[]>([]);
+  const [locationSelection, setLocationSelection] = useState<LocationSelection>(
+    EMPTY_LOCATION_SELECTION
+  );
   const [responsiblePersonUid, setResponsiblePersonUid] = useState("");
   const [ownershipStatus, setOwnershipStatus] =
     useState<OwnershipStatus>("Aset Perusahaan");
@@ -159,6 +168,17 @@ export default function NewAssetPage() {
         snap.docs
           .map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
           .filter((c) => c.status === "active")
+      );
+    });
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "asset_locations"), (snap) => {
+      setLocations(
+        snap.docs
+          .map((d) => ({ id: d.id, ...d.data() } as AssetLocationNode))
+          .filter((n) => n.status === "active")
       );
     });
     return () => unsub();
@@ -262,7 +282,9 @@ export default function NewAssetPage() {
     if (!brand.trim()) errors.brand = "Merk wajib diisi.";
     if (!model.trim()) errors.model = "Model/Tipe wajib diisi.";
     if (!companyOwnerId) errors.companyOwnerId = "Perusahaan/Brand wajib dipilih.";
-    if (!location.trim()) errors.location = "Lokasi wajib diisi.";
+    if (!locationSelection.buildingId) errors.location = "Gedung wajib dipilih.";
+    else if (!locationSelection.floorId) errors.location = "Lantai wajib dipilih.";
+    else if (!locationSelection.roomId) errors.location = "Ruangan wajib dipilih.";
     if (!ownershipStatus) errors.ownershipStatus = "Status kepemilikan wajib dipilih.";
     if (!assetStatus) errors.assetStatus = "Status aset wajib dipilih.";
     if (!condition) errors.condition = "Kondisi aset wajib dipilih.";
@@ -303,6 +325,13 @@ export default function NewAssetPage() {
       };
       console.debug("[Asset Save] payload photo fields:", photoFields);
 
+      const assetLocationText = buildFullPath({
+        buildingName: locationSelection.buildingName,
+        floorName: locationSelection.floorName,
+        roomName: locationSelection.roomName,
+        areaName: locationSelection.areaName,
+      });
+
       const docRef = await addDoc(collection(db, "assets"), {
         assetName: assetName.trim(),
         assetCode: assetCode.trim(),
@@ -320,7 +349,22 @@ export default function NewAssetPage() {
         companyOwnerName: companyOwner?.name || "",
         divisionOwnerId: divisionOwnerId || null,
         divisionOwnerName: divisionOwner?.name || "",
-        location: location.trim(),
+        location: assetLocationText,
+        buildingId: locationSelection.buildingId || null,
+        buildingName: locationSelection.buildingName || "",
+        floorId: locationSelection.floorId || null,
+        floor: locationSelection.floorName || "",
+        roomId: locationSelection.roomId || null,
+        roomName: locationSelection.roomName || "",
+        areaId: locationSelection.areaId || null,
+        areaName: locationSelection.areaName || "",
+        locationId:
+          locationSelection.areaId ||
+          locationSelection.roomId ||
+          locationSelection.floorId ||
+          locationSelection.buildingId ||
+          null,
+        locationText: assetLocationText,
         responsiblePersonUid: responsiblePersonUid || null,
         responsiblePersonName: responsiblePerson?.name || "",
         responsiblePersonEmail: responsiblePerson?.email || "",
@@ -561,14 +605,19 @@ export default function NewAssetPage() {
                     ))}
                   </select>
                 </Field>
-                <Field label="Lokasi" required error={fieldErrors.location}>
-                  <input
-                    value={location}
-                    onChange={(e) => setLocation(e.target.value)}
-                    className="input"
-                    placeholder="mis. Kantor Pusat Lt. 2"
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                    Lokasi Asset <span className="text-red-500">*</span>
+                  </label>
+                  <LocationCascadeFields
+                    locations={locations}
+                    value={locationSelection}
+                    onChange={setLocationSelection}
                   />
-                </Field>
+                  {fieldErrors.location && (
+                    <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
+                  )}
+                </div>
                 <Field label="Penanggung Jawab">
                   <SearchableSelect
                     items={employeeItems}

@@ -1,10 +1,16 @@
 import { DriveUploadResult } from "@/lib/types";
 
-export type DriveUploadType = "asset_photo" | "invoice";
+export type DriveUploadType =
+  | "asset_photo"
+  | "invoice"
+  | "issue_attachment"
+  | "maintenance_photo";
 
 const FOLDER_BY_TYPE: Record<DriveUploadType, string> = {
   asset_photo: "assetview/assets",
   invoice: "assetview/invoices",
+  issue_attachment: "assetview/issue-tickets",
+  maintenance_photo: "assetview/maintenance",
 };
 
 export function uploadToDrive(

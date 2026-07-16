@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { QRCodeCanvas } from "qrcode.react";
-import { Download, Printer, X, Copy, Check } from "lucide-react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { QRCodeSVG } from "qrcode.react";
+import { Download, Printer, X, Copy, Check, ChevronLeft, ChevronRight } from "lucide-react";
 import { toPng } from "html-to-image";
 import { Asset } from "@/lib/types";
 import {
@@ -20,13 +20,19 @@ const LABEL_SIZES = {
 
 type LabelSizeKey = keyof typeof LABEL_SIZES | "custom";
 type PrintMode = "single" | "a4";
+type Orientation = "portrait" | "landscape";
 
-const PX_PER_MM = 3.78; // referensi ~96dpi untuk preview di layar
+const SCREEN_DPI = 96;
+const EXPORT_DPI = 300;
+const PX_PER_MM = SCREEN_DPI / 25.4; // referensi 96dpi untuk preview di layar
 
-const A4_WIDTH_MM = 210;
-const A4_HEIGHT_MM = 297;
-const A4_PADDING_MM = 10;
-const A4_GAP_MM = 4;
+const A4_LONG_MM = 297;
+const A4_SHORT_MM = 210;
+
+const MARGIN_PRESETS = { "0": 0, "5": 5, "10": 10 } as const;
+type MarginPresetKey = keyof typeof MARGIN_PRESETS | "custom";
+const GAP_PRESETS = { "0": 0, "2": 2, "4": 4 } as const;
+type GapPresetKey = keyof typeof GAP_PRESETS | "custom";
 
 const A4_PREVIEW_MAX_WIDTH_PX = 340;
 
@@ -35,19 +41,61 @@ const CUSTOM_WIDTH_MAX = 150;
 const CUSTOM_HEIGHT_MIN = 20;
 const CUSTOM_HEIGHT_MAX = 100;
 
+const LABEL_COUNT_MIN = 1;
+const LABEL_COUNT_MAX = 500;
+
+const OFFSCREEN_EXPORT_STYLE: CSSProperties = {
+  position: "fixed",
+  left: -10000,
+  top: 0,
+  zIndex: -1,
+  pointerEvents: "none",
+  backgroundColor: "#ffffff",
+};
+
+function mmToPx(mm: number, dpi = EXPORT_DPI) {
+  return Math.round((mm / 25.4) * dpi);
+}
+
+function scaleScreenPx(px: number, dpi = EXPORT_DPI) {
+  return Math.max(1, Math.round((px / SCREEN_DPI) * dpi));
+}
+
+function getQrLogoImageSettings(qrPixelSize: number) {
+  const logoSize = Math.round(qrPixelSize * 0.18);
+  return {
+    src: "/logo.png",
+    height: logoSize,
+    width: logoSize,
+    excavate: true,
+  };
+}
+
+function getLabelQrSizeMm(labelWidthMm: number, labelHeightMm: number) {
+  const availableAfterTextMm = Math.max(10, labelHeightMm - 10);
+  return Math.max(
+    12,
+    Math.min(Math.min(labelWidthMm, labelHeightMm) * 0.62, availableAfterTextMm)
+  );
+}
+
 function QrLabelContent({
   asset,
   qrValue,
   qrPixelSize,
   nameClassName,
   codeClassName,
+  nameStyle,
+  codeStyle,
   gap = 6,
 }: {
   asset: Asset;
   qrValue: string;
   qrPixelSize: number;
-  nameClassName: string;
-  codeClassName: string;
+  nameClassName?: string;
+  codeClassName?: string;
+  nameStyle?: CSSProperties;
+  codeStyle?: CSSProperties;
   gap?: number;
 }) {
   return (
@@ -55,20 +103,20 @@ function QrLabelContent({
       className="flex flex-col items-center justify-center w-full h-full"
       style={{ gap }}
     >
-      <QRCodeCanvas
+      {/* SVG (vektor) supaya QR tetap tajam saat dirasterkan 3-4x untuk export/print */}
+      <QRCodeSVG
         value={qrValue}
         size={qrPixelSize}
         level="H"
         includeMargin
-        imageSettings={{
-          src: "/logo.png",
-          height: Math.round(qrPixelSize * 0.2),
-          width: Math.round(qrPixelSize * 0.2),
-          excavate: true,
-        }}
+        imageSettings={getQrLogoImageSettings(qrPixelSize)}
       />
-      <p className={nameClassName}>{asset.assetName}</p>
-      <p className={codeClassName}>{asset.assetCode}</p>
+      <p className={nameClassName} style={nameStyle}>
+        {asset.assetName}
+      </p>
+      <p className={codeClassName} style={codeStyle}>
+        {asset.assetCode}
+      </p>
     </div>
   );
 }
@@ -86,19 +134,19 @@ export default function QrLabelModal({
   const [sizeKey, setSizeKey] = useState<LabelSizeKey>("60x40");
   const [customWidthMm, setCustomWidthMm] = useState(80);
   const [customHeightMm, setCustomHeightMm] = useState(45);
+  const [marginPreset, setMarginPreset] = useState<MarginPresetKey>("5");
+  const [marginCustomMm, setMarginCustomMm] = useState(5);
+  const [gapPreset, setGapPreset] = useState<GapPresetKey>("2");
+  const [gapCustomMm, setGapCustomMm] = useState(2);
+  const [orientation, setOrientation] = useState<Orientation>("portrait");
   const [labelCountInput, setLabelCountInput] = useState("18");
-  const [isLabelCountManualEdited, setIsLabelCountManualEdited] = useState(false);
+  const [currentPageIndex, setCurrentPageIndex] = useState(0);
   const [copied, setCopied] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const singleLabelRef = useRef<HTMLDivElement>(null);
-  const sheetRef = useRef<HTMLDivElement>(null);
-
-  const a4WidthPx = Math.round(A4_WIDTH_MM * PX_PER_MM);
-  const a4HeightPx = Math.round(A4_HEIGHT_MM * PX_PER_MM);
-  const a4Scale = useMemo(
-    () => Math.min(1, A4_PREVIEW_MAX_WIDTH_PX / a4WidthPx),
-    [a4WidthPx]
-  );
+  const activePageRef = useRef<HTMLDivElement>(null);
+  const exportSingleLabelRef = useRef<HTMLDivElement>(null);
+  const exportActivePageRef = useRef<HTMLDivElement>(null);
 
   const isCustom = sizeKey === "custom";
   const customValid =
@@ -111,54 +159,99 @@ export default function QrLabelModal({
   const resolvedLabelWidthMm = isCustom ? customWidthMm : LABEL_SIZES[sizeKey].width;
   const resolvedLabelHeightMm = isCustom ? customHeightMm : LABEL_SIZES[sizeKey].height;
 
-  const availableWidthMm = A4_WIDTH_MM - A4_PADDING_MM * 2;
-  const availableHeightMm = A4_HEIGHT_MM - A4_PADDING_MM * 2;
+  const resolvedMarginMm =
+    marginPreset === "custom" ? marginCustomMm : MARGIN_PRESETS[marginPreset];
+  const resolvedGapMm = gapPreset === "custom" ? gapCustomMm : GAP_PRESETS[gapPreset];
+
+  const a4WidthMm = orientation === "portrait" ? A4_SHORT_MM : A4_LONG_MM;
+  const a4HeightMm = orientation === "portrait" ? A4_LONG_MM : A4_SHORT_MM;
+  const a4WidthPx = Math.round(a4WidthMm * PX_PER_MM);
+  const a4HeightPx = Math.round(a4HeightMm * PX_PER_MM);
+  const a4Scale = useMemo(
+    () => Math.min(1, A4_PREVIEW_MAX_WIDTH_PX / a4WidthPx),
+    [a4WidthPx]
+  );
+
+  const availableWidthMm = a4WidthMm - resolvedMarginMm * 2;
+  const availableHeightMm = a4HeightMm - resolvedMarginMm * 2;
   const columns = Math.max(
     0,
-    Math.floor((availableWidthMm + A4_GAP_MM) / (resolvedLabelWidthMm + A4_GAP_MM))
+    Math.floor((availableWidthMm + resolvedGapMm) / (resolvedLabelWidthMm + resolvedGapMm))
   );
   const rows = Math.max(
     0,
-    Math.floor((availableHeightMm + A4_GAP_MM) / (resolvedLabelHeightMm + A4_GAP_MM))
+    Math.floor((availableHeightMm + resolvedGapMm) / (resolvedLabelHeightMm + resolvedGapMm))
   );
-  const calculatedMaxLabels = columns * rows;
+  const calculatedLabelsPerPage = columns * rows;
 
   const labelCount = parseInt(labelCountInput, 10);
   const labelCountValid =
-    !isNaN(labelCount) && labelCount >= 1 && labelCount <= Math.max(calculatedMaxLabels, 0);
+    !isNaN(labelCount) &&
+    labelCount >= LABEL_COUNT_MIN &&
+    labelCount <= LABEL_COUNT_MAX &&
+    calculatedLabelsPerPage >= 1;
 
-  // Set/adjust default label count whenever size changes, unless user has
-  // manually typed a value that still fits within the new maximum.
+  const totalPages =
+    labelCountValid && calculatedLabelsPerPage >= 1
+      ? Math.ceil(labelCount / calculatedLabelsPerPage)
+      : 0;
+
+  // Clamp currentPageIndex setiap kali totalPages berubah (ukuran/margin/gap/
+  // orientasi/jumlah label) supaya tidak pernah menunjuk halaman yang sudah
+  // tidak ada lagi.
   useEffect(() => {
     queueMicrotask(() => {
-      if (!isLabelCountManualEdited) {
-        setLabelCountInput(String(Math.max(calculatedMaxLabels, 0)));
-        return;
-      }
-      setLabelCountInput((prev) => {
-        const current = parseInt(prev, 10);
-        if (!isNaN(current) && current > calculatedMaxLabels) {
-          return String(Math.max(calculatedMaxLabels, 0));
-        }
+      setCurrentPageIndex((prev) => {
+        if (totalPages <= 1) return 0;
+        if (prev >= totalPages) return totalPages - 1;
+        if (prev < 0) return 0;
         return prev;
       });
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [calculatedMaxLabels]);
+  }, [totalPages]);
 
   if (!open) return null;
 
   const qrValue = asset.qrCodeValue || asset.assetCode || asset.id;
   const singleWidth = Math.round(resolvedLabelWidthMm * PX_PER_MM);
   const singleHeight = Math.round(resolvedLabelHeightMm * PX_PER_MM);
-  const minSideMm = Math.min(resolvedLabelWidthMm, resolvedLabelHeightMm);
-  const singleQrSizeMm = Math.max(
-    18,
-    Math.min(minSideMm * 0.62, resolvedLabelHeightMm - 12)
-  );
+  const singleQrSizeMm = getLabelQrSizeMm(resolvedLabelWidthMm, resolvedLabelHeightMm);
   const singleQrSize = Math.round(singleQrSizeMm * PX_PER_MM);
+  const exportSingleWidth = mmToPx(resolvedLabelWidthMm);
+  const exportSingleHeight = mmToPx(resolvedLabelHeightMm);
+  const exportSingleQrSize = mmToPx(singleQrSizeMm);
+  const exportA4WidthPx = mmToPx(a4WidthMm);
+  const exportA4HeightPx = mmToPx(a4HeightMm);
+  const exportLabelWidthPx = mmToPx(resolvedLabelWidthMm);
+  const exportLabelHeightPx = mmToPx(resolvedLabelHeightMm);
+  const exportGapPx = mmToPx(resolvedGapMm);
+  const exportMarginPx = mmToPx(resolvedMarginMm);
 
   const canOutput = customValid && (mode === "single" || labelCountValid);
+  const safePageIndex = Math.min(currentPageIndex, Math.max(totalPages - 1, 0));
+
+  function getLabelsOnPage(pageIndex: number) {
+    const startIndex = pageIndex * calculatedLabelsPerPage;
+    const remaining = labelCount - startIndex;
+    return Math.max(0, Math.min(calculatedLabelsPerPage, remaining));
+  }
+
+  const labelsOnCurrentPage = getLabelsOnPage(safePageIndex);
+
+  console.debug("[QR Label] currentPageIndex", safePageIndex);
+  console.debug("[QR Label] totalPages", totalPages);
+  console.debug("[QR Label] labelsPerPage", calculatedLabelsPerPage);
+  console.debug("[QR Label] labelsOnCurrentPage", labelsOnCurrentPage);
+
+  const goPrevPage = () => {
+    console.debug("[QR Label] go prev");
+    setCurrentPageIndex((prev) => Math.max(0, prev - 1));
+  };
+
+  const goNextPage = () => {
+    console.debug("[QR Label] go next");
+    setCurrentPageIndex((prev) => Math.min(totalPages - 1, prev + 1));
+  };
 
   const handleCopy = async () => {
     try {
@@ -172,19 +265,24 @@ export default function QrLabelModal({
 
   const handleDownload = async () => {
     if (!canOutput) return;
-    const target = mode === "single" ? singleLabelRef.current : sheetRef.current;
+    const target =
+      mode === "single" ? exportSingleLabelRef.current : exportActivePageRef.current;
     if (!target) return;
+    console.debug("[QR Label] download page", safePageIndex + 1);
     setDownloading(true);
     try {
       const dataUrl = await toPng(target, {
-        pixelRatio: 3,
+        pixelRatio: 1,
         backgroundColor: "#ffffff",
+        cacheBust: true,
       });
       const a = document.createElement("a");
       a.href = dataUrl;
       a.download =
         mode === "single"
           ? `QR-${asset.assetCode}.png`
+          : totalPages > 1
+          ? `QR-SHEET-${asset.assetCode}-PAGE-${safePageIndex + 1}.png`
           : `QR-SHEET-${asset.assetCode}.png`;
       a.click();
     } catch (err) {
@@ -200,22 +298,58 @@ export default function QrLabelModal({
   };
 
   const handleLabelCountBlur = () => {
-    setIsLabelCountManualEdited(true);
     const parsed = parseInt(labelCountInput, 10);
-    if (isNaN(parsed) || parsed < 1) {
-      setLabelCountInput("1");
+    if (isNaN(parsed) || parsed < LABEL_COUNT_MIN) {
+      setLabelCountInput(String(LABEL_COUNT_MIN));
       return;
     }
-    if (parsed > calculatedMaxLabels) {
-      setLabelCountInput(String(Math.max(calculatedMaxLabels, 0)));
+    if (parsed > LABEL_COUNT_MAX) {
+      setLabelCountInput(String(LABEL_COUNT_MAX));
     }
   };
 
-  const previewLabelCount = labelCountValid ? labelCount : 0;
+  const a4LabelQrSizeMm = getLabelQrSizeMm(
+    resolvedLabelWidthMm,
+    resolvedLabelHeightMm
+  );
+  const previewLabelQrSize = Math.round(a4LabelQrSizeMm * PX_PER_MM);
+  const exportLabelQrSize = mmToPx(a4LabelQrSizeMm);
+
+  const exportSingleNameStyle: CSSProperties = {
+    color: "#0f172a",
+    fontSize: scaleScreenPx(11),
+    fontWeight: 700,
+    lineHeight: 1.15,
+    maxWidth: "100%",
+    overflow: "hidden",
+    paddingLeft: scaleScreenPx(4),
+    paddingRight: scaleScreenPx(4),
+    textAlign: "center",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  };
+  const exportSingleCodeStyle: CSSProperties = {
+    color: "#334155",
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+    fontSize: scaleScreenPx(10),
+    lineHeight: 1.15,
+    textAlign: "center",
+  };
+  const exportSheetNameStyle: CSSProperties = {
+    ...exportSingleNameStyle,
+    fontSize: scaleScreenPx(7),
+    paddingLeft: scaleScreenPx(3),
+    paddingRight: scaleScreenPx(3),
+  };
+  const exportSheetCodeStyle: CSSProperties = {
+    ...exportSingleCodeStyle,
+    fontSize: scaleScreenPx(6),
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 print:p-0 print:bg-white">
       <style>{`
+        .print-only-a4 { display: none; }
         @media print {
           body * { visibility: hidden; }
           .print-area, .print-area * { visibility: visible; }
@@ -226,13 +360,16 @@ export default function QrLabelModal({
           }
           .no-print { display: none !important; }
           .print-area { transform: none !important; }
+          .print-only-a4 { display: flex !important; flex-direction: column; }
+          .a4-page { margin: 0 !important; page-break-after: always; }
+          .a4-page:last-child { page-break-after: auto; }
           @page {
             size: ${
               mode === "single"
                 ? `${resolvedLabelWidthMm}mm ${resolvedLabelHeightMm}mm`
-                : "A4"
+                : `A4 ${orientation}`
             };
-            margin: ${mode === "single" ? "0" : `${A4_PADDING_MM}mm`};
+            margin: 0;
           }
         }
       `}</style>
@@ -289,67 +426,184 @@ export default function QrLabelModal({
                   />
                 </div>
               </div>
-            ) : calculatedMaxLabels < 1 ? (
+            ) : calculatedLabelsPerPage < 1 ? (
               <p className="text-sm text-amber-600 py-8 text-center">
                 Ukuran label terlalu besar untuk A4.
               </p>
             ) : (
-              <div className="w-full flex justify-center py-4">
-                <div
-                  className="a4-scale-wrapper"
-                  style={{
-                    width: a4WidthPx * a4Scale,
-                    height: a4HeightPx * a4Scale,
-                  }}
-                >
+              <>
+                {/* Preview layar: hanya halaman aktif */}
+                <div className="flex flex-col items-center gap-1.5 w-full py-4">
+                  <p className="text-xs text-slate-400">
+                    Halaman {safePageIndex + 1} dari {totalPages}
+                  </p>
                   <div
-                    ref={sheetRef}
-                    className="print-area bg-white shadow-sm origin-top-left"
+                    className="a4-scale-wrapper"
                     style={{
-                      width: a4WidthPx,
-                      height: a4HeightPx,
-                      padding: Math.round(A4_PADDING_MM * PX_PER_MM),
-                      transform: `scale(${a4Scale})`,
+                      width: a4WidthPx * a4Scale,
+                      height: a4HeightPx * a4Scale,
+                    }}
+                  >
+                    <div
+                      ref={activePageRef}
+                      className="a4-page bg-white shadow-sm origin-top-left"
+                      style={{
+                        width: a4WidthPx,
+                        height: a4HeightPx,
+                        padding: Math.round(resolvedMarginMm * PX_PER_MM),
+                        transform: `scale(${a4Scale})`,
+                      }}
+                    >
+                      <div
+                        className="grid w-full"
+                        style={{
+                          gridTemplateColumns: `repeat(${columns}, ${Math.round(
+                            resolvedLabelWidthMm * PX_PER_MM
+                          )}px)`,
+                          gridAutoRows: `${Math.round(resolvedLabelHeightMm * PX_PER_MM)}px`,
+                          gap: Math.round(resolvedGapMm * PX_PER_MM),
+                        }}
+                      >
+                        {Array.from({ length: labelsOnCurrentPage }).map((_, i) => (
+                          <div
+                            key={i}
+                            className="border border-dashed border-slate-300 rounded flex items-center justify-center overflow-hidden"
+                          >
+                            <QrLabelContent
+                              asset={asset}
+                              qrValue={qrValue}
+                              qrPixelSize={previewLabelQrSize}
+                              nameClassName="text-[7px] font-bold text-slate-900 text-center leading-tight px-1 truncate max-w-full"
+                              codeClassName="text-[6px] font-mono text-slate-500 text-center leading-tight"
+                              gap={2}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Print area tersembunyi di layar: render semua halaman */}
+                <div className="print-only-a4 print-area">
+                  {Array.from({ length: totalPages }).map((_, pageIndex) => (
+                    <div
+                      key={pageIndex}
+                      className="a4-page bg-white"
+                      style={{
+                        width: a4WidthPx,
+                        height: a4HeightPx,
+                        padding: Math.round(resolvedMarginMm * PX_PER_MM),
+                      }}
+                    >
+                      <div
+                        className="grid w-full"
+                        style={{
+                          gridTemplateColumns: `repeat(${columns}, ${Math.round(
+                            resolvedLabelWidthMm * PX_PER_MM
+                          )}px)`,
+                          gridAutoRows: `${Math.round(resolvedLabelHeightMm * PX_PER_MM)}px`,
+                          gap: Math.round(resolvedGapMm * PX_PER_MM),
+                        }}
+                      >
+                        {Array.from({ length: getLabelsOnPage(pageIndex) }).map((_, i) => (
+                          <div
+                            key={i}
+                            className="border border-dashed border-slate-300 rounded flex items-center justify-center overflow-hidden"
+                          >
+                            <QrLabelContent
+                              asset={asset}
+                              qrValue={qrValue}
+                              qrPixelSize={previewLabelQrSize}
+                              nameClassName="text-[7px] font-bold text-slate-900 text-center leading-tight px-1 truncate max-w-full"
+                              codeClassName="text-[6px] font-mono text-slate-500 text-center leading-tight"
+                              gap={2}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {canOutput && (
+              <div
+                aria-hidden="true"
+                className="no-print"
+                style={OFFSCREEN_EXPORT_STYLE}
+              >
+                {mode === "single" ? (
+                  <div
+                    ref={exportSingleLabelRef}
+                    className="bg-white flex items-center justify-center"
+                    style={{
+                      width: exportSingleWidth,
+                      height: exportSingleHeight,
+                      padding: scaleScreenPx(8),
+                      border: `${scaleScreenPx(1)}px solid #cbd5e1`,
+                      borderRadius: scaleScreenPx(6),
+                      boxSizing: "border-box",
+                    }}
+                  >
+                    <QrLabelContent
+                      asset={asset}
+                      qrValue={qrValue}
+                      qrPixelSize={exportSingleQrSize}
+                      nameStyle={exportSingleNameStyle}
+                      codeStyle={exportSingleCodeStyle}
+                      gap={scaleScreenPx(5)}
+                    />
+                  </div>
+                ) : (
+                  <div
+                    ref={exportActivePageRef}
+                    className="bg-white"
+                    style={{
+                      width: exportA4WidthPx,
+                      height: exportA4HeightPx,
+                      padding: exportMarginPx,
+                      boxSizing: "border-box",
                     }}
                   >
                     <div
                       className="grid w-full"
                       style={{
-                        gridTemplateColumns: `repeat(${columns}, ${Math.round(
-                          resolvedLabelWidthMm * PX_PER_MM
-                        )}px)`,
-                        gridAutoRows: `${Math.round(resolvedLabelHeightMm * PX_PER_MM)}px`,
-                        gap: Math.round(A4_GAP_MM * PX_PER_MM),
+                        gridTemplateColumns: `repeat(${columns}, ${exportLabelWidthPx}px)`,
+                        gridAutoRows: `${exportLabelHeightPx}px`,
+                        gap: exportGapPx,
                       }}
                     >
-                      {Array.from({ length: previewLabelCount }).map((_, i) => (
+                      {Array.from({ length: labelsOnCurrentPage }).map((_, i) => (
                         <div
                           key={i}
-                          className="border border-dashed border-slate-300 rounded flex items-center justify-center overflow-hidden"
+                          className="flex items-center justify-center overflow-hidden"
+                          style={{
+                            border: `${scaleScreenPx(1)}px dashed #cbd5e1`,
+                            borderRadius: scaleScreenPx(4),
+                            boxSizing: "border-box",
+                          }}
                         >
                           <QrLabelContent
                             asset={asset}
                             qrValue={qrValue}
-                            qrPixelSize={Math.round(
-                              Math.min(resolvedLabelWidthMm, resolvedLabelHeightMm) *
-                                PX_PER_MM *
-                                0.55
-                            )}
-                            nameClassName="text-[7px] font-bold text-slate-900 text-center leading-tight px-1 truncate max-w-full"
-                            codeClassName="text-[6px] font-mono text-slate-500 text-center leading-tight"
-                            gap={2}
+                            qrPixelSize={exportLabelQrSize}
+                            nameStyle={exportSheetNameStyle}
+                            codeStyle={exportSheetCodeStyle}
+                            gap={scaleScreenPx(2)}
                           />
                         </div>
                       ))}
                     </div>
                   </div>
-                </div>
+                )}
               </div>
             )}
-            {mode === "a4" && customValid && calculatedMaxLabels >= 1 && (
-              <p className="text-xs text-slate-400 mt-2 text-center">
-                {previewLabelCount} label akan dicetak dalam A4 ({columns} kolom x {rows} baris,
-                maksimal {calculatedMaxLabels} label).
+            {mode === "a4" && customValid && calculatedLabelsPerPage >= 1 && labelCountValid && (
+              <p className="text-xs text-slate-400 mt-2 text-center no-print">
+                {labelCount} label akan dicetak dalam {totalPages} halaman A4. Kapasitas{" "}
+                {calculatedLabelsPerPage} label per halaman ({columns} kolom x {rows} baris).
               </p>
             )}
           </div>
@@ -442,34 +696,149 @@ export default function QrLabelModal({
             )}
 
             {mode === "a4" && (
-              <div className="mb-4">
-                <label className="block text-xs font-medium text-slate-500 mb-1.5">
-                  Jumlah Label
-                </label>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  value={labelCountInput}
-                  onChange={(e) => {
-                    setIsLabelCountManualEdited(true);
-                    setLabelCountInput(e.target.value.replace(/[^0-9]/g, ""));
-                  }}
-                  onBlur={handleLabelCountBlur}
-                  className="input cursor-text"
-                />
-                <p className="text-xs text-slate-400 mt-1">
-                  Maksimal {calculatedMaxLabels} label untuk ukuran ini.
-                </p>
-                {!labelCountValid && (
-                  <p className="text-xs text-red-600 mt-1">
-                    {calculatedMaxLabels < 1
-                      ? "Ukuran label terlalu besar untuk A4."
-                      : parseInt(labelCountInput, 10) > calculatedMaxLabels
-                      ? `Maksimal ${calculatedMaxLabels} label untuk ukuran ini.`
-                      : "Jumlah label minimal 1."}
+              <>
+                <div className="mb-4">
+                  <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                    Orientasi
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setOrientation("portrait")}
+                      className={`rounded-xl border px-3 py-2 text-sm font-medium cursor-pointer transition-colors ${
+                        orientation === "portrait"
+                          ? "border-blue-500 bg-blue-50 text-blue-700"
+                          : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      Portrait
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setOrientation("landscape")}
+                      className={`rounded-xl border px-3 py-2 text-sm font-medium cursor-pointer transition-colors ${
+                        orientation === "landscape"
+                          ? "border-blue-500 bg-blue-50 text-blue-700"
+                          : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      Landscape
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mb-4 grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                      Margin A4
+                    </label>
+                    <select
+                      value={marginPreset}
+                      onChange={(e) => setMarginPreset(e.target.value as MarginPresetKey)}
+                      className="input cursor-pointer"
+                    >
+                      <option value="0">Rapat / 0mm</option>
+                      <option value="5">Kecil / 5mm</option>
+                      <option value="10">Normal / 10mm</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                    {marginPreset === "custom" && (
+                      <input
+                        type="number"
+                        inputMode="numeric"
+                        value={marginCustomMm}
+                        onChange={(e) => setMarginCustomMm(Number(e.target.value))}
+                        className="input cursor-text mt-2"
+                        placeholder="mm"
+                      />
+                    )}
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                      Jarak Antar Label
+                    </label>
+                    <select
+                      value={gapPreset}
+                      onChange={(e) => setGapPreset(e.target.value as GapPresetKey)}
+                      className="input cursor-pointer"
+                    >
+                      <option value="0">0mm</option>
+                      <option value="2">2mm</option>
+                      <option value="4">4mm</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                    {gapPreset === "custom" && (
+                      <input
+                        type="number"
+                        inputMode="numeric"
+                        value={gapCustomMm}
+                        onChange={(e) => setGapCustomMm(Number(e.target.value))}
+                        className="input cursor-text mt-2"
+                        placeholder="mm"
+                      />
+                    )}
+                  </div>
+                </div>
+
+                <div className="mb-4">
+                  <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                    Jumlah Label
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={labelCountInput}
+                    onChange={(e) =>
+                      setLabelCountInput(e.target.value.replace(/[^0-9]/g, ""))
+                    }
+                    onBlur={handleLabelCountBlur}
+                    className="input cursor-text"
+                  />
+                  <p className="text-xs text-slate-400 mt-1">
+                    {calculatedLabelsPerPage >= 1
+                      ? `Kapasitas ${calculatedLabelsPerPage} label per halaman. Total ${
+                          totalPages || 0
+                        } halaman.`
+                      : "Ukuran label terlalu besar untuk A4."}
                   </p>
+                  {!labelCountValid && calculatedLabelsPerPage >= 1 && (
+                    <p className="text-xs text-red-600 mt-1">
+                      {isNaN(labelCount) || labelCount < LABEL_COUNT_MIN
+                        ? "Jumlah label minimal 1."
+                        : `Jumlah label maksimal ${LABEL_COUNT_MAX}.`}
+                    </p>
+                  )}
+                </div>
+
+                {totalPages > 1 && (
+                  <div className="mb-4">
+                    <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                      Halaman untuk Download PNG
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={goPrevPage}
+                        disabled={safePageIndex === 0}
+                        className="p-2 rounded-lg border border-slate-200 text-slate-500 cursor-pointer hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <ChevronLeft size={15} />
+                      </button>
+                      <span className="text-sm text-slate-600 flex-1 text-center">
+                        Halaman {safePageIndex + 1} dari {totalPages}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={goNextPage}
+                        disabled={safePageIndex === totalPages - 1}
+                        className="p-2 rounded-lg border border-slate-200 text-slate-500 cursor-pointer hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <ChevronRight size={15} />
+                      </button>
+                    </div>
+                  </div>
                 )}
-              </div>
+              </>
             )}
 
             <button
@@ -493,7 +862,11 @@ export default function QrLabelModal({
                 className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 cursor-pointer hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Download size={15} />
-                {downloading ? "Menyiapkan..." : "Download PNG"}
+                {downloading
+                  ? "Menyiapkan..."
+                  : mode === "a4" && totalPages > 1
+                  ? "Download PNG Halaman Ini"
+                  : "Download PNG"}
               </button>
               <button
                 type="button"

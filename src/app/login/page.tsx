@@ -17,7 +17,7 @@ export default function LoginPage() {
   useEffect(() => {
     if (!loading && firebaseUser && assetUser && role) {
       const destination =
-        role === "super_admin" || role === "asset_admin" ? "/dashboard" : "/scan";
+        role === "staff" ? "/scan" : role === "it_team" ? "/maintenance" : "/dashboard";
       router.replace(destination);
     }
   }, [loading, firebaseUser, assetUser, role, router]);

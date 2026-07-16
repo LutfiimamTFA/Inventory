@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { collection, onSnapshot, query, where } from "firebase/firestore";
 import {
@@ -11,15 +11,19 @@ import {
   AlertTriangle,
   Wallet,
   ArrowRight,
+  Inbox,
+  CalendarClock,
 } from "lucide-react";
 import { db } from "@/lib/firebase";
-import { Asset, AssetBorrowing } from "@/lib/types";
+import { useAuth } from "@/lib/auth-context";
+import { Asset, AssetBorrowing, AssetIssueTicket, MaintenanceWorkOrder } from "@/lib/types";
 import {
   ASSET_STATUS_COLOR,
   ASSET_STATUS_LABEL,
   formatCurrency,
   formatDate,
 } from "@/lib/utils";
+import { isWorkOrderOverdueRecord } from "@/lib/reports";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
 import StatCard from "@/components/StatCard";
@@ -27,10 +31,13 @@ import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 
 export default function DashboardPage() {
+  const { role, assetUser } = useAuth();
   const [assets, setAssets] = useState<Asset[]>([]);
   const [activeBorrowings, setActiveBorrowings] = useState<AssetBorrowing[]>(
     []
   );
+  const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
+  const [workOrders, setWorkOrders] = useState<MaintenanceWorkOrder[]>([]);
 
   useEffect(() => {
     const unsub = onSnapshot(collection(db, "assets"), (snap) => {
@@ -54,6 +61,22 @@ export default function DashboardPage() {
     return () => unsub();
   }, []);
 
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "asset_issue_tickets"), (snap) => {
+      setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
+    });
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "asset_maintenance_work_orders"), (snap) => {
+      setWorkOrders(
+        snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder))
+      );
+    });
+    return () => unsub();
+  }, []);
+
   const total = assets.length;
   const available = assets.filter((a) => a.assetStatus === "available").length;
   const borrowed = assets.filter((a) => a.assetStatus === "borrowed").length;
@@ -72,6 +95,29 @@ export default function DashboardPage() {
       return tb - ta;
     })
     .slice(0, 5);
+
+  const unresolvedTickets = tickets.filter(
+    (t) => !["resolved", "closed", "rejected"].includes(t.status)
+  ).length;
+
+  const myRoutineWorkOrders = useMemo(
+    () => workOrders.filter((w) => w.assignedToUid === assetUser?.uid),
+    [workOrders, assetUser?.uid]
+  );
+  const routineToday = myRoutineWorkOrders.filter((w) =>
+    ["created", "accepted", "scheduled_by_it", "assigned"].includes(w.status)
+  ).length;
+  const routineOverdue = myRoutineWorkOrders.filter((w) => isWorkOrderOverdueRecord(w)).length;
+
+  const now = new Date();
+  const scheduleThisMonth = workOrders.filter(
+    (w) => w.startMonth === now.getMonth() + 1 && w.startYear === now.getFullYear()
+  ).length;
+  const maintenanceCompleted = workOrders.filter((w) => w.status === "completed").length;
+  const maintenanceOverdueAll = workOrders.filter((w) => isWorkOrderOverdueRecord(w)).length;
+  const staffReportsPending = tickets.filter((t) =>
+    ["open", "review_by_asset_admin", "need_more_info"].includes(t.status)
+  ).length;
 
   return (
     <ProtectedLayout>
@@ -108,6 +154,23 @@ export default function DashboardPage() {
           tone="blue"
         />
       </div>
+
+      {role === "super_admin" && (
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
+          <StatCard icon={Inbox} label="Ticket Kendala Belum Selesai" value={unresolvedTickets} tone="amber" />
+          <StatCard icon={CalendarClock} label="Tugas Maintenance Rutin Belum Dikerjakan" value={routineToday} tone="purple" />
+          <StatCard icon={AlertTriangle} label="Tugas Maintenance Rutin Overdue" value={routineOverdue} tone="red" />
+        </div>
+      )}
+
+      {role === "asset_admin" && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+          <StatCard icon={CalendarClock} label="Jadwal Maintenance Bulan Ini" value={scheduleThisMonth} tone="blue" />
+          <StatCard icon={CheckCircle2} label="Maintenance Selesai" value={maintenanceCompleted} tone="emerald" />
+          <StatCard icon={AlertTriangle} label="Maintenance Overdue" value={maintenanceOverdueAll} tone="red" />
+          <StatCard icon={Inbox} label="Laporan Kendala Staff Belum Ditangani" value={staffReportsPending} tone="amber" />
+        </div>
+      )}
 
       <div className="grid lg:grid-cols-2 gap-5">
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">

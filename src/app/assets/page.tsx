@@ -37,6 +37,7 @@ import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 import ConfirmModal from "@/components/ConfirmModal";
 import QrLabelModal from "@/components/QrLabelModal";
+import BulkQrLabelModal from "@/components/BulkQrLabelModal";
 
 export default function AssetsPage() {
   const { assetUser, role } = useAuth();
@@ -51,6 +52,9 @@ export default function AssetsPage() {
   const [deactivateTarget, setDeactivateTarget] = useState<Asset | null>(null);
   const [processing, setProcessing] = useState(false);
   const [qrLabelTarget, setQrLabelTarget] = useState<Asset | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkModalOpen, setBulkModalOpen] = useState(false);
+  const [confirmSelectAllFiltered, setConfirmSelectAllFiltered] = useState(false);
 
   const canManage = role === "super_admin" || role === "asset_admin";
 
@@ -110,6 +114,47 @@ export default function AssetsPage() {
   const hasFilters =
     search || categoryFilter || statusFilter || companyFilter || divisionFilter || locationFilter;
 
+  const allVisibleSelected =
+    filtered.length > 0 && filtered.every((a) => selectedIds.has(a.id));
+  const selectedAssets = assets.filter((a) => selectedIds.has(a.id));
+
+  const toggleSelectOne = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllVisible = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) {
+        filtered.forEach((a) => next.delete(a.id));
+      } else {
+        filtered.forEach((a) => next.add(a.id));
+      }
+      return next;
+    });
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const handleBulkQrClick = () => {
+    if (selectedIds.size > 0) {
+      setBulkModalOpen(true);
+    } else if (filtered.length > 0) {
+      setConfirmSelectAllFiltered(true);
+    }
+  };
+
+  const handleConfirmSelectAllFiltered = () => {
+    setSelectedIds(new Set(filtered.map((a) => a.id)));
+    setConfirmSelectAllFiltered(false);
+    setBulkModalOpen(true);
+  };
+
   const handleDeactivate = async () => {
     if (!deactivateTarget) return;
     setProcessing(true);
@@ -147,6 +192,16 @@ export default function AssetsPage() {
               <QrCode size={16} />
               Scan QR
             </Link>
+            {canManage && (
+              <button
+                type="button"
+                onClick={handleBulkQrClick}
+                className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 cursor-pointer hover:bg-slate-50 shadow-sm"
+              >
+                <QrCode size={16} />
+                Bulk QR Label
+              </button>
+            )}
             {canManage && (
               <Link
                 href="/assets/new"
@@ -235,6 +290,31 @@ export default function AssetsPage() {
         </select>
       </FilterCard>
 
+      {canManage && selectedIds.size > 0 && (
+        <div className="flex items-center justify-between gap-3 mb-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5">
+          <p className="text-sm text-blue-800 font-medium">
+            {selectedIds.size} asset dipilih
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setBulkModalOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-3 py-1.5 text-xs font-medium cursor-pointer hover:bg-blue-700"
+            >
+              <QrCode size={13} />
+              Cetak QR Terpilih
+            </button>
+            <button
+              type="button"
+              onClick={clearSelection}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 cursor-pointer hover:bg-slate-50"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         {filtered.length === 0 ? (
           <EmptyState
@@ -263,6 +343,17 @@ export default function AssetsPage() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
+                  {canManage && (
+                    <th className="px-4 py-3 w-10">
+                      <input
+                        type="checkbox"
+                        checked={allVisibleSelected}
+                        onChange={toggleSelectAllVisible}
+                        className="cursor-pointer"
+                        aria-label="Pilih semua asset yang tampil"
+                      />
+                    </th>
+                  )}
                   <th className="px-4 py-3 font-semibold">Asset</th>
                   <th className="px-4 py-3 font-semibold">Kategori</th>
                   <th className="px-4 py-3 font-semibold">Lokasi</th>
@@ -279,6 +370,17 @@ export default function AssetsPage() {
                     key={a.id}
                     className="border-b border-slate-100 last:border-0 hover:bg-slate-50/70 transition-colors"
                   >
+                    {canManage && (
+                      <td className="px-4 py-3">
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(a.id)}
+                          onChange={() => toggleSelectOne(a.id)}
+                          className="cursor-pointer"
+                          aria-label={`Pilih ${a.assetName}`}
+                        />
+                      </td>
+                    )}
                     <td className="px-4 py-3">
                       <Link href={`/assets/${a.id}`} className="block">
                         <p className="font-medium text-slate-800">{a.assetName}</p>
@@ -364,6 +466,23 @@ export default function AssetsPage() {
           asset={qrLabelTarget}
           open={!!qrLabelTarget}
           onClose={() => setQrLabelTarget(null)}
+        />
+      )}
+
+      <ConfirmModal
+        open={confirmSelectAllFiltered}
+        title="Pilih semua asset dari hasil filter ini?"
+        description={`${filtered.length} asset pada hasil filter/pencarian saat ini akan dipilih untuk dicetak QR-nya.`}
+        confirmLabel="Pilih Semua"
+        onConfirm={handleConfirmSelectAllFiltered}
+        onCancel={() => setConfirmSelectAllFiltered(false)}
+      />
+
+      {bulkModalOpen && (
+        <BulkQrLabelModal
+          assets={selectedAssets}
+          open={bulkModalOpen}
+          onClose={() => setBulkModalOpen(false)}
         />
       )}
     </ProtectedLayout>

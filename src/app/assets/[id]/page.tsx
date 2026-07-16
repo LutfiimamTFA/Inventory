@@ -13,12 +13,19 @@ import {
   where,
 } from "firebase/firestore";
 import { QRCodeSVG } from "qrcode.react";
-import { Pencil, Download, ArrowLeft, Image as ImageIcon, History as HistoryIcon, Power } from "lucide-react";
+import { Pencil, Download, ArrowLeft, Image as ImageIcon, History as HistoryIcon, Power, FileBarChart, FileDown } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { writeAssetLog } from "@/lib/firestore-helpers";
+import {
+  computeHealthScore,
+  exportToExcel,
+  healthScoreLabel,
+  isMaintenanceOverdue,
+  todayStamp,
+} from "@/lib/reports";
 import ConfirmModal from "@/components/ConfirmModal";
 import { useAuth } from "@/lib/auth-context";
-import { Asset, AssetBorrowing, AssetLog } from "@/lib/types";
+import { Asset, AssetBorrowing, AssetIssueTicket, AssetLog } from "@/lib/types";
 import {
   ASSET_STATUS_COLOR,
   ASSET_STATUS_LABEL,
@@ -32,6 +39,7 @@ import {
 import ProtectedLayout from "@/components/ProtectedLayout";
 import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
+import Link from "next/link";
 
 export default function AssetDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -41,6 +49,7 @@ export default function AssetDetailPage() {
   const [photoImgError, setPhotoImgError] = useState(false);
   const [borrowings, setBorrowings] = useState<AssetBorrowing[]>([]);
   const [logs, setLogs] = useState<AssetLog[]>([]);
+  const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
   const [deactivateOpen, setDeactivateOpen] = useState(false);
   const [deactivating, setDeactivating] = useState(false);
 
@@ -90,6 +99,14 @@ export default function AssetDetailPage() {
     return () => unsub();
   }, [id]);
 
+  useEffect(() => {
+    const q = query(collection(db, "asset_issue_tickets"), where("assetId", "==", id));
+    const unsub = onSnapshot(q, (snap) => {
+      setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
+    });
+    return () => unsub();
+  }, [id]);
+
   if (!asset) {
     return (
       <ProtectedLayout>
@@ -127,6 +144,16 @@ export default function AssetDetailPage() {
       setDeactivating(false);
     }
   };
+
+  const unresolvedTicketCount = tickets.filter(
+    (t) => !["resolved", "closed", "rejected"].includes(t.status)
+  ).length;
+  const healthScore = computeHealthScore({
+    asset,
+    unresolvedTicketCount,
+    resolvedLast30dCount: 0,
+    hasOverdueMaintenance: isMaintenanceOverdue(asset),
+  });
 
   const downloadQr = () => {
     const svg = document.getElementById("asset-qr-svg");
@@ -372,6 +399,59 @@ export default function AssetDetailPage() {
               </button>
             </div>
           </Section>
+
+          {canManage && (
+            <Section title="Asset Report Summary">
+              <div className="grid grid-cols-2 gap-3 text-sm mb-4">
+                <Info label="Health Score" value={String(healthScore)} />
+                <Info label="Label" value={healthScoreLabel(healthScore)} />
+                <Info label="Total Ticket" value={String(tickets.length)} />
+                <Info
+                  label="Ticket Belum Selesai"
+                  value={String(
+                    tickets.filter((t) => !["resolved", "closed", "rejected"].includes(t.status)).length
+                  )}
+                />
+                <Info label="Total Peminjaman" value={String(borrowings.length)} />
+                <Info label="Last Maintenance" value={formatDate(asset.lastMaintenanceAt)} />
+                <Info label="Next Maintenance" value={formatDate(asset.nextMaintenanceAt)} />
+                <Info label="Total Nilai Beli" value={formatCurrency(asset.purchasePrice)} />
+              </div>
+              <div className="flex gap-2">
+                <Link
+                  href={`/reports/assets/${asset.id}`}
+                  className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-teal-500 text-white px-3 py-2 text-sm font-medium hover:brightness-105"
+                >
+                  <FileBarChart size={14} />
+                  Lihat Full Report
+                </Link>
+                <button
+                  onClick={() =>
+                    exportToExcel(
+                      `AssetView-Asset-Report-${asset.assetCode}-${todayStamp()}.xlsx`,
+                      "Asset Report",
+                      [
+                        {
+                          Asset: asset.assetName,
+                          "Kode Asset": asset.assetCode,
+                          "Health Score": healthScore,
+                          Label: healthScoreLabel(healthScore),
+                          "Total Ticket": tickets.length,
+                          "Total Peminjaman": borrowings.length,
+                          "Last Maintenance": formatDate(asset.lastMaintenanceAt),
+                          "Next Maintenance": formatDate(asset.nextMaintenanceAt),
+                        },
+                      ]
+                    )
+                  }
+                  className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  <FileDown size={14} />
+                  Export
+                </button>
+              </div>
+            </Section>
+          )}
         </div>
       </div>
 

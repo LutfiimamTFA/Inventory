@@ -10,7 +10,7 @@ import {
   where,
 } from "firebase/firestore";
 import { Html5Qrcode } from "html5-qrcode";
-import { Camera, Search, ScanLine, PackageSearch } from "lucide-react";
+import { Camera, Search, ScanLine, PackageSearch, AlertTriangle } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { Asset } from "@/lib/types";
@@ -20,6 +20,7 @@ import PageHeader from "@/components/PageHeader";
 import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 import { BorrowModal, ReturnModal } from "@/components/BorrowReturnModal";
+import ReportIssueModal from "@/components/ReportIssueModal";
 
 const SCANNER_ID = "qr-scanner-region";
 
@@ -32,6 +33,7 @@ export default function ScanPage() {
   const [error, setError] = useState("");
   const [borrowOpen, setBorrowOpen] = useState(false);
   const [returnOpen, setReturnOpen] = useState(false);
+  const [reportIssueOpen, setReportIssueOpen] = useState(false);
   const scannerRef = useRef<Html5Qrcode | null>(null);
 
   const lookupAsset = async (code: string) => {
@@ -214,6 +216,13 @@ export default function ScanPage() {
                     Kembalikan
                   </button>
                 )}
+                <button
+                  onClick={() => setReportIssueOpen(true)}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-red-200 bg-red-50 text-red-700 px-5 py-2.5 text-sm font-medium hover:bg-red-100"
+                >
+                  <AlertTriangle size={15} />
+                  Laporkan Kendala
+                </button>
               </div>
             </div>
           )}
@@ -239,6 +248,11 @@ export default function ScanPage() {
               setReturnOpen(false);
               lookupAsset(asset.qrCodeValue);
             }}
+          />
+          <ReportIssueModal
+            asset={asset}
+            open={reportIssueOpen}
+            onClose={() => setReportIssueOpen(false)}
           />
         </>
       )}

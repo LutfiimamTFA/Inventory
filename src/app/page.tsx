@@ -15,7 +15,7 @@ export default function Home() {
       return;
     }
     router.replace(
-      role === "super_admin" || role === "asset_admin" ? "/dashboard" : "/scan"
+      role === "staff" ? "/scan" : role === "it_team" ? "/maintenance" : "/dashboard"
     );
   }, [loading, firebaseUser, role, router]);
 

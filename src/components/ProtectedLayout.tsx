@@ -20,9 +20,14 @@ import {
   X,
   Search,
   ChevronRight,
+  Wrench,
+  ClipboardCheck,
+  MapPin,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
 import { AppRole } from "@/lib/types";
+import { ROLE_LABEL } from "@/lib/roles";
+import NotificationBell from "@/components/NotificationBell";
 
 interface NavItem {
   href: string;
@@ -60,13 +65,31 @@ const NAV_ITEMS: NavItem[] = [
     href: "/scan",
     label: "Scan QR",
     icon: QrCode,
-    roles: ["super_admin", "asset_admin", "staff"],
+    roles: ["super_admin", "asset_admin", "it_team", "staff"],
   },
   {
     href: "/my-borrowings",
     label: "My Borrowings",
     icon: History,
-    roles: ["super_admin", "asset_admin", "staff"],
+    roles: ["super_admin", "asset_admin", "it_team", "staff"],
+  },
+  {
+    href: "/maintenance",
+    label: "Maintenance & Kendala",
+    icon: Wrench,
+    roles: ["super_admin", "asset_admin", "it_team"],
+  },
+  {
+    href: "/locations",
+    label: "Master Lokasi",
+    icon: MapPin,
+    roles: ["super_admin", "asset_admin"],
+  },
+  {
+    href: "/my-reports",
+    label: "My Reports",
+    icon: ClipboardCheck,
+    roles: ["staff"],
   },
   {
     href: "/reports",
@@ -88,15 +111,10 @@ const NAV_ITEMS: NavItem[] = [
   },
 ];
 
-const ROLE_LABEL: Record<AppRole, string> = {
-  super_admin: "Super Admin",
-  asset_admin: "Asset Admin",
-  staff: "Staff",
-};
-
 const DEFAULT_ROUTE: Record<AppRole, string> = {
   super_admin: "/dashboard",
   asset_admin: "/dashboard",
+  it_team: "/maintenance",
   staff: "/scan",
 };
 
@@ -145,6 +163,9 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (loading || !role) return;
+    // /notifications diakses lewat lonceng topbar, bukan lewat sidebar, tapi
+    // tetap harus lolos guard untuk semua role yang sudah login.
+    if (pathname.startsWith("/notifications")) return;
     const allowed = NAV_ITEMS.some(
       (item) => item.roles.includes(role) && pathname.startsWith(item.href)
     );
@@ -412,6 +433,7 @@ function TopbarAndMain({
         )}
 
         <div className="ml-auto flex items-center gap-3">
+          <NotificationBell />
           <div className="hidden sm:flex flex-col items-end leading-tight">
             <span className="text-sm font-medium text-slate-800">{assetUser.name}</span>
             <span className="text-[11px] text-slate-400">{ROLE_LABEL[role]}</span>

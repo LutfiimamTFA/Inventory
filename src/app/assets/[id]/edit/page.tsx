@@ -17,6 +17,7 @@ import {
   Asset,
   AssetCategory,
   AssetCondition,
+  AssetLocationNode,
   AssetStatus,
   EmployeeProfile,
   FundingSource,
@@ -26,6 +27,7 @@ import {
 } from "@/lib/types";
 import { fetchHrpBrands, fetchHrpDivisions } from "@/lib/hrp";
 import { isAssetCodeTaken, writeAssetLog } from "@/lib/firestore-helpers";
+import { buildFullPath } from "@/lib/locations";
 import {
   ASSET_STATUS_HELPER,
   ASSET_STATUS_LABEL,
@@ -38,6 +40,7 @@ import { FormSection, Field } from "@/components/FormSection";
 import Toggle from "@/components/Toggle";
 import CurrencyInput from "@/components/CurrencyInput";
 import SearchableSelect, { SearchableSelectItem } from "@/components/SearchableSelect";
+import LocationCascadeFields, { LocationSelection } from "@/components/LocationCascadeFields";
 import FileUploadField from "@/components/FileUploadField";
 import { Toast, ToastState } from "@/components/Toast";
 
@@ -98,6 +101,7 @@ export default function EditAssetPage() {
   const [invoiceUploading, setInvoiceUploading] = useState(false);
 
   const [form, setForm] = useState<Partial<Asset>>({});
+  const [locations, setLocations] = useState<AssetLocationNode[]>([]);
 
   useEffect(() => {
     getDoc(doc(db, "assets", id)).then((snap) => {
@@ -119,6 +123,17 @@ export default function EditAssetPage() {
     const unsub = onSnapshot(collection(db, "asset_categories"), (snap) => {
       setCategories(
         snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
+      );
+    });
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "asset_locations"), (snap) => {
+      setLocations(
+        snap.docs
+          .map((d) => ({ id: d.id, ...d.data() } as AssetLocationNode))
+          .filter((n) => n.status === "active")
       );
     });
     return () => unsub();
@@ -156,6 +171,30 @@ export default function EditAssetPage() {
 
   const set = <K extends keyof Asset>(key: K, value: Asset[K]) =>
     setForm((f) => ({ ...f, [key]: value }));
+
+  const locationSelection: LocationSelection = {
+    buildingId: form.buildingId || "",
+    buildingName: form.buildingName || "",
+    floorId: form.floorId || "",
+    floorName: form.floor || "",
+    roomId: form.roomId || "",
+    roomName: form.roomName || "",
+    areaId: form.areaId || "",
+    areaName: form.areaName || "",
+  };
+  const handleLocationSelectionChange = (next: LocationSelection) => {
+    setForm((f) => ({
+      ...f,
+      buildingId: next.buildingId,
+      buildingName: next.buildingName,
+      floorId: next.floorId,
+      floor: next.floorName,
+      roomId: next.roomId,
+      roomName: next.roomName,
+      areaId: next.areaId,
+      areaName: next.areaName,
+    }));
+  };
 
   const handleCompanyChange = (value: string) => {
     set("companyOwnerId", value);
@@ -216,7 +255,9 @@ export default function EditAssetPage() {
     if (!form.brand?.trim()) errors.brand = "Merk wajib diisi.";
     if (!form.model?.trim()) errors.model = "Model/Tipe wajib diisi.";
     if (!form.companyOwnerId) errors.companyOwnerId = "Perusahaan/Brand wajib dipilih.";
-    if (!form.location?.trim()) errors.location = "Lokasi wajib diisi.";
+    if (!form.buildingId) errors.location = "Gedung wajib dipilih.";
+    else if (!form.floorId) errors.location = "Lantai wajib dipilih.";
+    else if (!form.roomId) errors.location = "Ruangan wajib dipilih.";
     if (!form.ownershipStatus) errors.ownershipStatus = "Status kepemilikan wajib dipilih.";
     if (!form.assetStatus) errors.assetStatus = "Status aset wajib dipilih.";
     if (!form.condition) errors.condition = "Kondisi aset wajib dipilih.";
@@ -259,6 +300,13 @@ export default function EditAssetPage() {
       };
       console.debug("[Asset Save] payload photo fields:", photoFields);
 
+      const assetLocationText = buildFullPath({
+        buildingName: form.buildingName || "",
+        floorName: form.floor || "",
+        roomName: form.roomName || "",
+        areaName: form.areaName || "",
+      });
+
       await updateDoc(doc(db, "assets", asset.id), {
         assetName: form.assetName,
         assetCode: form.assetCode,
@@ -276,7 +324,18 @@ export default function EditAssetPage() {
         companyOwnerName: companyOwner?.name || form.companyOwnerName || "",
         divisionOwnerId: form.divisionOwnerId || null,
         divisionOwnerName: divisionOwner?.name || form.divisionOwnerName || "",
-        location: form.location || "",
+        location: assetLocationText,
+        buildingId: form.buildingId || null,
+        buildingName: form.buildingName || "",
+        floorId: form.floorId || null,
+        floor: form.floor || "",
+        roomId: form.roomId || null,
+        roomName: form.roomName || "",
+        areaId: form.areaId || null,
+        areaName: form.areaName || "",
+        locationId:
+          form.areaId || form.roomId || form.floorId || form.buildingId || null,
+        locationText: assetLocationText,
         responsiblePersonUid: form.responsiblePersonUid || null,
         responsiblePersonName:
           responsiblePerson?.name || form.responsiblePersonName || "",
@@ -520,13 +579,30 @@ export default function EditAssetPage() {
                     ))}
                   </select>
                 </Field>
-                <Field label="Lokasi" required error={fieldErrors.location}>
-                  <input
-                    value={form.location || ""}
-                    onChange={(e) => set("location", e.target.value)}
-                    className="input"
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                    Lokasi Asset <span className="text-red-500">*</span>
+                  </label>
+                  {form.location && !form.buildingId && (
+                    <p className="mb-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                      Asset ini masih memakai lokasi lama. Pilih Lokasi Asset dari Master Lokasi
+                      untuk sinkronisasi.
+                    </p>
+                  )}
+                  <LocationCascadeFields
+                    locations={locations}
+                    value={locationSelection}
+                    onChange={handleLocationSelectionChange}
                   />
-                </Field>
+                  {fieldErrors.location && (
+                    <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
+                  )}
+                  {form.location && !form.buildingId && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Lokasi Lama: <span className="text-slate-700">{form.location}</span>
+                    </p>
+                  )}
+                </div>
                 <Field label="Penanggung Jawab">
                   <SearchableSelect
                     items={employeeItems}

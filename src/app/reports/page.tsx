@@ -1,192 +1,280 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { collection, onSnapshot } from "firebase/firestore";
-import * as XLSX from "xlsx";
-import { FileDown } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import {
+  addDoc,
+  collection,
+  collectionGroup,
+  onSnapshot,
+  serverTimestamp,
+} from "firebase/firestore";
+import { Camera } from "lucide-react";
 import { db } from "@/lib/firebase";
-import { Asset, AssetBorrowing, AssetCategory } from "@/lib/types";
-import { formatDate } from "@/lib/utils";
+import { useAuth } from "@/lib/auth-context";
+import {
+  Asset,
+  AssetBorrowing,
+  AssetCategory,
+  AssetIssueTicket,
+  MaintenanceWorkOrder,
+  MaintenanceWorkOrderItem,
+} from "@/lib/types";
+import {
+  assetMatchesFilters,
+  DEFAULT_REPORT_FILTERS,
+  isMaintenanceOverdue,
+  isWithinRange,
+  resolveDateRange,
+} from "@/lib/reports";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
+import ReportsFilterBar from "@/components/reports/ReportsFilterBar";
+import OverviewTab from "@/components/reports/tabs/OverviewTab";
+import AssetHealthTab from "@/components/reports/tabs/AssetHealthTab";
+import TicketReportTab from "@/components/reports/tabs/TicketReportTab";
+import MaintenanceReportTab from "@/components/reports/tabs/MaintenanceReportTab";
+import BorrowingReportTab from "@/components/reports/tabs/BorrowingReportTab";
+import LocationReportTab from "@/components/reports/tabs/LocationReportTab";
+import CostReportTab from "@/components/reports/tabs/CostReportTab";
+import ExportTab from "@/components/reports/tabs/ExportTab";
+
+type TabKey =
+  | "overview"
+  | "asset_health"
+  | "ticket"
+  | "maintenance"
+  | "borrowing"
+  | "location"
+  | "cost"
+  | "export";
+
+const TABS: { key: TabKey; label: string }[] = [
+  { key: "overview", label: "Overview" },
+  { key: "asset_health", label: "Asset Health" },
+  { key: "ticket", label: "Ticket Kendala" },
+  { key: "maintenance", label: "Maintenance" },
+  { key: "borrowing", label: "Borrowing" },
+  { key: "location", label: "Lokasi & Ruangan" },
+  { key: "cost", label: "Cost & Recommendation" },
+  { key: "export", label: "Export" },
+];
 
 export default function ReportsPage() {
+  const { assetUser, role } = useAuth();
+  const [activeTab, setActiveTab] = useState<TabKey>("overview");
+  const [filters, setFilters] = useState(DEFAULT_REPORT_FILTERS);
+
   const [assets, setAssets] = useState<Asset[]>([]);
-  const [borrowings, setBorrowings] = useState<AssetBorrowing[]>([]);
   const [categories, setCategories] = useState<AssetCategory[]>([]);
+  const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
+  const [workOrders, setWorkOrders] = useState<MaintenanceWorkOrder[]>([]);
+  const [items, setItems] = useState<MaintenanceWorkOrderItem[]>([]);
+  const [borrowings, setBorrowings] = useState<AssetBorrowing[]>([]);
+  const [loadError, setLoadError] = useState("");
+  const [snapshotSaving, setSnapshotSaving] = useState(false);
+  const [snapshotSaved, setSnapshotSaved] = useState(false);
+  const canViewReports = role === "super_admin" || role === "asset_admin";
 
-  const [categoryFilter, setCategoryFilter] = useState("");
-  const [statusFilter, setStatusFilter] = useState("");
-  const [companyFilter, setCompanyFilter] = useState("");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
-
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, "assets"), (snap) => {
-      setAssets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset)));
-    });
-    return () => unsub();
-  }, []);
-
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_borrowings"), (snap) => {
-      setBorrowings(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))
-      );
-    });
-    return () => unsub();
-  }, []);
-
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_categories"), (snap) => {
-      setCategories(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
-      );
-    });
-    return () => unsub();
-  }, []);
-
-  const companies = Array.from(
-    new Set(assets.map((a) => a.companyOwnerName).filter(Boolean))
-  ) as string[];
-
-  const filteredAssets = assets.filter((a) => {
-    if (categoryFilter && a.categoryId !== categoryFilter) return false;
-    if (statusFilter && a.assetStatus !== statusFilter) return false;
-    if (companyFilter && a.companyOwnerName !== companyFilter) return false;
-    if (dateFrom || dateTo) {
-      const pd = a.purchaseDate ? new Date(a.purchaseDate) : null;
-      if (!pd) return false;
-      if (dateFrom && pd < new Date(dateFrom)) return false;
-      if (dateTo && pd > new Date(dateTo)) return false;
-    }
-    return true;
-  });
-
-  const exportAssets = () => {
-    const data = filteredAssets.map((a) => ({
-      "Nama Aset": a.assetName,
-      "Kode Aset": a.assetCode,
-      Kategori: a.categoryName,
-      Merk: a.brand,
-      Model: a.model,
-      Lokasi: a.location,
-      Perusahaan: a.companyOwnerName,
-      Divisi: a.divisionOwnerName,
-      "Status Aset": a.assetStatus,
-      Kondisi: a.condition,
-      "Harga Beli": a.purchasePrice,
-      "Tanggal Beli": a.purchaseDate,
-      Vendor: a.vendorName,
-    }));
-    const ws = XLSX.utils.json_to_sheet(data);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Assets");
-    XLSX.writeFile(wb, `assets-report-${Date.now()}.xlsx`);
+  const handleIndexError = (label: string) => (err: unknown) => {
+    console.error(`[Reports] error loading ${label}`, err);
+    setLoadError(
+      "Firestore membutuhkan index untuk filter ini. Cek console untuk link pembuatan index."
+    );
   };
 
-  const exportBorrowings = () => {
-    const data = borrowings.map((b) => ({
-      Aset: b.assetName,
-      Kode: b.assetCode,
-      Peminjam: b.borrowedByName,
-      Email: b.borrowedByEmail,
-      "Tgl Pinjam": formatDate(b.borrowedAt),
-      "Est. Kembali": b.estimatedReturnAt,
-      "Tgl Kembali": b.returnedAt ? formatDate(b.returnedAt) : "",
-      Status: b.status,
-    }));
-    const ws = XLSX.utils.json_to_sheet(data);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Borrowings");
-    XLSX.writeFile(wb, `borrowings-report-${Date.now()}.xlsx`);
+  useEffect(() => {
+    if (!canViewReports) return;
+    console.debug("[Reports] loading assets");
+    const unsub = onSnapshot(
+      collection(db, "assets"),
+      (snap) => setAssets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset))),
+      handleIndexError("assets")
+    );
+    return () => unsub();
+  }, [canViewReports]);
+
+  useEffect(() => {
+    if (!canViewReports) return;
+    const unsub = onSnapshot(collection(db, "asset_categories"), (snap) => {
+      setCategories(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory)));
+    });
+    return () => unsub();
+  }, [canViewReports]);
+
+  useEffect(() => {
+    if (!canViewReports) return;
+    console.debug("[Reports] loading tickets");
+    const unsub = onSnapshot(
+      collection(db, "asset_issue_tickets"),
+      (snap) => setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket))),
+      handleIndexError("tickets")
+    );
+    return () => unsub();
+  }, [canViewReports]);
+
+  useEffect(() => {
+    if (!canViewReports) return;
+    console.debug("[Reports] loading maintenance");
+    const unsub = onSnapshot(
+      collection(db, "asset_maintenance_work_orders"),
+      (snap) =>
+        setWorkOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder))),
+      handleIndexError("maintenance work orders")
+    );
+    return () => unsub();
+  }, [canViewReports]);
+
+  useEffect(() => {
+    if (!canViewReports) return;
+    const unsub = onSnapshot(
+      collectionGroup(db, "items"),
+      (snap) =>
+        setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrderItem))),
+      handleIndexError("maintenance work order items")
+    );
+    return () => unsub();
+  }, [canViewReports]);
+
+  useEffect(() => {
+    if (!canViewReports) return;
+    console.debug("[Reports] loading borrowings");
+    const unsub = onSnapshot(
+      collection(db, "asset_borrowings"),
+      (snap) => setBorrowings(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))),
+      handleIndexError("borrowings")
+    );
+    return () => unsub();
+  }, [canViewReports]);
+
+  useEffect(() => {
+    console.debug("[Reports] filters", filters);
+  }, [filters]);
+
+  const { from: dateFrom, to: dateTo } = useMemo(
+    () => resolveDateRange(filters.datePreset, filters.customFrom, filters.customTo),
+    [filters.datePreset, filters.customFrom, filters.customTo]
+  );
+
+  const filteredAssets = useMemo(
+    () => assets.filter((a) => assetMatchesFilters(a, filters)),
+    [assets, filters]
+  );
+  const filteredAssetIds = useMemo(() => new Set(filteredAssets.map((a) => a.id)), [filteredAssets]);
+
+  const filteredTickets = useMemo(
+    () => tickets.filter((t) => filteredAssetIds.has(t.assetId)),
+    [tickets, filteredAssetIds]
+  );
+  const filteredWorkOrders = useMemo(
+    () => workOrders.filter((w) => w.assetIds?.some((id) => filteredAssetIds.has(id))),
+    [workOrders, filteredAssetIds]
+  );
+  const filteredBorrowings = useMemo(
+    () => borrowings.filter((b) => assets.some((a) => a.id && a.assetCode === b.assetCode && filteredAssetIds.has(a.id))),
+    [borrowings, assets, filteredAssetIds]
+  );
+
+  const handleGenerateSnapshot = async () => {
+    setSnapshotSaving(true);
+    try {
+      const ticketsInRange = tickets.filter((t) => isWithinRange(t.reportedAt, dateFrom, dateTo));
+      const totalCost = assets.reduce((sum, a) => sum + (a.purchasePrice || 0), 0);
+      await addDoc(collection(db, "asset_report_snapshots"), {
+        period: filters.datePreset,
+        periodStart: dateFrom.toISOString(),
+        periodEnd: dateTo.toISOString(),
+        totalAssets: assets.length,
+        totalTickets: ticketsInRange.length,
+        totalMaintenance: workOrders.length,
+        totalBorrowings: borrowings.length,
+        totalOverdueMaintenance: assets.filter(isMaintenanceOverdue).length,
+        totalCost,
+        generatedAt: serverTimestamp(),
+        generatedByUid: assetUser?.uid || "",
+        generatedByName: assetUser?.name || "",
+      });
+      setSnapshotSaved(true);
+      setTimeout(() => setSnapshotSaved(false), 2500);
+    } finally {
+      setSnapshotSaving(false);
+    }
   };
 
   return (
     <ProtectedLayout>
       <PageHeader
-        title="Reports / Export"
-        subtitle="Ekspor data aset dan peminjaman ke Excel untuk pelaporan."
+        title="Reports & Analytics"
+        subtitle="Analisis data asset untuk pengambilan keputusan."
+        actions={
+          <button
+            type="button"
+            onClick={handleGenerateSnapshot}
+            disabled={snapshotSaving}
+            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium cursor-pointer hover:bg-slate-50 disabled:opacity-60"
+          >
+            <Camera size={15} />
+            {snapshotSaving ? "Menyimpan..." : snapshotSaved ? "Snapshot Tersimpan" : "Simpan Snapshot Bulanan"}
+          </button>
+        }
       />
 
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-5">
-        <h2 className="font-semibold text-slate-800 mb-4">Filter Laporan Aset</h2>
-        <div className="grid md:grid-cols-3 lg:grid-cols-5 gap-3 mb-4">
-          <select
-            value={categoryFilter}
-            onChange={(e) => setCategoryFilter(e.target.value)}
-            className="input"
-          >
-            <option value="">Semua Kategori</option>
-            {categories.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.categoryName}
-              </option>
-            ))}
-          </select>
-          <select
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-            className="input"
-          >
-            <option value="">Semua Status</option>
-            <option value="available">Tersedia</option>
-            <option value="borrowed">Dipinjam</option>
-            <option value="maintenance">Maintenance</option>
-            <option value="broken">Rusak</option>
-          </select>
-          <select
-            value={companyFilter}
-            onChange={(e) => setCompanyFilter(e.target.value)}
-            className="input"
-          >
-            <option value="">Semua Perusahaan</option>
-            {companies.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
-          <input
-            type="date"
-            value={dateFrom}
-            onChange={(e) => setDateFrom(e.target.value)}
-            className="input"
-          />
-          <input
-            type="date"
-            value={dateTo}
-            onChange={(e) => setDateTo(e.target.value)}
-            className="input"
-          />
-        </div>
-        <p className="text-sm text-slate-500 mb-4">
-          <span className="font-semibold text-slate-800">{filteredAssets.length}</span> aset
-          cocok dengan filter.
+      {loadError && (
+        <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl px-4 py-2.5 mb-4">
+          {loadError}
         </p>
-        <button
-          onClick={exportAssets}
-          className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-teal-500 text-white px-4 py-2.5 text-sm font-medium hover:brightness-105 shadow-md shadow-blue-900/20"
-        >
-          <FileDown size={16} />
-          Export Aset ke Excel
-        </button>
+      )}
+
+      <ReportsFilterBar filters={filters} onChange={setFilters} assets={assets} categories={categories} />
+
+      <div className="flex items-center gap-1 mb-5 border-b border-slate-200 overflow-x-auto">
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            onClick={() => setActiveTab(t.key)}
+            className={`px-4 py-2.5 text-sm font-medium whitespace-nowrap cursor-pointer border-b-2 -mb-px transition-colors ${
+              activeTab === t.key
+                ? "border-blue-600 text-blue-700"
+                : "border-transparent text-slate-500 hover:text-slate-700"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
       </div>
 
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
-        <h2 className="font-semibold text-slate-800 mb-2">Laporan Peminjaman</h2>
-        <p className="text-sm text-slate-500 mb-4">
-          <span className="font-semibold text-slate-800">{borrowings.length}</span> total data
-          peminjaman.
-        </p>
-        <button
-          onClick={exportBorrowings}
-          className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-teal-500 text-white px-4 py-2.5 text-sm font-medium hover:brightness-105 shadow-md shadow-blue-900/20"
-        >
-          <FileDown size={16} />
-          Export Peminjaman ke Excel
-        </button>
-      </div>
+      {activeTab === "overview" && (
+        <OverviewTab
+          assets={filteredAssets}
+          tickets={filteredTickets}
+          workOrders={filteredWorkOrders}
+          dateFrom={dateFrom}
+          dateTo={dateTo}
+        />
+      )}
+      {activeTab === "asset_health" && (
+        <AssetHealthTab assets={filteredAssets} tickets={filteredTickets} workOrders={filteredWorkOrders} />
+      )}
+      {activeTab === "ticket" && <TicketReportTab tickets={filteredTickets} />}
+      {activeTab === "maintenance" && (
+        <MaintenanceReportTab assets={filteredAssets} workOrders={filteredWorkOrders} items={items} />
+      )}
+      {activeTab === "borrowing" && <BorrowingReportTab borrowings={filteredBorrowings} />}
+      {activeTab === "location" && (
+        <LocationReportTab assets={filteredAssets} tickets={filteredTickets} workOrders={filteredWorkOrders} />
+      )}
+      {activeTab === "cost" && (
+        <CostReportTab assets={filteredAssets} tickets={filteredTickets} borrowings={filteredBorrowings} />
+      )}
+      {activeTab === "export" && (
+        <ExportTab
+          assets={filteredAssets}
+          tickets={filteredTickets}
+          workOrders={filteredWorkOrders}
+          items={items}
+          borrowings={filteredBorrowings}
+        />
+      )}
     </ProtectedLayout>
   );
 }
