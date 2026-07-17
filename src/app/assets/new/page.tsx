@@ -12,6 +12,8 @@ import {
   AssetLocationNode,
   AssetStatus,
   AssetCondition,
+  AssetUsageType,
+  TrackingMode,
   DriveUploadResult,
   EmployeeProfile,
   FundingSource,
@@ -21,14 +23,18 @@ import {
 } from "@/lib/types";
 import { fetchHrpBrands, fetchHrpDivisions } from "@/lib/hrp";
 import {
+  fetchActiveUsersByRoles,
   generateAssetCode,
   isAssetCodeTaken,
   writeAssetLog,
 } from "@/lib/firestore-helpers";
+import { createAssetNotification } from "@/lib/notifications";
 import { buildFullPath } from "@/lib/locations";
 import {
   ASSET_STATUS_HELPER,
   ASSET_STATUS_LABEL,
+  ASSET_USAGE_TYPE_LABEL,
+  TRACKING_MODE_LABEL,
   CONDITION_LABEL,
   getQrImageSettings,
 } from "@/lib/utils";
@@ -44,6 +50,24 @@ import LocationCascadeFields, {
 } from "@/components/LocationCascadeFields";
 import FileUploadField from "@/components/FileUploadField";
 import { Toast, ToastState } from "@/components/Toast";
+
+// Section A/B — mode tracking aset. Menggantikan "Tipe Pemakaian Aset" di
+// form sebagai field utama; usageType lama tetap diturunkan darinya supaya
+// kode/tampilan lain yang masih baca usageType tidak perlu diubah semua.
+const TRACKING_MODE_OPTIONS: { value: TrackingMode; hint: string }[] = [
+  {
+    value: "fixed_location",
+    hint: "Aset menetap di lokasi, tidak dipinjam/diserahkan — mis. AC, meja, kursi, lemari, CCTV, printer ruangan.",
+  },
+  {
+    value: "assigned_pic",
+    hint: "Dipakai harian oleh satu PIC operasional, bisa diserahkan sementara — mis. HP sosial media, laptop kerja.",
+  },
+  {
+    value: "shared_borrowable",
+    hint: "Dipakai bergantian/dipinjam — mis. kamera, tripod, proyektor, mic, tablet.",
+  },
+];
 
 const OWNERSHIP_OPTIONS: OwnershipStatus[] = [
   "Aset Perusahaan",
@@ -85,8 +109,19 @@ const CONDITION_OPTIONS: AssetCondition[] = [
 ];
 
 export default function NewAssetPage() {
-  const { assetUser } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const router = useRouter();
+
+  // Section A/H — Asset Finance TIDAK boleh membuat aset baru (bukan bagian
+  // dari kewenangannya), hanya boleh mengedit data finance aset yang sudah
+  // ada. NAV_ITEMS mengizinkan "/assets" secara umum, jadi guard tambahan di
+  // sini mencegah akses langsung lewat URL /assets/new.
+  useEffect(() => {
+    if (authReady && role === "asset_finance") {
+      router.replace("/assets");
+    }
+  }, [authReady, role, router]);
   const [categories, setCategories] = useState<AssetCategory[]>([]);
   const [employees, setEmployees] = useState<EmployeeProfile[]>([]);
   const [brands, setBrands] = useState<HrpBrand[]>([]);
@@ -123,6 +158,10 @@ export default function NewAssetPage() {
   const [responsiblePersonUid, setResponsiblePersonUid] = useState("");
   const [ownershipStatus, setOwnershipStatus] =
     useState<OwnershipStatus>("Aset Perusahaan");
+  const [trackingMode, setTrackingMode] = useState<TrackingMode>("shared_borrowable");
+  // usageType (skema lama) diturunkan dari trackingMode — SATU sumber data,
+  // supaya tidak ada dua state yang bisa saling desync.
+  const usageType: AssetUsageType = trackingMode === "assigned_pic" ? "assigned_daily" : "shared_pool";
 
   // C. Finance
   const [purchaseDate, setPurchaseDate] = useState("");
@@ -163,43 +202,83 @@ export default function NewAssetPage() {
   );
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_categories"), (snap) => {
-      setCategories(
-        snap.docs
-          .map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
-          .filter((c) => c.status === "active")
-      );
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_categories"),
+      (snap) => {
+        console.log("[NewAssetPage Listener] asset_categories success:", snap.size);
+        setCategories(
+          snap.docs
+            .map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
+            .filter((c) => c.status === "active")
+        );
+      },
+      (error) => {
+        console.error("[NewAssetPage Listener] asset_categories error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_locations"), (snap) => {
-      setLocations(
-        snap.docs
-          .map((d) => ({ id: d.id, ...d.data() } as AssetLocationNode))
-          .filter((n) => n.status === "active")
-      );
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_locations"),
+      (snap) => {
+        console.log("[NewAssetPage Listener] asset_locations success:", snap.size);
+        setLocations(
+          snap.docs
+            .map((d) => ({ id: d.id, ...d.data() } as AssetLocationNode))
+            .filter((n) => n.status === "active")
+        );
+      },
+      (error) => {
+        console.error("[NewAssetPage Listener] asset_locations error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, EMPLOYEE_PROFILES_COLLECTION), (snap) => {
-      setEmployees(
-        snap.docs
-          .map((d) => ({ uid: d.id, ...d.data() } as EmployeeProfile))
-          .filter((e) => !e.status || e.status === "active")
-      );
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, EMPLOYEE_PROFILES_COLLECTION),
+      (snap) => {
+        console.log("[NewAssetPage Listener] employee_profiles success:", snap.size);
+        setEmployees(
+          snap.docs
+            // Doc id HARUS jadi fallback terakhir, bukan base yang bisa
+            // ditimpa field "uid" di data (kalau ada field itu di HRP source
+            // dan isinya beda/kosong, PIC yang dipilih jadi tidak match saat
+            // dicari lagi pakai uid ini).
+            .map((d) => {
+              const data = d.data() as Record<string, unknown>;
+              return { ...data, uid: (data.uid as string) || (data.userId as string) || d.id } as EmployeeProfile;
+            })
+            .filter((e) => {
+              const status = String(e.status || "").toLowerCase();
+              const roleText = String(e.role || "").toLowerCase();
+              const isCandidate =
+                roleText.includes("kandidat") || roleText.includes("candidate") || roleText.includes("applicant");
+              const isInactive = status.includes("inactive") || status.includes("nonaktif") || status.includes("rejected");
+              return !isCandidate && !isInactive;
+            })
+        );
+      },
+      (error) => {
+        console.error("[NewAssetPage Listener] employee_profiles error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
+    if (!authReady) return;
     fetchHrpBrands().then(setBrands);
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
+    if (!authReady) return;
     if (!companyOwnerId) return;
     let cancelled = false;
     fetchHrpDivisions(companyOwnerId)
@@ -212,7 +291,7 @@ export default function NewAssetPage() {
     return () => {
       cancelled = true;
     };
-  }, [companyOwnerId]);
+  }, [authReady, companyOwnerId]);
 
   const handleCompanyChange = (value: string) => {
     setCompanyOwnerId(value);
@@ -286,6 +365,8 @@ export default function NewAssetPage() {
     else if (!locationSelection.floorId) errors.location = "Lantai wajib dipilih.";
     else if (!locationSelection.roomId) errors.location = "Ruangan wajib dipilih.";
     if (!ownershipStatus) errors.ownershipStatus = "Status kepemilikan wajib dipilih.";
+    if (trackingMode === "assigned_pic" && !responsiblePersonUid)
+      errors.responsiblePersonUid = "PIC Operasional wajib dipilih untuk aset dengan PIC.";
     if (!assetStatus) errors.assetStatus = "Status aset wajib dipilih.";
     if (!condition) errors.condition = "Kondisi aset wajib dipilih.";
 
@@ -373,6 +454,46 @@ export default function NewAssetPage() {
           (responsiblePerson?.jobTitle as string) || (responsiblePerson?.jabatan as string) || "",
         ownershipStatus,
 
+        // ── Mode tracking, tipe pemakaian & custodian ─────────────────────
+        // "PIC/Custodian" pakai picker yang sama dengan responsiblePerson di
+        // atas — custodian* cuma alias semantik dari data karyawan yang sama.
+        // Aset "fixed_location" TIDAK masuk sistem custodian/currentHolder
+        // sama sekali (section B) — hanya PIC Lokasi opsional di
+        // responsiblePerson*.
+        trackingMode,
+        trackingModeLabel: TRACKING_MODE_LABEL[trackingMode],
+        usageType: trackingMode === "fixed_location" ? null : usageType,
+        usageTypeLabel: trackingMode === "fixed_location" ? null : ASSET_USAGE_TYPE_LABEL[usageType],
+        custodianUid: trackingMode === "fixed_location" ? null : responsiblePersonUid || null,
+        custodianName: trackingMode === "fixed_location" ? null : responsiblePerson?.name || null,
+        custodianEmail: trackingMode === "fixed_location" ? null : responsiblePerson?.email || null,
+        custodianDivision:
+          trackingMode === "fixed_location" ? null : (responsiblePerson?.divisionName as string) || null,
+        currentHolderUid: trackingMode === "assigned_pic" ? responsiblePersonUid || null : null,
+        currentHolderName: trackingMode === "assigned_pic" ? responsiblePerson?.name || null : null,
+        currentHolderEmail: trackingMode === "assigned_pic" ? responsiblePerson?.email || null : null,
+        currentHolderDivision:
+          trackingMode === "assigned_pic" ? (responsiblePerson?.divisionName as string) || null : null,
+        currentUsageStatus:
+          trackingMode === "fixed_location"
+            ? "fixed_at_location"
+            : trackingMode === "assigned_pic"
+            ? "with_custodian"
+            : "available",
+        currentUsageStatusLabel:
+          trackingMode === "fixed_location"
+            ? "Tetap di Lokasi"
+            : trackingMode === "assigned_pic"
+            ? "Bersama Custodian"
+            : "Tersedia",
+        currentUsageStartedAt: trackingMode === "assigned_pic" ? serverTimestamp() : null,
+        // Alias legacy — tampilan/laporan lama yang masih baca pic* tetap
+        // konsisten dengan custodian baru. Untuk fixed_location, dipakai
+        // sebagai "PIC Lokasi".
+        picUid: responsiblePersonUid || null,
+        picName: responsiblePerson?.name || null,
+        picEmail: responsiblePerson?.email || null,
+
         purchaseDate: purchaseDate || null,
         purchasePrice: purchasePrice ?? null,
         vendorName: vendorName.trim(),
@@ -415,6 +536,29 @@ export default function NewAssetPage() {
         userName: assetUser?.name || "",
         detail: "Aset dibuat",
       });
+
+      const notifyRecipients = (await fetchActiveUsersByRoles(["asset_admin", "super_admin"])).filter(
+        (u) => u.uid !== assetUser?.uid
+      );
+      await Promise.all(
+        notifyRecipients.map((recipient) =>
+          createAssetNotification({
+            recipientUid: recipient.uid,
+            recipientName: recipient.name,
+            recipientRole: recipient.role,
+            title: "Asset Baru Ditambahkan",
+            message: `${assetName.trim()} (${assetCode.trim()}) ditambahkan oleh ${assetUser?.name || "seseorang"}.`,
+            type: "asset_created",
+            priority: "low",
+            linkUrl: `/assets/${docRef.id}`,
+            relatedType: "asset",
+            relatedId: docRef.id,
+            relatedNumber: assetCode.trim(),
+            createdByUid: assetUser?.uid,
+            createdByName: assetUser?.name,
+          })
+        )
+      );
 
       setToast({ type: "success", message: "Asset berhasil ditambahkan." });
       router.push(`/assets/${docRef.id}`);
@@ -618,7 +762,32 @@ export default function NewAssetPage() {
                     <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
                   )}
                 </div>
-                <Field label="Penanggung Jawab">
+                <Field
+                  label="Mode Tracking Aset"
+                  hint={TRACKING_MODE_OPTIONS.find((o) => o.value === trackingMode)?.hint}
+                >
+                  <select
+                    value={trackingMode}
+                    onChange={(e) => setTrackingMode(e.target.value as TrackingMode)}
+                    className="input"
+                  >
+                    {TRACKING_MODE_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {TRACKING_MODE_LABEL[o.value]}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field
+                  label={trackingMode === "fixed_location" ? "PIC Lokasi" : "PIC / Custodian Aset"}
+                  required={trackingMode === "assigned_pic"}
+                  hint={
+                    trackingMode === "fixed_location"
+                      ? "Orang yang menjaga/mendata aset di lokasi ini (opsional)."
+                      : "Orang yang bertanggung jawab utama atas aset ini."
+                  }
+                  error={fieldErrors.responsiblePersonUid}
+                >
                   <SearchableSelect
                     items={employeeItems}
                     value={responsiblePersonUid}
@@ -628,6 +797,18 @@ export default function NewAssetPage() {
                     emptyText="Tidak ada karyawan yang cocok."
                   />
                 </Field>
+                {trackingMode === "assigned_pic" && (
+                  <p className="sm:col-span-2 text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded-xl px-3 py-2">
+                    Karena aset ini punya PIC Operasional, PIC akan otomatis menjadi pemegang utama
+                    aset.
+                  </p>
+                )}
+                {trackingMode === "fixed_location" && (
+                  <p className="sm:col-span-2 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+                    Aset tetap lokasi tidak masuk sistem pinjam/PIC operasional — fokus ke lokasi dan
+                    maintenance.
+                  </p>
+                )}
                 <Field
                   label="Status Kepemilikan"
                   required

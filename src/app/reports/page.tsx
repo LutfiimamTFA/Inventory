@@ -60,7 +60,8 @@ const TABS: { key: TabKey; label: string }[] = [
 ];
 
 export default function ReportsPage() {
-  const { assetUser, role } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [activeTab, setActiveTab] = useState<TabKey>("overview");
   const [filters, setFilters] = useState(DEFAULT_REPORT_FILTERS);
 
@@ -73,7 +74,8 @@ export default function ReportsPage() {
   const [loadError, setLoadError] = useState("");
   const [snapshotSaving, setSnapshotSaving] = useState(false);
   const [snapshotSaved, setSnapshotSaved] = useState(false);
-  const canViewReports = role === "super_admin" || role === "asset_admin";
+  const canViewReports =
+    authReady && (role === "super_admin" || role === "asset_admin" || role === "asset_finance");
 
   const handleIndexError = (label: string) => (err: unknown) => {
     console.error(`[Reports] error loading ${label}`, err);
@@ -87,7 +89,10 @@ export default function ReportsPage() {
     console.debug("[Reports] loading assets");
     const unsub = onSnapshot(
       collection(db, "assets"),
-      (snap) => setAssets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset))),
+      (snap) => {
+        console.log("[Reports Listener] assets success:", snap.size);
+        setAssets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset)));
+      },
       handleIndexError("assets")
     );
     return () => unsub();
@@ -95,9 +100,14 @@ export default function ReportsPage() {
 
   useEffect(() => {
     if (!canViewReports) return;
-    const unsub = onSnapshot(collection(db, "asset_categories"), (snap) => {
-      setCategories(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory)));
-    });
+    const unsub = onSnapshot(
+      collection(db, "asset_categories"),
+      (snap) => {
+        console.log("[Reports Listener] asset_categories success:", snap.size);
+        setCategories(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory)));
+      },
+      handleIndexError("asset_categories")
+    );
     return () => unsub();
   }, [canViewReports]);
 
@@ -106,7 +116,10 @@ export default function ReportsPage() {
     console.debug("[Reports] loading tickets");
     const unsub = onSnapshot(
       collection(db, "asset_issue_tickets"),
-      (snap) => setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket))),
+      (snap) => {
+        console.log("[Reports Listener] asset_issue_tickets success:", snap.size);
+        setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
+      },
       handleIndexError("tickets")
     );
     return () => unsub();
@@ -117,8 +130,10 @@ export default function ReportsPage() {
     console.debug("[Reports] loading maintenance");
     const unsub = onSnapshot(
       collection(db, "asset_maintenance_work_orders"),
-      (snap) =>
-        setWorkOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder))),
+      (snap) => {
+        console.log("[Reports Listener] asset_maintenance_work_orders success:", snap.size);
+        setWorkOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder)));
+      },
       handleIndexError("maintenance work orders")
     );
     return () => unsub();
@@ -128,8 +143,10 @@ export default function ReportsPage() {
     if (!canViewReports) return;
     const unsub = onSnapshot(
       collectionGroup(db, "items"),
-      (snap) =>
-        setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrderItem))),
+      (snap) => {
+        console.log("[Reports Listener] collectionGroup items success:", snap.size);
+        setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrderItem)));
+      },
       handleIndexError("maintenance work order items")
     );
     return () => unsub();
@@ -140,7 +157,10 @@ export default function ReportsPage() {
     console.debug("[Reports] loading borrowings");
     const unsub = onSnapshot(
       collection(db, "asset_borrowings"),
-      (snap) => setBorrowings(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))),
+      (snap) => {
+        console.log("[Reports Listener] asset_borrowings success:", snap.size);
+        setBorrowings(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing)));
+      },
       handleIndexError("borrowings")
     );
     return () => unsub();

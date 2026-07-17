@@ -9,7 +9,7 @@ import {
   setDoc,
   updateDoc,
 } from "firebase/firestore";
-import { Search, ShieldCheck, ShieldOff, Power, Users, RefreshCw } from "lucide-react";
+import { Search, ShieldCheck, ShieldOff, Power, Users, RefreshCw, MoreVertical } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { AppRole, AssetUser } from "@/lib/types";
@@ -38,12 +38,15 @@ interface AccessRow {
   lastLoginAt?: unknown;
 }
 
+const ASSIGNABLE_ROLES: AppRole[] = ["staff", "asset_admin", "asset_finance", "it_team"];
+
 type PendingAction =
   | { type: "role"; target: AccessRow; newRole: AppRole }
   | { type: "status"; target: AccessRow; newStatus: "active" | "inactive" };
 
 export default function AccessPage() {
-  const { assetUser: currentUser, role } = useAuth();
+  const { firebaseUser, assetUser: currentUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!currentUser && !!role;
   const [hrpEmployees, setHrpEmployees] = useState<HrpEmployeeInfo[]>([]);
   const [assetUsers, setAssetUsers] = useState<Record<string, AssetUser>>({});
   const [loadingHrp, setLoadingHrp] = useState(true);
@@ -76,10 +79,12 @@ export default function AccessPage() {
   }, []);
 
   useEffect(() => {
+    if (!authReady || role !== "super_admin") return;
     syncEmployeesFromHRP();
-  }, [syncEmployeesFromHRP]);
+  }, [authReady, role, syncEmployeesFromHRP]);
 
   const handleRefresh = () => {
+    if (!authReady || role !== "super_admin") return;
     if (isSyncingRef.current) {
       console.debug("[User Access] sync skipped because already running");
       return;
@@ -89,16 +94,23 @@ export default function AccessPage() {
   };
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_users"), (snap) => {
-      const map: Record<string, AssetUser> = {};
-      snap.docs.forEach((d) => {
-        map[d.id] = { uid: d.id, ...d.data() } as AssetUser;
-      });
-      console.debug("[User Access] asset_users loaded:", Object.keys(map).length);
-      setAssetUsers(map);
-    });
+    if (!authReady || role !== "super_admin") return;
+    const unsub = onSnapshot(
+      collection(db, "asset_users"),
+      (snap) => {
+        const map: Record<string, AssetUser> = {};
+        snap.docs.forEach((d) => {
+          map[d.id] = { uid: d.id, ...d.data() } as AssetUser;
+        });
+        console.log("[UserAccessPage Listener] asset_users success:", snap.size);
+        setAssetUsers(map);
+      },
+      (error) => {
+        console.error("[UserAccessPage Listener] asset_users error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady, role]);
 
   if (role !== "super_admin") {
     return (
@@ -168,6 +180,7 @@ export default function AccessPage() {
     total: rows.length,
     superAdmin: rows.filter((r) => r.role === "super_admin").length,
     assetAdmin: rows.filter((r) => r.role === "asset_admin").length,
+    assetFinance: rows.filter((r) => r.role === "asset_finance").length,
     itTeam: rows.filter((r) => r.role === "it_team").length,
     staff: rows.filter((r) => r.role === "staff").length,
     inactive: rows.filter((r) => !r.isDefaultStaff && r.effectiveStatus === "inactive").length,
@@ -285,10 +298,11 @@ export default function AccessPage() {
         }
       />
 
-      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-5">
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-7 gap-3 mb-5">
         <CounterCard label="Total Karyawan Aktif" value={counters.total} />
         <CounterCard label="Super Admin" value={counters.superAdmin} tone="purple" />
         <CounterCard label="Asset Admin" value={counters.assetAdmin} tone="blue" />
+        <CounterCard label="Asset Finance" value={counters.assetFinance} tone="amber" />
         <CounterCard label="Tim IT" value={counters.itTeam} tone="emerald" />
         <CounterCard label="Staff" value={counters.staff} tone="slate" />
         <CounterCard label="Inactive" value={counters.inactive} tone="red" />
@@ -315,6 +329,7 @@ export default function AccessPage() {
           <option value="">Semua Role</option>
           <option value="super_admin">Super Admin</option>
           <option value="asset_admin">Asset Admin</option>
+          <option value="asset_finance">Asset Finance</option>
           <option value="it_team">Tim IT</option>
           <option value="staff">Staff</option>
         </select>
@@ -372,14 +387,15 @@ export default function AccessPage() {
                 {filtered.map((r) => {
                   const isSelf = r.uid === currentUser?.uid;
                   const isSelfSuperAdmin = isSelf && r.role === "super_admin";
+                  // Section C — dropdown "Aksi": tampilkan semua role yang
+                  // bisa ditugaskan KECUALI role user saat ini. Super Admin
+                  // tidak pernah muncul di sini (tidak boleh downgrade lewat
+                  // UI ini) dan baris Super Admin sendiri tidak punya aksi
+                  // ganti role sama sekali.
                   const roleActions: AppRole[] =
-                    r.role === "staff"
-                      ? ["asset_admin", "it_team"]
-                      : r.role === "asset_admin"
-                      ? ["staff", "it_team"]
-                      : r.role === "it_team"
-                      ? ["staff", "asset_admin"]
-                      : [];
+                    r.role === "super_admin"
+                      ? []
+                      : ASSIGNABLE_ROLES.filter((x) => x !== r.role);
                   const canToggleStatus = !isSelfSuperAdmin && !isSelf;
                   const statusLabel = r.isDefaultStaff
                     ? "Default Staff"
@@ -423,46 +439,20 @@ export default function AccessPage() {
                       <td className="px-4 py-3 text-slate-500">
                         {r.lastLoginAt ? formatDate(r.lastLoginAt) : "-"}
                       </td>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center justify-end gap-2 flex-wrap">
-                          {roleActions.map((newRole) => (
-                            <button
-                              key={newRole}
-                              type="button"
-                              onClick={() =>
-                                setPending({
-                                  type: "role",
-                                  target: r,
-                                  newRole,
-                                })
-                              }
-                              className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-slate-600 cursor-pointer transition-colors hover:bg-slate-100 active:bg-slate-200"
-                            >
-                              <ShieldCheck size={14} />
-                              Jadikan {ROLE_LABEL[newRole]}
-                            </button>
-                          ))}
-                          {canToggleStatus && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setPending({
-                                  type: "status",
-                                  target: r,
-                                  newStatus: r.effectiveStatus === "active" ? "inactive" : "active",
-                                })
-                              }
-                              className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
-                                r.effectiveStatus === "active"
-                                  ? "text-red-600 hover:bg-red-50 active:bg-red-100"
-                                  : "text-emerald-600 hover:bg-emerald-50 active:bg-emerald-100"
-                              }`}
-                            >
-                              <Power size={14} />
-                              {r.effectiveStatus === "active" ? "Nonaktifkan" : "Aktifkan"}
-                            </button>
-                          )}
-                        </div>
+                      <td className="px-4 py-3 text-right">
+                        <RowActionsMenu
+                          roleActions={roleActions}
+                          canToggleStatus={canToggleStatus}
+                          isActive={r.effectiveStatus === "active"}
+                          onPickRole={(newRole) => setPending({ type: "role", target: r, newRole })}
+                          onToggleStatus={() =>
+                            setPending({
+                              type: "status",
+                              target: r,
+                              newStatus: r.effectiveStatus === "active" ? "inactive" : "active",
+                            })
+                          }
+                        />
                       </td>
                     </tr>
                   );
@@ -500,6 +490,78 @@ export default function AccessPage() {
   );
 }
 
+// Section C — dropdown "Aksi" per baris, menggantikan tombol memanjang.
+// Ditutup lewat backdrop transparan (fixed inset-0) daripada listener
+// document supaya tidak perlu effect/cleanup tambahan per baris.
+function RowActionsMenu({
+  roleActions,
+  canToggleStatus,
+  isActive,
+  onPickRole,
+  onToggleStatus,
+}: {
+  roleActions: AppRole[];
+  canToggleStatus: boolean;
+  isActive: boolean;
+  onPickRole: (role: AppRole) => void;
+  onToggleStatus: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  if (roleActions.length === 0 && !canToggleStatus) {
+    return <span className="text-xs text-slate-400">-</span>;
+  }
+
+  return (
+    <div className="relative inline-block text-left">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 cursor-pointer hover:bg-slate-50"
+      >
+        Aksi
+        <MoreVertical size={14} />
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 mt-2 w-52 rounded-xl border border-slate-200 bg-white shadow-lg z-20 py-1.5">
+            {roleActions.map((newRole) => (
+              <button
+                key={newRole}
+                type="button"
+                onClick={() => {
+                  onPickRole(newRole);
+                  setOpen(false);
+                }}
+                className="flex h-9 w-full items-center gap-2 px-3 text-sm font-medium text-slate-600 cursor-pointer hover:bg-slate-50"
+              >
+                <ShieldCheck size={14} />
+                Jadikan {ROLE_LABEL[newRole]}
+              </button>
+            ))}
+            {canToggleStatus && (
+              <button
+                type="button"
+                onClick={() => {
+                  onToggleStatus();
+                  setOpen(false);
+                }}
+                className={`flex h-9 w-full items-center gap-2 px-3 text-sm font-medium cursor-pointer hover:bg-red-50 ${
+                  isActive ? "text-red-600" : "text-emerald-600"
+                }`}
+              >
+                <Power size={14} />
+                {isActive ? "Nonaktifkan" : "Aktifkan"}
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function CounterCard({
   label,
   value,
@@ -507,7 +569,7 @@ function CounterCard({
 }: {
   label: string;
   value: number;
-  tone?: "slate" | "blue" | "emerald" | "purple" | "red";
+  tone?: "slate" | "blue" | "emerald" | "purple" | "red" | "amber";
 }) {
   const toneClass = {
     slate: "text-slate-800",
@@ -515,6 +577,7 @@ function CounterCard({
     emerald: "text-emerald-600",
     purple: "text-purple-600",
     red: "text-red-600",
+    amber: "text-amber-600",
   }[tone];
 
   return (

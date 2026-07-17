@@ -85,7 +85,8 @@ function locationMatchesSearch(node: AssetLocationNode, search: string) {
 }
 
 export default function LocationsPage() {
-  const { role } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [locations, setLocations] = useState<AssetLocationNode[]>([]);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
@@ -106,32 +107,64 @@ export default function LocationsPage() {
   const canManage = role === "super_admin" || role === "asset_admin";
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_locations"), (snap) => {
-      setLocations(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetLocationNode)));
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_locations"),
+      (snap) => {
+        console.log("[LocationsPage Listener] asset_locations success:", snap.size);
+        setLocations(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetLocationNode)));
+      },
+      (error) => {
+        console.error("[LocationsPage Listener] asset_locations error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "assets"), (snap) => {
-      setAssets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset)));
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "assets"),
+      (snap) => {
+        console.log("[LocationsPage Listener] assets success:", snap.size);
+        setAssets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset)));
+      },
+      (error) => {
+        console.error("[LocationsPage Listener] assets error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_issue_tickets"), (snap) => {
-      setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_issue_tickets"),
+      (snap) => {
+        console.log("[LocationsPage Listener] asset_issue_tickets success:", snap.size);
+        setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
+      },
+      (error) => {
+        console.error("[LocationsPage Listener] asset_issue_tickets error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_maintenance_work_orders"), (snap) => {
-      setWorkOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder)));
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_maintenance_work_orders"),
+      (snap) => {
+        console.log("[LocationsPage Listener] asset_maintenance_work_orders success:", snap.size);
+        setWorkOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder)));
+      },
+      (error) => {
+        console.error("[LocationsPage Listener] asset_maintenance_work_orders error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   const selectedNode = locations.find((n) => n.id === selectedId) || null;
   const selectedBuilding = locations.find((n) => n.id === selectedBuildingId) || null;

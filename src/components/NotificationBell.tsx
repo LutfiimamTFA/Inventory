@@ -22,7 +22,8 @@ import { checkPushStatus, disableWebPush, enableWebPush } from "@/lib/push-notif
 import Badge from "@/components/Badge";
 
 export default function NotificationBell() {
-  const { assetUser } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [notifications, setNotifications] = useState<AssetNotification[]>([]);
@@ -36,25 +37,32 @@ export default function NotificationBell() {
   // login ulang) — kalau permission browser sudah granted dan token masih
   // valid, tombol langsung tampil aktif tanpa minta izin ulang.
   useEffect(() => {
-    if (!assetUser?.uid) return;
+    if (!authReady || !assetUser?.uid) return;
     let cancelled = false;
     checkPushStatus({
       uid: assetUser.uid,
       email: assetUser.email,
       name: assetUser.name,
       role: assetUser.role,
-    }).then((result) => {
-      if (cancelled) return;
-      setPushStatus(result.status);
-      if (result.status === "error" && result.message) setPushError(result.message);
-    });
+    })
+      .then((result) => {
+        if (cancelled) return;
+        setPushStatus(result.status);
+        if (result.status === "error" && result.message) setPushError(result.message);
+      })
+      .catch((err) => {
+        console.error("[NotificationBell] checkPushStatus error:", err);
+        if (cancelled) return;
+        setPushStatus("error");
+        setPushError("Gagal memeriksa status notifikasi.");
+      });
     return () => {
       cancelled = true;
     };
-  }, [assetUser?.uid, assetUser?.email, assetUser?.name, assetUser?.role]);
+  }, [authReady, assetUser?.uid, assetUser?.email, assetUser?.name, assetUser?.role]);
 
   useEffect(() => {
-    if (!assetUser?.uid) return;
+    if (!authReady || !assetUser?.uid) return;
     const q = query(
       collection(db, "asset_notifications"),
       where("recipientUid", "==", assetUser.uid),
@@ -72,7 +80,7 @@ export default function NotificationBell() {
       }
     );
     return () => unsub();
-  }, [assetUser?.uid]);
+  }, [authReady, assetUser?.uid]);
 
   useEffect(() => {
     if (!open) return;
@@ -115,14 +123,23 @@ export default function NotificationBell() {
     if (!assetUser) return;
     setPushStatus("requesting");
     setPushError("");
-    const result = await enableWebPush({
-      uid: assetUser.uid,
-      email: assetUser.email,
-      name: assetUser.name,
-      role: assetUser.role,
-    });
-    setPushStatus(result.status);
-    if (result.status === "error" && result.message) setPushError(result.message);
+    try {
+      const result = await enableWebPush({
+        uid: assetUser.uid,
+        email: assetUser.email,
+        name: assetUser.name,
+        role: assetUser.role,
+      });
+      setPushStatus(result.status);
+      if (result.status === "error" && result.message) setPushError(result.message);
+    } catch (err) {
+      // enableWebPush sudah menangkap error internal dan tidak seharusnya
+      // throw — try/catch ini cuma jaring pengaman terakhir supaya klik
+      // "Aktifkan Notifikasi" tidak pernah memunculkan overlay error Next.js.
+      console.error("[NotificationBell] enableWebPush error:", err);
+      setPushStatus("error");
+      setPushError("Gagal mengaktifkan notifikasi. Refresh halaman lalu coba lagi.");
+    }
   };
 
   const handleDisablePush = async () => {
@@ -183,7 +200,19 @@ export default function NotificationBell() {
                     <p className="text-sm font-medium text-slate-800 truncate">{n.title}</p>
                     {!n.isRead && <span className="h-2 w-2 rounded-full bg-blue-500 shrink-0" />}
                   </div>
-                  <p className="text-xs text-slate-500 line-clamp-2 mb-1.5">{n.message}</p>
+                  <p className="whitespace-pre-line text-xs text-slate-500 mb-1.5">{n.message}</p>
+                  {!!n.changeSummary && n.changeSummary.length > 0 && (
+                    <div className="mb-1.5 rounded-lg bg-slate-50 p-2 text-[11px] text-slate-600">
+                      {n.changeSummary.slice(0, 3).map((change, index) => (
+                        <div key={index}>• {change}</div>
+                      ))}
+                      {n.changeSummary.length > 3 && (
+                        <div className="text-slate-400">
+                          +{n.changeSummary.length - 3} perubahan lain
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <div className="flex items-center gap-2 flex-wrap">
                     <Badge
                       label={NOTIFICATION_TYPE_LABEL[n.type]}

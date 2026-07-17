@@ -2,7 +2,16 @@
 
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { collection, collectionGroup, onSnapshot, orderBy, query } from "firebase/firestore";
+import {
+  collection,
+  collectionGroup,
+  doc,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  updateDoc,
+} from "firebase/firestore";
 import {
   Inbox,
   Wrench,
@@ -42,7 +51,7 @@ import {
   getDueDateKey,
   isWorkOrderOverdue,
 } from "@/lib/utils";
-import { getMaintenanceSummaryCounts, workOrderProgress } from "@/lib/reports";
+import { getMaintenanceSummaryCounts, toDateSafe, workOrderProgress } from "@/lib/reports";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
 import Badge from "@/components/Badge";
@@ -82,11 +91,11 @@ const TICKET_TAB_STATUS: Partial<Record<TabKey, IssueTicketStatus[]>> = {
 
 const TABS: { key: TabKey; label: string; roles: AppRole[] }[] = [
   { key: "incoming", label: "Laporan Kendala Staff", roles: ["super_admin", "asset_admin"] },
+  { key: "schedule", label: "Maintenance Rutin", roles: ["asset_admin", "super_admin", "it_team"] },
   { key: "technician", label: "Antrian Tim IT", roles: ["super_admin", "it_team"] },
   { key: "follow_up", label: "Butuh Tindakan Lanjutan", roles: ["super_admin", "asset_admin", "it_team"] },
-  { key: "schedule", label: "Maintenance Rutin", roles: ["asset_admin", "super_admin"] },
-  { key: "my_tasks", label: "Tugas Saya", roles: ["super_admin", "it_team"] },
-  { key: "history", label: "Riwayat", roles: ["super_admin", "asset_admin"] },
+  { key: "my_tasks", label: "Tugas Kendala Saya", roles: ["super_admin", "it_team"] },
+  { key: "history", label: "Riwayat", roles: ["super_admin", "asset_admin", "it_team"] },
 ];
 
 // Badge angka tab: hijau/tidak penting tidak dapat badge sama sekali,
@@ -105,10 +114,161 @@ function formatBadgeCount(count: number) {
   return String(count);
 }
 
+const HISTORY_DONE_STATUSES = ["completed", "resolved", "closed"];
+const HISTORY_CANCELLED_STATUSES = ["cancelled", "rejected"];
+
 function logMaintenanceListenerError(label: string) {
   return (error: unknown) => {
     console.error(`[Maintenance Listener] ${label} error`, error);
   };
+}
+
+function normalizeMatchText(value?: string | null) {
+  return (value || "").toLowerCase().trim();
+}
+
+// Cocokkan work order ke user Tim IT yang sedang login lewat SEMUA field
+// yang pernah dipakai untuk menyimpan penugasan (uid, email, lalu nama
+// sebagai fallback terakhir) — jangan hanya cek assignedToUid, karena data
+// lama/dibuat lewat jalur berbeda bisa memakai nama field lain atau bahkan
+// cuma menyimpan nama teknisi tanpa uid sama sekali.
+function isAssignedToCurrentIt(
+  workOrder: MaintenanceWorkOrder,
+  currentAssetUser?: { uid?: string; email?: string; name?: string } | null,
+  firebaseUser?: { uid?: string; email?: string | null; displayName?: string | null } | null
+) {
+  const wo = workOrder as MaintenanceWorkOrder & {
+    assignedUserUid?: string;
+    assignedToId?: string;
+    picUid?: string;
+    picEmail?: string;
+    picName?: string;
+    executorUid?: string;
+    executorEmail?: string;
+    executorName?: string;
+  };
+
+  const uid = currentAssetUser?.uid || firebaseUser?.uid;
+  const email = normalizeMatchText(currentAssetUser?.email || firebaseUser?.email);
+  const name = normalizeMatchText(currentAssetUser?.name || firebaseUser?.displayName);
+
+  if (uid) {
+    const uidMatch =
+      wo.assignedToUid === uid ||
+      wo.technicianUid === uid ||
+      wo.assignedTechnicianUid === uid ||
+      wo.assignedToId === uid ||
+      wo.assignedUserUid === uid ||
+      wo.picUid === uid ||
+      wo.executorUid === uid;
+    if (uidMatch) return true;
+  }
+
+  if (email) {
+    const emailMatch =
+      normalizeMatchText(wo.assignedToEmail) === email ||
+      normalizeMatchText(wo.technicianEmail) === email ||
+      normalizeMatchText(wo.assignedTechnicianEmail) === email ||
+      normalizeMatchText(wo.picEmail) === email ||
+      normalizeMatchText(wo.executorEmail) === email;
+    if (emailMatch) return true;
+  }
+
+  if (name) {
+    const nameMatch =
+      normalizeMatchText(wo.assignedToName) === name ||
+      normalizeMatchText(wo.technicianName) === name ||
+      normalizeMatchText(wo.assignedTechnicianName) === name ||
+      normalizeMatchText(wo.picName) === name ||
+      normalizeMatchText(wo.executorName) === name;
+    if (nameMatch) return true;
+  }
+
+  return false;
+}
+
+// Versi generik isAssignedToCurrentIt yang juga dipakai untuk ticket kendala
+// (AssetIssueTicket hanya punya assignedToUid/assignedToName/assignedToEmail,
+// tanpa alias legacy seperti technicianUid) — dipakai khusus untuk scoping
+// Riwayat Tim IT supaya satu history hanya menampilkan tugas yang pernah
+// ditugaskan ke user yang sedang login.
+function isAssignedToCurrentUser(
+  item: {
+    assignedToUid?: string;
+    assignedToName?: string;
+    assignedToEmail?: string;
+    technicianUid?: string;
+    technicianName?: string;
+    technicianEmail?: string;
+    assignedTechnicianUid?: string;
+    assignedTechnicianName?: string;
+    assignedTechnicianEmail?: string;
+  },
+  currentAssetUser?: { uid?: string; email?: string; name?: string } | null,
+  firebaseUser?: { uid?: string; email?: string | null; displayName?: string | null } | null
+) {
+  const uid = currentAssetUser?.uid || firebaseUser?.uid;
+  const email = normalizeMatchText(currentAssetUser?.email || firebaseUser?.email);
+  const name = normalizeMatchText(currentAssetUser?.name || firebaseUser?.displayName);
+
+  if (uid) {
+    if (
+      item.assignedToUid === uid ||
+      item.technicianUid === uid ||
+      item.assignedTechnicianUid === uid
+    )
+      return true;
+  }
+  if (email) {
+    if (
+      normalizeMatchText(item.assignedToEmail) === email ||
+      normalizeMatchText(item.technicianEmail) === email ||
+      normalizeMatchText(item.assignedTechnicianEmail) === email
+    )
+      return true;
+  }
+  if (name) {
+    if (
+      normalizeMatchText(item.assignedToName) === name ||
+      normalizeMatchText(item.technicianName) === name ||
+      normalizeMatchText(item.assignedTechnicianName) === name
+    )
+      return true;
+  }
+  return false;
+}
+
+// Longgar dengan sengaja — data lama/jalur pembuatan berbeda bisa tidak
+// punya taskCategory/maintenanceSource sama sekali, jadi kita juga terima
+// tanda-tanda tidak langsung (frequencyMonths, due-date-key, dst) sebagai
+// bukti "ini jadwal rutin".
+function isRoutineWorkOrder(workOrder: MaintenanceWorkOrder) {
+  const wo = workOrder as MaintenanceWorkOrder & {
+    type?: string;
+    category?: string;
+    currentDueDateKey?: string;
+    nextDueDateKey?: string;
+    currentPeriodLabel?: string;
+  };
+  if (wo.taskCategory === "corrective") return false;
+  return (
+    wo.taskCategory === "routine" ||
+    wo.maintenanceSource === "routine_schedule" ||
+    wo.type === "routine" ||
+    wo.category === "routine" ||
+    !!wo.frequencyMonths ||
+    !!wo.dueDateKey ||
+    !!wo.currentDueDateKey ||
+    !!wo.nextDueDateKey ||
+    !!wo.currentPeriodLabel ||
+    !wo.taskCategory
+  );
+}
+
+function sortWorkOrdersNewestFirst(a: MaintenanceWorkOrder, b: MaintenanceWorkOrder) {
+  const ta = (a.createdAt as { seconds?: number })?.seconds || 0;
+  const tb = (b.createdAt as { seconds?: number })?.seconds || 0;
+  return tb - ta;
 }
 
 export default function MaintenancePage() {
@@ -120,7 +280,8 @@ export default function MaintenancePage() {
 }
 
 function MaintenancePageContent() {
-  const { role, assetUser } = useAuth();
+  const { firebaseUser, role, assetUser, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const router = useRouter();
   const searchParams = useSearchParams();
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
@@ -137,12 +298,18 @@ function MaintenancePageContent() {
   const [openActionMenuId, setOpenActionMenuId] = useState<string | null>(null);
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [consumedDeepLink, setConsumedDeepLink] = useState(false);
+  const [historySourceFilter, setHistorySourceFilter] = useState<"all" | "maintenance" | "ticket">(
+    "all"
+  );
+  const [historyStatusFilter, setHistoryStatusFilter] = useState<"all" | "done" | "cancelled">("all");
+  const [historySearch, setHistorySearch] = useState("");
 
   const tabParam = searchParams.get("tab");
   const ticketIdParam = searchParams.get("ticketId");
   const workOrderIdParam = searchParams.get("workOrderId");
   const canViewMaintenancePage =
-    role === "super_admin" || role === "asset_admin" || role === "it_team";
+    authReady && (role === "super_admin" || role === "asset_admin" || role === "it_team");
+  const currentAssetUser = assetUser;
 
   // Baca ?tab= dari notifikasi begitu halaman dibuka supaya tab yang
   // relevan langsung aktif, bukan selalu jatuh ke tab pertama.
@@ -252,19 +419,9 @@ function MaintenancePageContent() {
 
   // Data lama tanpa taskCategory dianggap "routine" — dulu hanya jadwal
   // rutin yang membuat dokumen di asset_maintenance_work_orders.
-  const isRoutineWorkOrder = (w: MaintenanceWorkOrder) => (w.taskCategory || "routine") === "routine";
   const ticketsForTab = useMemo(() => {
     // Tugas Maintenance Saya = tugas korektif (kerusakan/insidental) yang
     // ditugaskan ke teknisi yang sedang login — BUKAN jadwal rutin.
-    if (activeTab === "my_tasks") {
-      return tickets
-        .filter(
-          (t) =>
-            t.assignedToUid === assetUser?.uid &&
-            !["resolved", "closed", "rejected"].includes(t.status)
-        )
-        .sort((a, b) => ISSUE_PRIORITY_RANK[a.priority] - ISSUE_PRIORITY_RANK[b.priority]);
-    }
     const statuses = TICKET_TAB_STATUS[activeTab];
     if (!statuses) return [];
     const filtered = tickets.filter((t) => statuses.includes(t.status));
@@ -274,19 +431,17 @@ function MaintenancePageContent() {
       );
     }
     return filtered;
-  }, [tickets, activeTab, assetUser?.uid]);
+  }, [tickets, activeTab]);
 
   // Jadwal Maintenance Rutin: HANYA taskCategory "routine" — tugas korektif
   // (taskCategory "corrective") tidak boleh muncul di sini.
-  const scheduleWorkOrders = useMemo(
-    () =>
-      workOrders
-        .filter(isRoutineWorkOrder)
-        .sort((a, b) => {
-          const ta = (a.createdAt as { seconds?: number })?.seconds || 0;
-          const tb = (b.createdAt as { seconds?: number })?.seconds || 0;
-          return tb - ta;
-        }),
+  const routineTasks = useMemo(
+    () => workOrders.filter((wo) => isRoutineWorkOrder(wo)),
+    [workOrders]
+  );
+
+  const correctiveTasks = useMemo(
+    () => workOrders.filter((wo) => wo.taskCategory === "corrective"),
     [workOrders]
   );
 
@@ -294,17 +449,229 @@ function MaintenancePageContent() {
   // — saat ini belum ada flow yang membuat work order korektif (tugas
   // insidental dibuat sebagai ticket, lihat ticketsForTab di atas), jadi
   // list ini forward-compat saja dan biasanya kosong.
-  const myAssignedWorkOrders = useMemo(
+  const myRoutineTasks = useMemo(
     () =>
-      workOrders.filter(
-        (w) =>
-          w.assignedToUid === assetUser?.uid &&
-          !["cancelled", "completed"].includes(w.status)
-      ),
-    [workOrders, assetUser?.uid]
+      routineTasks
+        .filter(
+          (task) =>
+            task.taskCategory === "routine" &&
+            isAssignedToCurrentIt(task, currentAssetUser, firebaseUser) &&
+            !["completed", "cancelled"].includes(task.status)
+        )
+        .sort(sortWorkOrdersNewestFirst),
+    [routineTasks, currentAssetUser, firebaseUser]
   );
 
+  const myCorrectiveTasks = useMemo(
+    () =>
+      correctiveTasks
+        .filter(
+          (task) =>
+            task.taskCategory === "corrective" &&
+            isAssignedToCurrentIt(task, currentAssetUser, firebaseUser) &&
+            !["completed", "cancelled", "closed"].includes(task.status)
+        )
+        .sort(sortWorkOrdersNewestFirst),
+    [correctiveTasks, currentAssetUser, firebaseUser]
+  );
+
+  const myAssignedTasks = myCorrectiveTasks;
+
+  const scheduleWorkOrders = useMemo(() => {
+    const source = role === "it_team" ? myRoutineTasks : routineTasks;
+    return [...source].sort(sortWorkOrdersNewestFirst);
+  }, [role, myRoutineTasks, routineTasks]);
+
+  // Summary card Maintenance Rutin HARUS pakai sumber yang sama-sama
+  // di-scope per role dengan tabel (scheduleWorkOrders) — sebelumnya summary
+  // pakai summaryCounts.routine (global, semua work order tanpa peduli siapa
+  // yang login) sedangkan tabel sudah discope ke tugas Tim IT, jadi angkanya
+  // bisa kelihatan "ada data" padahal tabelnya kosong buat user itu.
+  const routineWorkOrders = useMemo(
+    () => routineTasks.filter((wo) => !["completed", "cancelled"].includes(wo.status)),
+    [routineTasks]
+  );
+  const visibleRoutineWorkOrders = useMemo(
+    () =>
+      role === "it_team"
+        ? routineWorkOrders.filter((wo) => isAssignedToCurrentIt(wo, currentAssetUser, firebaseUser))
+        : routineWorkOrders,
+    [role, routineWorkOrders, currentAssetUser, firebaseUser]
+  );
+  const routineSummarySource = visibleRoutineWorkOrders;
+
+  const routineCompletedThisMonthCount = useMemo(() => {
+    const scoped =
+      role === "it_team"
+        ? routineTasks.filter((wo) => isAssignedToCurrentIt(wo, currentAssetUser, firebaseUser))
+        : routineTasks;
+    const now = new Date();
+    return scoped.filter((wo) => {
+      if (wo.status !== "completed") return false;
+      const d = toDateSafe(wo.completedAt);
+      if (!d) return false;
+      return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+    }).length;
+  }, [role, routineTasks, currentAssetUser, firebaseUser]);
+
+  // Debug sementara — bantu diagnosa kalau Maintenance Rutin kosong lagi di
+  // akun Tim IT (mis. field penugasan tidak konsisten di data lama).
+  useEffect(() => {
+    if (role !== "it_team") return;
+    console.log("[Tim IT Routine Filter]", {
+      currentUid: currentAssetUser?.uid || firebaseUser?.uid,
+      currentEmail: currentAssetUser?.email || firebaseUser?.email,
+      currentName: currentAssetUser?.name || firebaseUser?.displayName,
+      totalWorkOrders: workOrders.length,
+      routineCandidates: routineTasks.map((wo) => ({
+        id: wo.id,
+        title: wo.title,
+        assignedToUid: wo.assignedToUid,
+        technicianUid: wo.technicianUid,
+        assignedToName: wo.assignedToName,
+        assignedToEmail: wo.assignedToEmail,
+        taskCategory: wo.taskCategory,
+        maintenanceSource: wo.maintenanceSource,
+        status: wo.status,
+      })),
+      myRoutineTasks: myRoutineTasks.length,
+    });
+  }, [role, currentAssetUser, firebaseUser, workOrders.length, routineTasks, myRoutineTasks]);
+
+  // Debug tambahan — bandingkan langsung apa yang dipakai summary card
+  // (routineSummarySource) vs tabel (scheduleWorkOrders) supaya kalau
+  // keduanya beda lagi di masa depan, ketahuan dari log ini.
+  useEffect(() => {
+    console.log("[Tim IT Routine Debug]", {
+      role,
+      currentUid: currentAssetUser?.uid || firebaseUser?.uid,
+      currentEmail: currentAssetUser?.email || firebaseUser?.email,
+      currentName: currentAssetUser?.name || firebaseUser?.displayName,
+      totalWorkOrders: workOrders.length,
+      routineWorkOrders: routineWorkOrders.map((wo) => ({
+        id: wo.id,
+        title: wo.title,
+        status: wo.status,
+        taskCategory: wo.taskCategory,
+        maintenanceSource: wo.maintenanceSource,
+        assignedToUid: wo.assignedToUid,
+        technicianUid: wo.technicianUid,
+        assignedTechnicianUid: wo.assignedTechnicianUid,
+        assignedToName: wo.assignedToName,
+        assignedToEmail: wo.assignedToEmail,
+      })),
+      visibleRoutineCount: visibleRoutineWorkOrders.length,
+      scheduleTableCount: scheduleWorkOrders.length,
+    });
+  }, [role, currentAssetUser, firebaseUser, workOrders.length, routineWorkOrders, visibleRoutineWorkOrders, scheduleWorkOrders]);
+
+  // Backfill data lama: kalau jadwal rutin cuma cocok lewat email/nama
+  // (assignedToUid kosong/berbeda) dengan Tim IT yang sedang login, isi
+  // ulang field uid-nya supaya konsisten ke depannya — tidak menyentuh
+  // dokumen milik teknisi lain.
+  useEffect(() => {
+    if (role !== "it_team" || !currentAssetUser?.uid) return;
+    const uid = currentAssetUser.uid;
+    const mismatched = routineTasks.filter(
+      (task) =>
+        task.assignedToUid !== uid && isAssignedToCurrentIt(task, currentAssetUser, firebaseUser)
+    );
+    if (mismatched.length === 0) return;
+    mismatched.forEach((task) => {
+      console.log("[Tim IT Routine Backfill] memperbaiki assignedToUid", {
+        workOrderId: task.id,
+        workOrderNumber: task.workOrderNumber,
+        oldAssignedToUid: task.assignedToUid,
+      });
+      updateDoc(doc(db, "asset_maintenance_work_orders", task.id), {
+        assignedToUid: uid,
+        assignedToName: currentAssetUser.name || task.assignedToName || "",
+        assignedToEmail: currentAssetUser.email || task.assignedToEmail || "",
+        assignedToRole: "it_team",
+        technicianUid: uid,
+        technicianName: currentAssetUser.name || task.technicianName || "",
+        technicianEmail: currentAssetUser.email || task.technicianEmail || "",
+        taskCategory: "routine",
+        maintenanceSource: task.maintenanceSource || "routine_schedule",
+        updatedAt: serverTimestamp(),
+      }).catch((err) => console.error("[Tim IT Routine Backfill] gagal update", task.id, err));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [role, currentAssetUser?.uid, routineTasks]);
+
   const overdueWorkOrders = workOrders.filter((w) => isWorkOrderOverdue(w));
+
+  // Riwayat = arsip pekerjaan yang SUDAH final (selesai/dibatalkan/ditolak/
+  // ditutup), digabung dari dua sumber (work order maintenance + ticket
+  // kendala) dan diurutkan terbaru dulu. Tim IT hanya melihat riwayat yang
+  // pernah ditugaskan ke dirinya — QHSE/super_admin melihat semuanya.
+  const historyItems = useMemo(() => {
+    const maintenanceHistory = workOrders
+      .filter((wo) => ["completed", "cancelled"].includes(wo.status))
+      .filter((wo) =>
+        role === "it_team" ? isAssignedToCurrentUser(wo, currentAssetUser, firebaseUser) : true
+      )
+      .map((wo) => ({
+        id: wo.id,
+        source: "maintenance" as const,
+        number: wo.workOrderNumber || wo.id,
+        title: wo.title,
+        typeLabel: isRoutineWorkOrder(wo) ? "Maintenance Rutin" : "Maintenance Korektif",
+        status: wo.status as string,
+        locationText: wo.maintenanceLocationText || wo.locationText || "-",
+        assignedToName: wo.assignedToName || wo.technicianName || "-",
+        completedAt: wo.completedAt || wo.cancelledAt || wo.updatedAt || wo.createdAt,
+        resultSummary: wo.qhseNote || wo.notes || wo.cancelReason || "-",
+        linkUrl: `/maintenance?tab=history&workOrderId=${wo.id}`,
+        raw: wo,
+      }));
+
+    const ticketHistory = tickets
+      .filter((t) => ["resolved", "closed", "rejected"].includes(t.status))
+      .filter((t) =>
+        role === "it_team" ? isAssignedToCurrentUser(t, currentAssetUser, firebaseUser) : true
+      )
+      .map((t) => ({
+        id: t.id,
+        source: "ticket" as const,
+        number: t.ticketNumber || t.id,
+        title: t.assetName ? `${t.symptomType} — ${t.assetName}` : t.description || "Laporan Kendala",
+        typeLabel: "Laporan Kendala",
+        status: t.status as string,
+        locationText: t.locationText || t.assetLocation || "-",
+        assignedToName: t.assignedToName || "-",
+        completedAt: t.resolvedAt || t.closedAt || t.updatedAt || t.createdAt,
+        resultSummary: t.resolutionNote || t.diagnosis || "-",
+        linkUrl: `/maintenance?tab=history&ticketId=${t.id}`,
+        raw: t,
+      }));
+
+    return [...maintenanceHistory, ...ticketHistory].sort((a, b) => {
+      const aTime = toDateSafe(a.completedAt)?.getTime() || 0;
+      const bTime = toDateSafe(b.completedAt)?.getTime() || 0;
+      return bTime - aTime;
+    });
+  }, [workOrders, tickets, role, currentAssetUser, firebaseUser]);
+
+  const filteredHistoryItems = useMemo(() => {
+    const search = historySearch.trim().toLowerCase();
+    return historyItems.filter((item) => {
+      if (historySourceFilter !== "all" && item.source !== historySourceFilter) return false;
+      if (historyStatusFilter === "done" && !HISTORY_DONE_STATUSES.includes(item.status)) return false;
+      if (
+        historyStatusFilter === "cancelled" &&
+        !HISTORY_CANCELLED_STATUSES.includes(item.status)
+      )
+        return false;
+      if (search) {
+        const haystack = [item.number, item.title, item.locationText, item.assignedToName]
+          .join(" ")
+          .toLowerCase();
+        if (!haystack.includes(search)) return false;
+      }
+      return true;
+    });
+  }, [historyItems, historySourceFilter, historyStatusFilter, historySearch]);
 
   // Summary card WAJIB menghitung dari kedua collection (tickets + work
   // orders), termasuk status baru (created/accepted/in_progress/
@@ -334,17 +701,9 @@ function MaintenancePageContent() {
   // Badge angka tab — dihitung dari data realtime yang sama dengan isi tab
   // itu sendiri, bukan angka hardcode, supaya selalu sinkron. Rutin dan
   // korektif TIDAK boleh saling menghitung data yang sama.
-  const scheduleBadgeCount = workOrders.filter(
-    (w) =>
-      isRoutineWorkOrder(w) &&
-      (["created", "accepted", "scheduled_by_it", "assigned"].includes(w.status) || isWorkOrderOverdue(w))
-  ).length;
-  const myCorrectiveTicketCount = tickets.filter(
-    (t) =>
-      t.assignedToUid === assetUser?.uid && !["resolved", "closed", "rejected"].includes(t.status)
-  ).length;
-  const myTasksBadgeCount = myCorrectiveTicketCount + myAssignedWorkOrders.length;
-  const myTasksHasOverdue = myAssignedWorkOrders.some(
+  const scheduleBadgeCount = scheduleWorkOrders.length;
+  const myTasksBadgeCount = myCorrectiveTasks.length;
+  const myTasksHasOverdue = myCorrectiveTasks.some(
     (w) => w.status !== "completed" && isWorkOrderOverdue(w)
   );
 
@@ -354,7 +713,7 @@ function MaintenancePageContent() {
     follow_up: tickets.filter((t) => TICKET_TAB_STATUS.follow_up!.includes(t.status)).length,
     schedule: scheduleBadgeCount,
     my_tasks: myTasksBadgeCount,
-    history: 0,
+    history: historyItems.length,
   };
   const tabBadgeColor: Record<TabKey, string> = {
     ...TAB_BADGE_COLOR,
@@ -392,7 +751,7 @@ function MaintenancePageContent() {
                   uid: w.assignedToUid,
                   name: w.assignedToName || "",
                   role: getAssignedMaintenanceRole(w.assignedToRole),
-                  linkUrl: `/maintenance?tab=${TAB_QUERY_PARAM.my_tasks}&workOrderId=${w.id}`,
+                  linkUrl: `/maintenance?tab=${TAB_QUERY_PARAM.schedule}&workOrderId=${w.id}`,
                 }
               : null,
             w.requestedByUid
@@ -454,37 +813,39 @@ function MaintenancePageContent() {
   const routineSummary = [
     {
       label: "Jadwal Rutin Aktif",
-      value: summaryCounts.routine.activeCount,
+      value: routineSummarySource.length,
       icon: CalendarClock,
       color: "bg-blue-50 text-blue-600",
     },
     {
       label: "Belum Dikerjakan",
-      value: summaryCounts.routine.notStartedCount,
+      value: routineSummarySource.filter((wo) =>
+        ["created", "accepted", "scheduled_by_it"].includes(wo.status)
+      ).length,
       icon: Wrench,
       color: "bg-indigo-50 text-indigo-600",
     },
     {
       label: "Sedang Dikerjakan",
-      value: summaryCounts.routine.inProgressCount,
+      value: routineSummarySource.filter((wo) => wo.status === "in_progress").length,
       icon: Wrench,
       color: "bg-purple-50 text-purple-600",
     },
     {
       label: "Menunggu Review QHSE",
-      value: summaryCounts.routine.awaitingReviewCount,
+      value: routineSummarySource.filter((wo) => wo.status === "report_submitted").length,
       icon: ClipboardCheck,
       color: "bg-teal-50 text-teal-600",
     },
     {
       label: "Terlambat",
-      value: summaryCounts.routine.overdueCount,
+      value: routineSummarySource.filter((wo) => isWorkOrderOverdue(wo)).length,
       icon: AlertOctagon,
       color: "bg-red-50 text-red-600",
     },
     {
       label: "Selesai Bulan Ini",
-      value: summaryCounts.routine.completedThisMonth,
+      value: routineCompletedThisMonthCount,
       icon: CheckCircle2,
       color: "bg-emerald-50 text-emerald-600",
     },
@@ -603,8 +964,8 @@ function MaintenancePageContent() {
       {(activeTab === "schedule" || activeTab === "my_tasks") && (
         <p className="text-xs text-slate-500 mb-4 -mt-2">
           {activeTab === "schedule"
-            ? "Maintenance Rutin: tugas berkala/preventive (bulanan, 3 bulanan, dst) yang dijadwalkan QHSE."
-            : "Tugas Saya: maintenance rutin dan kendala yang ditugaskan ke Anda."}
+            ? "Jadwal maintenance rutin yang ditugaskan ke Anda."
+            : "Kendala/korektif yang ditugaskan ke Anda."}
         </p>
       )}
 
@@ -765,10 +1126,13 @@ function MaintenancePageContent() {
         </div>
       ) : (
         <div className="space-y-4">
-          {activeTab === "my_tasks" && myAssignedWorkOrders.length > 0 && (
+          {activeTab === "my_tasks" ? (
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
+              {myAssignedTasks.length === 0 ? (
+                <EmptyState icon={Wrench} title="Belum ada tugas untuk Anda" />
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
                   <thead>
                     <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
                       <th className="px-4 py-3 font-semibold">Judul</th>
@@ -781,7 +1145,7 @@ function MaintenancePageContent() {
                     </tr>
                   </thead>
                   <tbody>
-                    {myAssignedWorkOrders.map((w) => {
+                    {myAssignedTasks.map((w) => {
                       const progress = workOrderProgress(items.filter((i) => i.workOrderId === w.id));
                       return (
                         <tr
@@ -813,17 +1177,136 @@ function MaintenancePageContent() {
                       );
                     })}
                   </tbody>
-                </table>
+                  </table>
+                </div>
+              )}
+            </div>
+          ) : activeTab === "history" ? (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                {(
+                  [
+                    { key: "all" as const, label: "Semua" },
+                    { key: "maintenance" as const, label: "Maintenance" },
+                    { key: "ticket" as const, label: "Kendala" },
+                  ]
+                ).map((f) => (
+                  <button
+                    key={f.key}
+                    type="button"
+                    onClick={() => setHistorySourceFilter(f.key)}
+                    className={`rounded-xl border px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
+                      historySourceFilter === f.key
+                        ? "border-blue-500 bg-blue-50 text-blue-700"
+                        : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+                <span className="mx-1 h-5 w-px bg-slate-200" />
+                {(
+                  [
+                    { key: "all" as const, label: "Semua Status" },
+                    { key: "done" as const, label: "Selesai" },
+                    { key: "cancelled" as const, label: "Dibatalkan/Ditolak" },
+                  ]
+                ).map((f) => (
+                  <button
+                    key={f.key}
+                    type="button"
+                    onClick={() => setHistoryStatusFilter(f.key)}
+                    className={`rounded-xl border px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
+                      historyStatusFilter === f.key
+                        ? "border-blue-500 bg-blue-50 text-blue-700"
+                        : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+                <input
+                  type="text"
+                  value={historySearch}
+                  onChange={(e) => setHistorySearch(e.target.value)}
+                  placeholder="Cari nomor, judul, lokasi, teknisi..."
+                  className="input text-sm ml-auto w-full sm:w-64"
+                />
+              </div>
+
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                {filteredHistoryItems.length === 0 ? (
+                  <EmptyState icon={Inbox} title="Belum ada riwayat maintenance atau kendala" />
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
+                          <th className="px-4 py-3 font-semibold">Tanggal</th>
+                          <th className="px-4 py-3 font-semibold">Nomor</th>
+                          <th className="px-4 py-3 font-semibold">Jenis</th>
+                          <th className="px-4 py-3 font-semibold">Judul</th>
+                          <th className="px-4 py-3 font-semibold">Lokasi</th>
+                          <th className="px-4 py-3 font-semibold">Ditugaskan ke</th>
+                          <th className="px-4 py-3 font-semibold">Status</th>
+                          <th className="px-4 py-3 font-semibold">Ringkasan</th>
+                          <th className="px-4 py-3 font-semibold text-right">Aksi</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredHistoryItems.map((item) => (
+                          <tr
+                            key={`${item.source}-${item.id}`}
+                            className={`border-b border-slate-100 last:border-0 hover:bg-slate-50/70 transition-colors ${
+                              highlightId === item.id ? "bg-amber-50" : ""
+                            }`}
+                          >
+                            <td className="px-4 py-3 text-slate-500">{formatDateTime(item.completedAt)}</td>
+                            <td className="px-4 py-3 font-medium text-slate-800">{item.number}</td>
+                            <td className="px-4 py-3 text-slate-600">{item.typeLabel}</td>
+                            <td className="px-4 py-3 text-slate-600">{item.title}</td>
+                            <td className="px-4 py-3 text-slate-600">{item.locationText}</td>
+                            <td className="px-4 py-3 text-slate-600">{item.assignedToName}</td>
+                            <td className="px-4 py-3">
+                              {item.source === "maintenance" ? (
+                                <WorkOrderStatusBadge workOrder={item.raw as MaintenanceWorkOrder} />
+                              ) : (
+                                <Badge
+                                  label={ISSUE_STATUS_LABEL[(item.raw as AssetIssueTicket).status]}
+                                  colorClass={ISSUE_STATUS_COLOR[(item.raw as AssetIssueTicket).status]}
+                                />
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-slate-600">{item.resultSummary}</td>
+                            <td className="px-4 py-3 text-right">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (item.source === "maintenance") {
+                                    setWoDetailTarget(item.raw as MaintenanceWorkOrder);
+                                  } else {
+                                    setDetailTarget(item.raw as AssetIssueTicket);
+                                  }
+                                }}
+                                className="text-sm font-medium text-blue-600 cursor-pointer hover:underline"
+                              >
+                                Lihat Detail
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </div>
-          )}
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-          {ticketsForTab.length === 0 ? (
+          ) : (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+              {ticketsForTab.length === 0 ? (
             <EmptyState
               icon={Inbox}
-              title={
-                activeTab === "my_tasks" ? "Belum ada tugas untuk Anda" : "Belum ada ticket pada tab ini"
-              }
+              title="Belum ada ticket pada tab ini"
             />
           ) : (
             <div className="overflow-x-auto">
@@ -879,7 +1362,8 @@ function MaintenancePageContent() {
               </table>
             </div>
           )}
-        </div>
+            </div>
+          )}
         </div>
       )}
 

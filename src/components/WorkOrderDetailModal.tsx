@@ -29,10 +29,13 @@ import {
   HelpCircle,
   CalendarClock,
   FlaskConical,
+  AlertOctagon,
 } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import {
+  AssetIssueTicket,
+  AssetUser,
   MaintenanceActionTaken,
   MaintenanceChecklistState,
   MaintenanceConditionLabel,
@@ -43,6 +46,8 @@ import {
   WorkOrderStatus,
 } from "@/lib/types";
 import {
+  cleanFirestoreData,
+  fetchActiveUsersByRole,
   generateQueueNumber,
   generateTicketNumber,
   writeAssetIssueLog,
@@ -78,21 +83,56 @@ const CONDITION_OPTIONS: MaintenanceConditionLabel[] = [
 ];
 
 const ACTION_OPTIONS: MaintenanceActionTaken[] = [
-  "Tidak Ada Tindakan",
-  "Dibersihkan",
-  "Disetting Ulang",
-  "Update Software",
-  "Kosongkan Storage",
-  "Ganti Aksesoris",
-  "Ganti Sparepart",
-  "Perlu Vendor",
-  "Perlu Ticket Kendala Lanjutan",
+  "no_action",
+  "cleaned",
+  "reconfigured",
+  "minor_repair",
+  "software_update",
+  "clear_storage",
+  "replace_component",
+  "need_purchase",
+  "need_vendor",
+  "need_follow_up_ticket",
+  "temporarily_unusable",
 ];
 
+const ACTION_LABELS: Record<MaintenanceActionTaken, string> = {
+  no_action: "Tidak ada tindakan",
+  cleaned: "Dibersihkan",
+  reconfigured: "Disetting / Disesuaikan Ulang",
+  minor_repair: "Diperbaiki Ringan",
+  software_update: "Update Software / Firmware",
+  clear_storage: "Kosongkan Storage / Rapikan Data",
+  replace_component: "Ganti Komponen / Aksesoris",
+  need_purchase: "Perlu Pembelian Komponen",
+  need_vendor: "Perlu Vendor / Teknisi Eksternal",
+  need_follow_up_ticket: "Perlu Ticket Kendala Lanjutan",
+  temporarily_unusable: "Tidak Layak Pakai Sementara",
+};
+
+// Placeholder catatan menyesuaikan tindakan yang dipilih supaya teknisi tahu
+// info apa yang wajib ditulis — dipakai juga untuk membersihkan catatan
+// "kondisi baik" kalau tindakan diganti jadi bukan no_action (lihat handler
+// onChange dropdown Tindakan).
+const ACTION_NOTE_PLACEHOLDER: Partial<Record<MaintenanceActionTaken, string>> = {
+  replace_component: "Sebutkan komponen atau aksesoris yang perlu diganti.",
+  need_purchase: "Sebutkan komponen yang perlu dibeli dan alasannya.",
+  need_vendor: "Jelaskan kenapa perlu vendor atau teknisi eksternal.",
+  need_follow_up_ticket: "Jelaskan kendala yang perlu dibuatkan ticket lanjutan.",
+  temporarily_unusable: "Jelaskan alasan asset sementara tidak layak digunakan.",
+};
+
+const DEFAULT_NOTE_PLACEHOLDER =
+  "Tulis temuan, kondisi asset, atau catatan teknisi. Contoh: Tidak ada temuan, asset dalam kondisi baik.";
+
+// Tindakan yang butuh tindak lanjut nyata (beli/ganti/vendor/tidak layak
+// pakai) — item ditandai "needs_follow_up" dan tombol buat ticket muncul.
 const NEEDS_FOLLOW_UP_ACTIONS: MaintenanceActionTaken[] = [
-  "Ganti Sparepart",
-  "Perlu Vendor",
-  "Perlu Ticket Kendala Lanjutan",
+  "replace_component",
+  "need_purchase",
+  "need_vendor",
+  "need_follow_up_ticket",
+  "temporarily_unusable",
 ];
 
 const CHECKLIST_LABELS: { key: keyof MaintenanceChecklistState; label: string }[] = [
@@ -158,6 +198,288 @@ const DEFAULT_CHECKLIST: MaintenanceChecklistState = {
   tidakAdaKerusakanKritis: false,
 };
 
+const ALL_CHECKED_CHECKLIST: MaintenanceChecklistState = {
+  fisikDicek: true,
+  fungsiUtamaBerjalan: true,
+  aksesorisLengkap: true,
+  kebersihanDicek: true,
+  labelQrTerbaca: true,
+  lokasiSesuai: true,
+  tidakAdaKerusakanKritis: true,
+};
+
+const GOOD_CONDITION_NOTE = "Tidak ada temuan. Asset dalam kondisi baik.";
+
+// Bungkus setiap write reset-checklist supaya kalau gagal (mis. Firestore
+// rules menolak field yang belum di-whitelist) errornya jelas collection
+// mana yang bermasalah di console, bukan cuma "gagal menyimpan" generik —
+// dan errornya tetap di-rethrow supaya try/catch/finally pemanggil (yang
+// me-reset tombol "Menyimpan...") tetap jalan seperti biasa.
+// 4 sub-keputusan di bawah modal "Tindak Lanjuti" — "request_recheck" dipicu
+// langsung dari tombol "Minta Cek Ulang" terpisah (tidak lewat chooser ini).
+type QhseFollowUpDecisionKind =
+  | "request_recheck"
+  | "create_corrective_task"
+  | "need_purchase"
+  | "need_vendor"
+  | "mark_temporarily_unusable";
+
+const QHSE_FOLLOW_UP_DECISION_LABELS: Record<QhseFollowUpDecisionKind, string> = {
+  request_recheck: "Minta Cek Ulang ke Tim IT",
+  create_corrective_task: "Buat Tugas Korektif IT",
+  need_purchase: "Ajukan Pembelian Komponen",
+  need_vendor: "Butuh Vendor Eksternal",
+  mark_temporarily_unusable: "Tandai Asset Tidak Layak Pakai Sementara",
+};
+
+type TicketBadgeState = "active" | "cancelled" | "missing" | "none";
+
+// "cancelled" di sini = status ticket yang sudah final/tidak butuh tindak
+// lanjut lagi (closed/rejected) — AssetIssueTicket TIDAK punya status
+// "cancelled" sungguhan, jadi dua status final ini dipakai sebagai
+// padanannya untuk keperluan badge.
+const TICKET_CANCELLED_EQUIVALENT_STATUSES = ["closed", "rejected"];
+
+function getTicketBadgeState(
+  item: MaintenanceWorkOrderItem,
+  existingTicketsById: Record<string, AssetIssueTicket | null>
+): TicketBadgeState {
+  if (!item.followUpTicketId) return "none";
+  const ticket = existingTicketsById[item.followUpTicketId];
+  // undefined = belum selesai di-fetch — anggap "none" dulu supaya badge
+  // tidak sempat kelihatan aktif sebelum kepastian didapat.
+  if (ticket === undefined) return "none";
+  if (ticket === null) return "missing";
+  if (TICKET_CANCELLED_EQUIVALENT_STATUSES.includes(ticket.status)) return "cancelled";
+  return "active";
+}
+
+// Label status temuan Tim IT → QHSE (alur baru: IT lapor, QHSE yang
+// memutuskan tugas lanjutan/ticket — bukan IT bikin ticket sendiri).
+// Return null kalau item belum pernah dilaporkan sama sekali.
+function getFindingStatusLabel(
+  item: MaintenanceWorkOrderItem,
+  existingTicketsById: Record<string, AssetIssueTicket | null>
+): string | null {
+  if (item.followUpStatus === "corrective_task_created") {
+    const ticketState = getTicketBadgeState(item, existingTicketsById);
+    if (ticketState === "cancelled") return "Ticket dibatalkan";
+    if (item.followUpTicketNumber) return `Tugas Lanjutan Dibuat: ${item.followUpTicketNumber}`;
+    return "Tugas Lanjutan Dibuat";
+  }
+  if (item.followUpStatus === "noted") return "Temuan Dicatat QHSE";
+  if (item.followUpStatus === "recheck_requested") return "Cek Ulang Diminta QHSE";
+  if (item.followUpStatus === "waiting_purchase") return "Menunggu pembelian komponen";
+  if (item.followUpStatus === "waiting_vendor") return "Menunggu vendor eksternal";
+  if (item.followUpStatus === "asset_temporarily_unusable")
+    return "Asset ditandai tidak layak pakai sementara";
+  if (item.needsQhseReview || item.followUpStatus === "waiting_qhse_decision") {
+    return "Menunggu Keputusan QHSE";
+  }
+  return null;
+}
+
+// Mapping label + warna badge status utama (section H) — dipakai untuk
+// badge di header item (ringkas, satu badge) DAN sebagai judul panel
+// keputusan QHSE (lebih detail). Beda dengan getFindingStatusLabel di atas
+// yang menambahkan info ticket number untuk corrective_task_created.
+const FINDING_STATUS_META: Record<string, { label: string; colorClass: string }> = {
+  waiting_qhse_decision: { label: "Menunggu Keputusan QHSE", colorClass: "bg-amber-100 text-amber-700" },
+  noted: { label: "Temuan Dicatat QHSE", colorClass: "bg-emerald-100 text-emerald-700" },
+  recheck_requested: { label: "Cek Ulang Diminta QHSE", colorClass: "bg-blue-100 text-blue-700" },
+  corrective_task_created: { label: "Tugas Korektif Dibuat", colorClass: "bg-orange-100 text-orange-700" },
+  waiting_purchase: { label: "Menunggu Pembelian", colorClass: "bg-amber-100 text-amber-700" },
+  waiting_vendor: { label: "Menunggu Vendor", colorClass: "bg-purple-100 text-purple-700" },
+  asset_temporarily_unusable: {
+    label: "Asset Tidak Layak Pakai Sementara",
+    colorClass: "bg-red-100 text-red-700",
+  },
+};
+
+function getFindingStatusMeta(
+  item: MaintenanceWorkOrderItem
+): { label: string; colorClass: string } | null {
+  // Hasil cek ulang yang baru dikirim tetap followUpStatus
+  // "waiting_qhse_decision" seperti temuan biasa — bedakan labelnya supaya
+  // QHSE tahu ini putaran cek ulang, bukan temuan baru (section F).
+  if (item.followUpStatus === "waiting_qhse_decision" && item.recheckSubmittedAt) {
+    return { label: "Hasil Cek Ulang Dikirim", colorClass: "bg-amber-100 text-amber-700" };
+  }
+  if (item.followUpStatus && FINDING_STATUS_META[item.followUpStatus]) {
+    return FINDING_STATUS_META[item.followUpStatus];
+  }
+  if (item.needsQhseReview) return FINDING_STATUS_META.waiting_qhse_decision;
+  return null;
+}
+
+// Item butuh panel keputusan QHSE kalau sedang menunggu ATAU sudah pernah
+// diputuskan (supaya QHSE tetap bisa "Minta Cek Ulang"/"Ubah Keputusan"
+// walau statusnya sudah final — lihat acceptance #7).
+const QHSE_PANEL_STATUSES = [
+  "waiting_qhse_decision",
+  "noted",
+  "recheck_requested",
+  "waiting_purchase",
+  "waiting_vendor",
+  "asset_temporarily_unusable",
+  "corrective_task_created",
+];
+
+function needsQhsePanel(item: MaintenanceWorkOrderItem): boolean {
+  return !!item.needsQhseReview || (!!item.followUpStatus && QHSE_PANEL_STATUSES.includes(item.followUpStatus));
+}
+
+interface MaintenanceItemReportSummary {
+  assetId: string;
+  assetCode: string;
+  assetName: string;
+  conditionBefore: string;
+  conditionAfter: string;
+  actionTaken: string;
+  technicianNote: string;
+  needsQhseReview: boolean;
+  followUpStatus: string | null;
+}
+
+interface MaintenanceReportSummary {
+  totalAssets: number;
+  checkedCount: number;
+  goodCount: number;
+  findingCount: number;
+  waitingQhseDecisionCount: number;
+  itemSummaries: MaintenanceItemReportSummary[];
+}
+
+// Merangkum semua hasil cek per-device jadi satu laporan siap kirim ke QHSE
+// — dipakai baik untuk rekap di modal "Kirim Laporan" maupun disimpan ke
+// reportData di parent work order (item.status di codebase ini tidak punya
+// nilai "completed"/boolean checked, jadi "checked" dianggap = statusnya
+// bukan lagi pending/in_progress, sama seperti checkedCount di modal ini).
+function buildMaintenanceReportSummary(items: MaintenanceWorkOrderItem[]): MaintenanceReportSummary {
+  const totalAssets = items.length;
+
+  const checkedAssets = items.filter(
+    (item) => item.status !== "pending" && item.status !== "in_progress"
+  );
+
+  const assetsWithFindings = items.filter(
+    (item) =>
+      item.needsQhseReview === true ||
+      !!item.findingNote ||
+      !!item.technicianNote ||
+      (!!item.actionTaken && item.actionTaken !== "no_action")
+  );
+
+  const waitingQhseDecision = items.filter(
+    (item) => item.needsQhseReview === true && item.followUpStatus === "waiting_qhse_decision"
+  );
+
+  const goodAssets = items.filter(
+    (item) => !item.needsQhseReview && (item.actionTaken === "no_action" || !item.actionTaken)
+  );
+
+  return {
+    totalAssets,
+    checkedCount: checkedAssets.length,
+    goodCount: goodAssets.length,
+    findingCount: assetsWithFindings.length,
+    waitingQhseDecisionCount: waitingQhseDecision.length,
+    itemSummaries: items.map((item) => ({
+      assetId: item.assetId,
+      assetCode: item.assetCode,
+      assetName: item.assetName,
+      conditionBefore: item.conditionBefore || "-",
+      conditionAfter: item.conditionAfter || "-",
+      actionTaken: (item.actionTaken && ACTION_LABELS[item.actionTaken]) || item.actionLabel || item.actionTaken || "-",
+      technicianNote: item.technicianNote || item.findingNote || item.technicalNote || "-",
+      needsQhseReview: item.needsQhseReview === true,
+      followUpStatus: item.followUpStatus || null,
+    })),
+  };
+}
+
+// Teks ringkasan otomatis (section F) — ditampilkan di modal konfirmasi
+// sekaligus disimpan sebagai reportSummary di parent work order.
+function buildReportSummaryText(technicianName: string, summary: MaintenanceReportSummary): string {
+  const lines = [
+    `Laporan maintenance telah dikirim oleh ${technicianName || "Tim IT"}.`,
+    `Total asset dicek: ${summary.totalAssets}.`,
+    `Asset kondisi baik: ${summary.goodCount}.`,
+    `Asset dengan temuan: ${summary.findingCount}.`,
+    `Menunggu keputusan QHSE: ${summary.waitingQhseDecisionCount}.`,
+  ];
+
+  const findings = summary.itemSummaries.filter(
+    (i) => i.needsQhseReview || (i.technicianNote && i.technicianNote !== "-")
+  );
+  if (findings.length > 0) {
+    lines.push("");
+    lines.push("Temuan penting:");
+    findings.forEach((f, index) => {
+      lines.push(`${index + 1}. ${f.assetName} - ${f.actionTaken} - ${f.technicianNote}`);
+    });
+  }
+
+  return lines.join("\n");
+}
+
+// ── Lock form hasil cek Tim IT setelah temuan dikirim ke QHSE ────────────
+// isFindingLocked = menunggu keputusan (form dikunci total).
+// isFindingFinal = QHSE sudah memutuskan sesuatu yang final (juga dikunci —
+// kalau butuh direvisi, jalurnya adalah QHSE pilih "Minta Cek Ulang", bukan
+// Tim IT edit langsung).
+function isFindingLocked(item: MaintenanceWorkOrderItem): boolean {
+  return item.needsQhseReview === true && item.followUpStatus === "waiting_qhse_decision";
+}
+
+function isFindingFinal(item: MaintenanceWorkOrderItem): boolean {
+  return !!item.followUpStatus &&
+    (
+      [
+        "noted",
+        "corrective_task_created",
+        "waiting_purchase",
+        "waiting_vendor",
+        "asset_temporarily_unusable",
+      ] as string[]
+    ).includes(item.followUpStatus);
+}
+
+// Satu-satunya sumber kebenaran untuk "boleh edit form hasil cek atau tidak"
+// — dipakai baik untuk disable UI (defense in depth) MAUPUN sebagai guard di
+// dalam setiap handler submit, supaya data tetap aman walau ada bug di UI
+// yang lupa nge-disable sesuatu.
+function canEditMaintenanceCheck(
+  item: MaintenanceWorkOrderItem,
+  currentAssetUser?: { role?: string } | null
+): boolean {
+  if (currentAssetUser?.role !== "it_team") return false;
+
+  // Temuan sudah dikirim ke QHSE, menunggu keputusan — kunci.
+  if (isFindingLocked(item)) return false;
+
+  // QHSE sudah memutuskan final — kunci (revisi lewat "Minta Cek Ulang").
+  if (isFindingFinal(item)) return false;
+
+  // QHSE minta cek ulang — boleh edit lagi.
+  if (item.followUpStatus === "recheck_requested") return true;
+
+  // Normal saat sedang dikerjakan.
+  return ["in_progress", "checking", "sedang_dicek"].includes(item.status);
+}
+
+async function debugFirestoreWrite<T>(label: string, action: () => Promise<T>): Promise<T> {
+  try {
+    console.log(`[Reset Checklist Write] START ${label}`);
+    const result = await action();
+    console.log(`[Reset Checklist Write] SUCCESS ${label}`);
+    return result;
+  } catch (error) {
+    console.error(`[Reset Checklist Write] ERROR ${label}`, error);
+    throw error;
+  }
+}
+
 export default function WorkOrderDetailModal({
   workOrder: initialWorkOrder,
   open,
@@ -167,7 +489,8 @@ export default function WorkOrderDetailModal({
   open: boolean;
   onClose: () => void;
 }) {
-  const { assetUser } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [workOrder, setWorkOrder] = useState(initialWorkOrder);
   const [items, setItems] = useState<MaintenanceWorkOrderItem[]>([]);
   const [logs, setLogs] = useState<MaintenanceWorkOrderLog[]>([]);
@@ -177,9 +500,61 @@ export default function WorkOrderDetailModal({
   const [conditionBefore, setConditionBefore] = useState<MaintenanceConditionLabel>("Baik");
   const [conditionAfter, setConditionAfter] = useState<MaintenanceConditionLabel>("Baik");
   const [checklist, setChecklist] = useState<MaintenanceChecklistState>(DEFAULT_CHECKLIST);
-  const [findings, setFindings] = useState("");
   const [actionTaken, setActionTaken] = useState<MaintenanceActionTaken | "">("");
   const [technicianNote, setTechnicianNote] = useState("");
+  const [itemFormError, setItemFormError] = useState("");
+  const [existingTicketsById, setExistingTicketsById] = useState<
+    Record<string, AssetIssueTicket | null>
+  >({});
+  const [pendingTicketResetItem, setPendingTicketResetItem] = useState<MaintenanceWorkOrderItem | null>(
+    null
+  );
+  const [ticketResetReason, setTicketResetReason] = useState("");
+  const [ticketResetError, setTicketResetError] = useState("");
+  const [ticketResetSaving, setTicketResetSaving] = useState(false);
+  const [resetChecklistClearTickets, setResetChecklistClearTickets] = useState(false);
+
+  // ── Modal keputusan QHSE atas temuan Tim IT ───────────────────────────────
+  // kind === null hanya berlaku saat "Tindak Lanjuti" baru diklik (masih
+  // menampilkan 4 pilihan sub-keputusan); begitu salah satu dipilih, kind
+  // terisi dan form detailnya muncul. "request_recheck" langsung membuka
+  // modal ini dengan kind terisi (skip pemilihan).
+  const [qhseDecisionItem, setQhseDecisionItem] = useState<MaintenanceWorkOrderItem | null>(null);
+  const [qhseDecisionKind, setQhseDecisionKind] = useState<QhseFollowUpDecisionKind | null>(null);
+  const [qhseDecisionNote, setQhseDecisionNote] = useState("");
+  const [qhseDecisionError, setQhseDecisionError] = useState("");
+  const [qhseDecisionSaving, setQhseDecisionSaving] = useState(false);
+  const [qhseSelectedItUid, setQhseSelectedItUid] = useState("");
+  const [qhsePurchaseDetail, setQhsePurchaseDetail] = useState("");
+  const [qhseVendorNote, setQhseVendorNote] = useState("");
+  const [qhseConfirmUnusable, setQhseConfirmUnusable] = useState(false);
+  const [itTeamOptions, setItTeamOptions] = useState<AssetUser[]>([]);
+
+  const closeQhseDecisionModal = () => {
+    setQhseDecisionItem(null);
+    setQhseDecisionKind(null);
+    setQhseDecisionNote("");
+    setQhseDecisionError("");
+    setQhseSelectedItUid("");
+    setQhsePurchaseDetail("");
+    setQhseVendorNote("");
+    setQhseConfirmUnusable(false);
+  };
+
+  useEffect(() => {
+    if (qhseDecisionKind !== "create_corrective_task") return;
+    let cancelled = false;
+    fetchActiveUsersByRole("it_team")
+      .then((users) => {
+        if (!cancelled) setItTeamOptions(users);
+      })
+      .catch((error) => {
+        console.error("[Work Order] gagal memuat daftar Tim IT", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [qhseDecisionKind]);
 
   const [helpMenuOpen, setHelpMenuOpen] = useState(false);
   const [pendingHelpAction, setPendingHelpAction] = useState<HelpActionOption | null>(null);
@@ -198,13 +573,22 @@ export default function WorkOrderDetailModal({
   const [revisionReason, setRevisionReason] = useState("");
   const [revisionError, setRevisionError] = useState("");
 
+  // Modal "Kirim Laporan Maintenance ke QHSE" — rekap otomatis semua item +
+  // kesimpulan/rekomendasi Tim IT, dibuka dari tombol "Kirim Laporan"
+  // (bukan langsung submit).
+  const [submitReportModalOpen, setSubmitReportModalOpen] = useState(false);
+  const [reportConclusion, setReportConclusion] = useState("");
+  const [reportRecommendation, setReportRecommendation] = useState("");
+  const [reportConfirmChecked, setReportConfirmChecked] = useState(false);
+  const [reportModalError, setReportModalError] = useState("");
+
   const [testingMenuOpen, setTestingMenuOpen] = useState(false);
   const [pendingTestingOption, setPendingTestingOption] = useState<TestingStatusOption | null>(null);
   const [testingReason, setTestingReason] = useState("");
   const [testingError, setTestingError] = useState("");
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !authReady) return;
     const unsub = onSnapshot(
       doc(db, "asset_maintenance_work_orders", initialWorkOrder.id),
       (snap) => {
@@ -223,10 +607,10 @@ export default function WorkOrderDetailModal({
       }
     );
     return () => unsub();
-  }, [open, initialWorkOrder.id]);
+  }, [open, authReady, initialWorkOrder.id]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !authReady) return;
     const q = query(
       collection(db, "asset_maintenance_work_orders", initialWorkOrder.id, "items"),
       orderBy("createdAt", "asc")
@@ -242,11 +626,11 @@ export default function WorkOrderDetailModal({
       }
     );
     return () => unsub();
-  }, [open, initialWorkOrder.id]);
+  }, [open, authReady, initialWorkOrder.id]);
 
   // Activity log mini — 5 aktivitas terakhir untuk work order ini.
   useEffect(() => {
-    if (!open) return;
+    if (!open || !authReady) return;
     const q = query(
       collection(db, "asset_maintenance_work_order_logs"),
       where("workOrderId", "==", initialWorkOrder.id),
@@ -264,7 +648,7 @@ export default function WorkOrderDetailModal({
       }
     );
     return () => unsub();
-  }, [open, initialWorkOrder.id]);
+  }, [open, authReady, initialWorkOrder.id]);
 
   const checkedCount = useMemo(
     () => items.filter((i) => i.status !== "pending" && i.status !== "in_progress").length,
@@ -272,12 +656,47 @@ export default function WorkOrderDetailModal({
   );
   const progressPercent = items.length > 0 ? Math.round((checkedCount / items.length) * 100) : 0;
 
+  // Badge "Ticket TKT-xxx dibuat" TIDAK boleh hanya mengandalkan
+  // followUpTicketId/Number di item — dokumen ticket-nya bisa saja sudah
+  // dihapus manual (mis. saat mengulang alur testing). Fetch dulu tiap
+  // ticket yang direferensikan, baru tentukan badge-nya nanti (lihat
+  // getTicketBadgeState). Sebelum fetch selesai, existingTicketsById[id]
+  // sengaja undefined supaya badge TIDAK sempat tampil "aktif" duluan.
+  const followUpTicketIds = useMemo(
+    () =>
+      Array.from(
+        new Set(items.map((i) => i.followUpTicketId).filter((id): id is string => !!id))
+      ),
+    [items]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all(
+      followUpTicketIds.map(async (id) => {
+        const snap = await getDoc(doc(db, "asset_issue_tickets", id));
+        return [id, snap.exists() ? ({ id: snap.id, ...snap.data() } as AssetIssueTicket) : null] as const;
+      })
+    )
+      .then((results) => {
+        if (cancelled) return;
+        setExistingTicketsById(Object.fromEntries(results));
+      })
+      .catch((error) => {
+        console.error("[Work Order] gagal memverifikasi ticket lanjutan", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [followUpTicketIds]);
+
   if (!open) return null;
 
   const currentAssetUser = assetUser ? { role: assetUser.role } : null;
   const { isSuperAdminRole, isAssetAdminRole, isItTeamRole, canManageSchedule } =
     getAssetRoleHelpers(currentAssetUser);
   const assignedMaintenanceRole = getAssignedMaintenanceRole(workOrder.assignedToRole);
+  const workOrderTabQuery = workOrder.taskCategory === "corrective" ? "my-tasks" : "routine";
   const isAssignedTechnician =
     workOrder.assignedToUid === assetUser?.uid &&
     (isItTeamRole || (isSuperAdminRole && assignedMaintenanceRole === "super_admin"));
@@ -298,6 +717,9 @@ export default function WorkOrderDetailModal({
     isAssignedTechnician && ["in_progress", "partially_completed"].includes(workOrder.status);
   const canSubmitReport =
     isAssignedTechnician && ["in_progress", "partially_completed"].includes(workOrder.status);
+  // Progress 100% = syarat sebelum tombol "Kirim Laporan" bisa dipakai
+  // (lihat modal konfirmasi — bukan langsung submit saat diklik).
+  const progressComplete = items.length > 0 && checkedCount === items.length;
   const canMarkCompleted = isQhse && workOrder.status === "report_submitted";
   const canCancel = isQhse && workOrder.status === "created";
 
@@ -561,20 +983,45 @@ export default function WorkOrderDetailModal({
     }
   };
 
-  const handleSubmitReport = async () => {
+  // Dipanggil HANYA dari modal "Kirim Laporan Maintenance ke QHSE" (lihat
+  // submitReportModalOpen) — validasi sudah dilakukan oleh caller, di sini
+  // cukup menyimpan rekap + kesimpulan/rekomendasi Tim IT.
+  const handleSubmitReport = async (conclusion: string, recommendation: string) => {
     setSaving(true);
     try {
-      await updateDoc(woRef, {
-        status: "report_submitted",
-        reportSubmittedAt: serverTimestamp(),
-        reportSubmittedByUid: assetUser?.uid || "",
-        reportSubmittedByName: assetUser?.name || "",
-        updatedAt: serverTimestamp(),
-      });
+      const performerUid = assetUser?.uid || "";
+      const performerName = assetUser?.name || "";
+      const reportData = buildMaintenanceReportSummary(items);
+      const reportSummaryText = buildReportSummaryText(performerName, reportData);
+      const hasAnyFinding = items.some((i) => !!i.needsQhseReview);
+
+      await updateDoc(
+        woRef,
+        cleanFirestoreData({
+          status: "report_submitted",
+          reportSubmittedAt: serverTimestamp(),
+          reportSubmittedByUid: performerUid,
+          reportSubmittedByName: performerName,
+          reportSummary: reportSummaryText,
+          reportConclusion: conclusion,
+          reportRecommendation: recommendation || "",
+          reportData: reportData as unknown as Record<string, unknown>,
+          needsQhseReview: hasAnyFinding,
+          lastActivityAt: serverTimestamp(),
+          lastActivityByUid: performerUid,
+          lastActivityByName: performerName,
+          lastActivityMessage: "Tim IT mengirim laporan maintenance ke QHSE.",
+          updatedAt: serverTimestamp(),
+          updatedByUid: performerUid,
+          updatedByName: performerName,
+        }) as Record<string, unknown>
+      );
 
       // Semua item yang masih "Sedang Dicek" otomatis jadi "Sudah Dicek" saat
       // laporan dikirim — item yang sudah "needs_follow_up"/"skipped" tidak
-      // disentuh (statusnya sudah final, bukan "belum selesai dicek").
+      // disentuh (statusnya sudah final, bukan "belum selesai dicek"). Data
+      // per-device TETAP tersimpan di subcollection items, laporan ini hanya
+      // menambahkan ringkasan di level parent work order.
       const inProgressItems = items.filter((i) => i.status === "in_progress");
       if (inProgressItems.length > 0) {
         const batch = writeBatch(db);
@@ -592,24 +1039,27 @@ export default function WorkOrderDetailModal({
         oldStatus: workOrder.status,
         newStatus: "report_submitted",
         note: "Laporan hasil pengecekan dikirim ke QHSE",
-        performedByUid: assetUser?.uid || "",
-        performedByName: assetUser?.name || "",
+        performedByUid: performerUid,
+        performedByName: performerName,
       });
       if (workOrder.requestedByUid) {
+        const extraSentence = hasAnyFinding
+          ? ` ${reportData.waitingQhseDecisionCount} temuan menunggu keputusan QHSE.`
+          : "";
         await createAssetNotification({
           recipientUid: workOrder.requestedByUid,
           recipientName: workOrder.requestedByName,
           recipientRole: "asset_admin",
           title: "Laporan Maintenance Dikirim",
-          message: `${workOrder.title} sudah selesai dikerjakan, menunggu review QHSE.`,
+          message: `${performerName} mengirim laporan maintenance ${workOrder.workOrderNumber}. Total ${reportData.totalAssets} asset dicek, ${reportData.findingCount} asset memiliki temuan.${extraSentence}`,
           type: "work_order_report_submitted",
-          priority: workOrder.priority,
+          priority: hasAnyFinding ? "high" : workOrder.priority,
           linkUrl: `/maintenance?tab=routine&workOrderId=${workOrder.id}`,
           relatedType: "work_order",
           relatedId: workOrder.id,
           relatedNumber: workOrder.workOrderNumber,
-          createdByUid: assetUser?.uid,
-          createdByName: assetUser?.name,
+          createdByUid: performerUid,
+          createdByName: performerName,
         });
       }
     } finally {
@@ -646,7 +1096,7 @@ export default function WorkOrderDetailModal({
           message: `${workOrder.title} sudah selesai dikerjakan.`,
           type: "work_order_completed",
           priority: workOrder.priority,
-          linkUrl: `/maintenance?tab=my-tasks&workOrderId=${workOrder.id}`,
+          linkUrl: `/maintenance?tab=history&workOrderId=${workOrder.id}`,
           relatedType: "work_order",
           relatedId: workOrder.id,
           relatedNumber: workOrder.workOrderNumber,
@@ -684,6 +1134,23 @@ export default function WorkOrderDetailModal({
         performedByUid: assetUser?.uid || "",
         performedByName: assetUser?.name || "",
       });
+      if (workOrder.assignedToUid) {
+        await createAssetNotification({
+          recipientUid: workOrder.assignedToUid,
+          recipientName: workOrder.assignedToName || "",
+          recipientRole: "super_admin",
+          title: "Maintenance Dibatalkan",
+          message: `Jadwal maintenance ${workOrder.title} dibatalkan oleh QHSE.`,
+          type: "work_order_completed",
+          priority: workOrder.priority,
+          linkUrl: `/maintenance?tab=history&workOrderId=${workOrder.id}`,
+          relatedType: "work_order",
+          relatedId: workOrder.id,
+          relatedNumber: workOrder.workOrderNumber,
+          createdByUid: assetUser?.uid,
+          createdByName: assetUser?.name,
+        });
+      }
     } finally {
       setSaving(false);
     }
@@ -721,7 +1188,7 @@ export default function WorkOrderDetailModal({
         message: `QHSE meminta revisi laporan maintenance ${workOrder.title}: ${reason}`,
         type: "work_order_revision_requested",
         priority: workOrder.priority,
-        linkUrl: `/maintenance?tab=my-tasks&workOrderId=${workOrder.id}`,
+        linkUrl: `/maintenance?tab=${workOrderTabQuery}&workOrderId=${workOrder.id}`,
         relatedType: "work_order",
         relatedId: workOrder.id,
         relatedNumber: workOrder.workOrderNumber,
@@ -800,7 +1267,7 @@ export default function WorkOrderDetailModal({
         message: `${workOrder.title} dibuka ulang: ${reason}`,
         type: "work_order_reopened",
         priority: workOrder.priority,
-        linkUrl: `/maintenance?tab=${isQhse ? "my-tasks" : "routine"}&workOrderId=${workOrder.id}`,
+        linkUrl: `/maintenance?tab=${isQhse ? workOrderTabQuery : "routine"}&workOrderId=${workOrder.id}`,
         relatedType: "work_order",
         relatedId: workOrder.id,
         relatedNumber: workOrder.workOrderNumber,
@@ -810,9 +1277,9 @@ export default function WorkOrderDetailModal({
     }
   };
 
-  // Dipakai untuk "Buat Ulang Pengecekan" (dari completed) maupun "Reset
-  // Checklist Asset" (dari in_progress) — reset status item ke pending TANPA
-  // menghapus findings/actionTaken/technicianNote lama (history tetap ada).
+  // Dipakai untuk "Buat Ulang Pengecekan" (dari completed) — reset status
+  // item ke pending TANPA menghapus findings/actionTaken/technicianNote lama
+  // (history tetap ada).
   const handleRetryChecklist = async (reason: string, targetStatus: "in_progress") => {
     const batch = writeBatch(db);
     items.forEach((item) => {
@@ -836,6 +1303,100 @@ export default function WorkOrderDetailModal({
       performedByUid: assetUser?.uid || "",
       performedByName: assetUser?.name || "",
     });
+  };
+
+  // "Reset Checklist Asset" (dari in_progress) — BEDA dari "Buat Ulang
+  // Pengecekan" di atas: di sini checklist/tindakan/catatan tiap item
+  // BENAR-BENAR dikembalikan ke kondisi awal (bukan cuma status), supaya
+  // progress kembali 0% dan teknisi mengisi ulang dari nol. Setiap write
+  // dibungkus debugFirestoreWrite supaya kalau Firestore rules menolak field
+  // tertentu, errornya jelas kelihatan di console alih-alih tombol stuck
+  // tanpa penjelasan.
+  const handleResetChecklistInProgress = async (reason: string, clearFollowUpTickets: boolean) => {
+    const performerUid = assetUser?.uid || firebaseUser?.uid || "";
+    const performerName = assetUser?.name || firebaseUser?.displayName || firebaseUser?.email || "Tim IT";
+
+    console.log("[Reset Checklist] START", { workOrderId: workOrder.id, reason, clearFollowUpTickets });
+
+    await debugFirestoreWrite("reset work order item checklist", async () => {
+      const batch = writeBatch(db);
+      items.forEach((item) => {
+        const itemRef = doc(db, "asset_maintenance_work_orders", workOrder.id, "items", item.id);
+        batch.update(
+          itemRef,
+          cleanFirestoreData({
+            status: "pending",
+            checklist: DEFAULT_CHECKLIST,
+            actionTaken: null,
+            technicianNote: "",
+            findings: "",
+            checkedByUid: null,
+            checkedByName: null,
+            checkedAt: null,
+            ...(clearFollowUpTickets && item.followUpTicketId
+              ? {
+                  followUpTicketId: null,
+                  followUpTicketNumber: null,
+                  resetFollowUpTicketAt: serverTimestamp(),
+                  resetFollowUpTicketByUid: performerUid,
+                  resetFollowUpTicketByName: performerName,
+                  resetFollowUpTicketReason: `Dibersihkan bersamaan reset checklist. Alasan: ${reason}`,
+                }
+              : {}),
+            updatedAt: serverTimestamp(),
+          }) as Record<string, unknown>
+        );
+      });
+      return batch.commit();
+    });
+
+    await debugFirestoreWrite("update parent work order after checklist reset", async () => {
+      return updateDoc(
+        woRef,
+        cleanFirestoreData({
+          status: "in_progress",
+          retryCount: (workOrder.retryCount || 0) + 1,
+          checklistResetAt: serverTimestamp(),
+          checklistResetByUid: performerUid,
+          checklistResetByName: performerName,
+          checklistResetReason: reason,
+          updatedAt: serverTimestamp(),
+          updatedByUid: performerUid,
+          updatedByName: performerName,
+        }) as Record<string, unknown>
+      );
+    });
+
+    await debugFirestoreWrite("create reset checklist work order log", async () => {
+      return writeWorkOrderLog({
+        workOrderId: workOrder.id,
+        workOrderNumber: workOrder.workOrderNumber,
+        action: "retry_checklist",
+        oldStatus: workOrder.status,
+        newStatus: "in_progress",
+        note: `Checklist asset di-reset. Alasan: ${reason}`,
+        performedByUid: performerUid,
+        performedByName: performerName,
+      });
+    });
+
+    const clearedTicketItems = clearFollowUpTickets
+      ? items.filter((item) => !!item.followUpTicketId)
+      : [];
+    if (clearedTicketItems.length > 0) {
+      await debugFirestoreWrite("create reset follow-up ticket work order log", async () => {
+        return writeWorkOrderLog({
+          workOrderId: workOrder.id,
+          workOrderNumber: workOrder.workOrderNumber,
+          action: "reset_follow_up_ticket",
+          note: `Ticket lanjutan di-reset oleh admin bersamaan reset checklist (${clearedTicketItems
+            .map((i) => i.assetName)
+            .join(", ")}). Alasan: ${reason}`,
+          performedByUid: performerUid,
+          performedByName: performerName,
+        });
+      });
+    }
   };
 
   const handleSaveDraftReport = async (reason: string) => {
@@ -898,6 +1459,7 @@ export default function WorkOrderDetailModal({
     }
     setHelpError("");
     setHelpReason("");
+    setResetChecklistClearTickets(false);
     setPendingHelpAction(option);
   };
 
@@ -931,7 +1493,7 @@ export default function WorkOrderDetailModal({
           await handleSaveDraftReport(reason);
           break;
         case "reset_checklist_in_progress":
-          await handleRetryChecklist(reason, "in_progress");
+          await handleResetChecklistInProgress(reason, resetChecklistClearTickets);
           break;
         case "return_to_scheduled":
           await handleReturnToScheduled(reason);
@@ -1157,9 +1719,9 @@ export default function WorkOrderDetailModal({
     setConditionBefore(item.conditionBefore || "Baik");
     setConditionAfter(item.conditionAfter || "Baik");
     setChecklist(item.checklist || DEFAULT_CHECKLIST);
-    setFindings(item.findings || "");
     setActionTaken(item.actionTaken || "");
-    setTechnicianNote(item.technicianNote || "");
+    setTechnicianNote(item.technicianNote || item.findings || "");
+    setItemFormError("");
   };
 
   const updateAssetAfterCheck = async (item: MaintenanceWorkOrderItem, after: MaintenanceConditionLabel) => {
@@ -1213,6 +1775,23 @@ export default function WorkOrderDetailModal({
   };
 
   const handleSaveItem = async (item: MaintenanceWorkOrderItem) => {
+    // Guard di dalam handler, bukan cuma disable UI — supaya data tetap aman
+    // walau ada bug di UI yang lupa nge-disable tombol/lupa mengunci form.
+    if (!canEditMaintenanceCheck(item, currentAssetUser)) {
+      setItemFormError("Temuan sudah dikirim ke QHSE. Menunggu keputusan QHSE.");
+      return;
+    }
+    const allChecked = CHECKLIST_LABELS.every(({ key }) => checklist[key]);
+    const actionNeedsNote = !!actionTaken && actionTaken !== "no_action";
+    if ((!allChecked || actionNeedsNote) && !technicianNote.trim()) {
+      setItemFormError(
+        actionNeedsNote
+          ? `Tindakan "${ACTION_LABELS[actionTaken as MaintenanceActionTaken]}" wajib disertai catatan di "Temuan / Catatan Teknisi".`
+          : 'Ada checklist yang belum dicentang — isi dulu "Temuan / Catatan Teknisi".'
+      );
+      return;
+    }
+    setItemFormError("");
     setSaving(true);
     try {
       const needsFollowUp = !!actionTaken && NEEDS_FOLLOW_UP_ACTIONS.includes(actionTaken);
@@ -1224,19 +1803,36 @@ export default function WorkOrderDetailModal({
         "items",
         item.id
       );
-      await updateDoc(itemRef, {
-        status: newItemStatus,
-        conditionBefore,
-        conditionAfter,
-        checklist,
-        findings,
-        actionTaken: actionTaken || null,
-        technicianNote,
-        checkedByUid: assetUser?.uid || "",
-        checkedByName: assetUser?.name || "",
-        checkedAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      const isRecheck = item.followUpStatus === "recheck_requested";
+      await updateDoc(
+        itemRef,
+        cleanFirestoreData({
+          status: newItemStatus,
+          conditionBefore,
+          conditionAfter,
+          checklist,
+          // technicianNote = satu-satunya field yang diisi di UI ("Temuan /
+          // Catatan Teknisi") — findings dipertahankan sebagai alias untuk
+          // kompatibilitas data lama yang masih membaca field ini.
+          technicianNote,
+          findings: technicianNote,
+          actionTaken: actionTaken || null,
+          checkedByUid: assetUser?.uid || "",
+          checkedByName: assetUser?.name || "",
+          checkedAt: serverTimestamp(),
+          // Simpan draft hasil cek ulang TANPA mengubah followUpStatus —
+          // masih "recheck_requested" sampai Tim IT klik "Kirim Hasil Cek
+          // Ulang ke QHSE" (lihat handleSubmitRecheckResult).
+          ...(isRecheck
+            ? {
+                recheckSavedAt: serverTimestamp(),
+                recheckSavedByUid: assetUser?.uid || "",
+                recheckSavedByName: assetUser?.name || "",
+              }
+            : {}),
+          updatedAt: serverTimestamp(),
+        }) as Record<string, unknown>
+      );
       await writeWorkOrderLog({
         workOrderId: workOrder.id,
         workOrderNumber: workOrder.workOrderNumber,
@@ -1261,78 +1857,651 @@ export default function WorkOrderDetailModal({
     }
   };
 
-  const handleCreateFollowUpTicket = async (item: MaintenanceWorkOrderItem) => {
+  // Tim IT TIDAK boleh lagi bikin ticket kendala untuk dirinya sendiri (alur
+  // muter: IT lapor → ticket dibuat → balik ke IT lagi). Tim IT hanya
+  // melaporkan temuan ke QHSE lewat handleReportFindingToQhse di bawah. QHSE
+  // yang memutuskan tindak lanjutnya lewat salah satu handler di bawah ini —
+  // dipanggil dari modal keputusan (qhseDecisionItem/qhseDecisionKind).
+
+  // 1. Cukup Dicatat — tidak ada ticket, tidak ada assignment baru.
+  const handleQhseMarkNoted = async (item: MaintenanceWorkOrderItem) => {
     setSaving(true);
     try {
-      const ticketNumber = await generateTicketNumber();
-      const queueNumber = await generateQueueNumber();
-      const ticketRef = await addDoc(collection(db, "asset_issue_tickets"), {
-        ticketNumber,
-        queueNumber,
-        assetId: item.assetId,
-        assetName: item.assetName,
-        assetCode: item.assetCode,
-        assetCategory: item.assetCategory || "",
-        assetLocation: item.assetLocation || "",
-        reportedByUid: assetUser?.uid || "",
-        reportedByName: assetUser?.name || "",
-        reportedByEmail: assetUser?.email || "",
-        reportedAt: serverTimestamp(),
-        symptomType: "Lainnya",
-        impactLevel: "Mengganggu Pekerjaan",
-        description: findings || item.findings || "Temuan dari Work Order Maintenance",
-        priority: "medium",
-        status: "waiting_diagnosis",
-        source: "maintenance_work_order",
-        workOrderId: workOrder.id,
-        workOrderNumber: workOrder.workOrderNumber,
-        workOrderItemId: item.id,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-      await writeAssetIssueLog({
-        ticketId: ticketRef.id,
-        ticketNumber,
-        action: "create_ticket",
-        newStatus: "waiting_diagnosis",
-        note: `Dibuat dari temuan Work Order ${workOrder.workOrderNumber}`,
-        performedByUid: assetUser?.uid || "",
-        performedByName: assetUser?.name || "",
-      });
-
-      const itemRef = doc(
-        db,
-        "asset_maintenance_work_orders",
-        workOrder.id,
-        "items",
-        item.id
+      const qhseUid = assetUser?.uid || "";
+      const qhseName = assetUser?.name || "";
+      const itemRef = doc(db, "asset_maintenance_work_orders", workOrder.id, "items", item.id);
+      await updateDoc(
+        itemRef,
+        cleanFirestoreData({
+          followUpStatus: "noted",
+          needsQhseReview: false,
+          qhseDecision: "noted",
+          qhseDecisionLabel: "Cukup Dicatat",
+          qhseDecisionByUid: qhseUid,
+          qhseDecisionByName: qhseName,
+          qhseDecisionAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }) as Record<string, unknown>
       );
-      await updateDoc(itemRef, {
-        followUpTicketId: ticketRef.id,
-        followUpTicketNumber: ticketNumber,
-        updatedAt: serverTimestamp(),
-      });
-
       await writeWorkOrderLog({
         workOrderId: workOrder.id,
         workOrderNumber: workOrder.workOrderNumber,
-        action: "create_follow_up_ticket",
-        note: `Ticket ${ticketNumber} dibuat dari ${item.assetName}`,
-        performedByUid: assetUser?.uid || "",
-        performedByName: assetUser?.name || "",
+        action: "qhse_finding_decision",
+        note: `Temuan dicatat QHSE (${item.assetName}) — tidak ada tindak lanjut lebih jauh`,
+        performedByUid: qhseUid,
+        performedByName: qhseName,
       });
     } finally {
       setSaving(false);
     }
   };
 
+  // 2. Minta Cek Ulang ke Tim IT — item & work order kembali "in_progress",
+  // notifikasi ke Tim IT yang mengerjakan, catatan revisi WAJIB.
+  const handleQhseRequestRecheck = async (item: MaintenanceWorkOrderItem, note: string) => {
+    setSaving(true);
+    try {
+      const qhseUid = assetUser?.uid || "";
+      const qhseName = assetUser?.name || "";
+      const itemRef = doc(db, "asset_maintenance_work_orders", workOrder.id, "items", item.id);
+      await updateDoc(
+        itemRef,
+        cleanFirestoreData({
+          status: "in_progress",
+          followUpStatus: "recheck_requested",
+          needsQhseReview: false,
+          qhseDecision: "request_recheck",
+          qhseDecisionLabel: "Minta Cek Ulang",
+          qhseDecisionNote: note,
+          qhseDecisionByUid: qhseUid,
+          qhseDecisionByName: qhseName,
+          qhseDecisionAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }) as Record<string, unknown>
+      );
+
+      // needsQhseReview di parent hanya boleh jadi false kalau TIDAK ada item
+      // lain (selain item ini) yang masih menunggu keputusan QHSE.
+      const stillWaiting = items.some(
+        (i) => i.id !== item.id && i.needsQhseReview && i.followUpStatus === "waiting_qhse_decision"
+      );
+
+      await updateDoc(
+        woRef,
+        cleanFirestoreData({
+          status: "in_progress",
+          needsQhseReview: stillWaiting,
+          lastActivityMessage: "QHSE meminta Tim IT melakukan cek ulang.",
+          updatedAt: serverTimestamp(),
+          updatedByUid: qhseUid,
+          updatedByName: qhseName,
+        }) as Record<string, unknown>
+      );
+      await writeWorkOrderLog({
+        workOrderId: workOrder.id,
+        workOrderNumber: workOrder.workOrderNumber,
+        action: "qhse_finding_decision",
+        note: `QHSE (${qhseName}) minta cek ulang pada ${item.assetName}. Catatan: ${note}`,
+        performedByUid: qhseUid,
+        performedByName: qhseName,
+      });
+
+      if (workOrder.assignedToUid) {
+        await createAssetNotification({
+          recipientUid: workOrder.assignedToUid,
+          recipientName: workOrder.assignedToName || "",
+          recipientRole: assignedMaintenanceRole,
+          title: "QHSE Meminta Cek Ulang",
+          message: `QHSE meminta Anda melakukan cek ulang pada asset ${item.assetName}. Catatan: ${note}`,
+          type: "maintenance_finding_decided",
+          priority: "medium",
+          linkUrl: `/maintenance?tab=routine&workOrderId=${workOrder.id}`,
+          relatedType: "work_order",
+          relatedId: workOrder.id,
+          relatedNumber: workOrder.workOrderNumber,
+          createdByUid: qhseUid,
+          createdByName: qhseName,
+        });
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // 3. Buat Tugas Korektif IT — SATU-SATUNYA tempat ticket dibuat dari
+  // temuan maintenance, dan hanya QHSE yang bisa memicunya.
+  const handleQhseCreateCorrectiveTask = async (
+    item: MaintenanceWorkOrderItem,
+    note: string,
+    selectedItUid: string
+  ) => {
+    setSaving(true);
+    try {
+      const qhseUid = assetUser?.uid || "";
+      const qhseName = assetUser?.name || "";
+      const technicianUid = workOrder.assignedToUid || "";
+      const technicianName = workOrder.assignedToName || "";
+      const selectedIt = itTeamOptions.find((u) => u.uid === selectedItUid);
+
+      const ticketNumber = await generateTicketNumber();
+      const queueNumber = await generateQueueNumber();
+      const ticketRef = await addDoc(
+        collection(db, "asset_issue_tickets"),
+        cleanFirestoreData({
+          ticketNumber,
+          queueNumber,
+          assetId: item.assetId,
+          assetName: item.assetName,
+          assetCode: item.assetCode,
+          assetCategory: item.assetCategory || "",
+          assetLocation: item.assetLocation || "",
+          reportedByUid: technicianUid,
+          reportedByName: technicianName,
+          reportedByEmail: workOrder.assignedToEmail || "",
+          reportedAt: serverTimestamp(),
+          symptomType: "Lainnya",
+          impactLevel: item.findingSeverity === "urgent" ? "Darurat" : "Mengganggu Pekerjaan",
+          description: note || item.findingNote || item.technicianNote || "Temuan dari Work Order Maintenance",
+          priority: item.findingSeverity === "urgent" ? "high" : "medium",
+          status: "waiting_diagnosis",
+          assignedToUid: selectedIt?.uid || null,
+          assignedToName: selectedIt?.name || null,
+          assignedAt: selectedIt ? serverTimestamp() : null,
+          source: "maintenance_finding",
+          sourceWorkOrderId: workOrder.id,
+          sourceWorkOrderNumber: workOrder.workOrderNumber,
+          sourceItemId: item.id,
+          sourceAssetId: item.assetId,
+          workOrderId: workOrder.id,
+          workOrderNumber: workOrder.workOrderNumber,
+          workOrderItemId: item.id,
+          createdByUid: qhseUid,
+          createdByName: qhseName,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }) as Record<string, unknown>
+      );
+      await writeAssetIssueLog({
+        ticketId: ticketRef.id,
+        ticketNumber,
+        action: "create_ticket",
+        newStatus: "waiting_diagnosis",
+        note: `Dibuat oleh QHSE (${qhseName}) dari temuan Work Order ${workOrder.workOrderNumber}. Catatan: ${note}`,
+        performedByUid: qhseUid,
+        performedByName: qhseName,
+      });
+
+      const itemRef = doc(db, "asset_maintenance_work_orders", workOrder.id, "items", item.id);
+      await updateDoc(
+        itemRef,
+        cleanFirestoreData({
+          followUpTicketId: ticketRef.id,
+          followUpTicketNumber: ticketNumber,
+          followUpStatus: "corrective_task_created",
+          needsQhseReview: false,
+          correctiveAssignedToUid: selectedIt?.uid || null,
+          correctiveAssignedToName: selectedIt?.name || null,
+          qhseDecision: "create_corrective_task",
+          qhseDecisionLabel: QHSE_FOLLOW_UP_DECISION_LABELS.create_corrective_task,
+          qhseDecisionNote: note,
+          qhseDecisionByUid: qhseUid,
+          qhseDecisionByName: qhseName,
+          qhseDecisionAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }) as Record<string, unknown>
+      );
+
+      await writeWorkOrderLog({
+        workOrderId: workOrder.id,
+        workOrderNumber: workOrder.workOrderNumber,
+        action: "qhse_finding_decision",
+        note: `QHSE (${qhseName}) membuat tugas korektif ${ticketNumber} dari temuan ${item.assetName}${
+          selectedIt ? ` untuk ${selectedIt.name}` : ""
+        }. Catatan: ${note}`,
+        performedByUid: qhseUid,
+        performedByName: qhseName,
+      });
+
+      if (selectedIt) {
+        await createAssetNotification({
+          recipientUid: selectedIt.uid,
+          recipientName: selectedIt.name || "",
+          recipientRole: "it_team",
+          title: "Tugas Korektif Baru dari Temuan Maintenance",
+          message: `QHSE menugaskan Anda menangani ${item.assetName} (${ticketNumber}). Catatan: ${note}`,
+          type: "maintenance_finding_decided",
+          priority: item.findingSeverity === "urgent" ? "urgent" : "medium",
+          linkUrl: `/maintenance?tab=technician-queue&ticketId=${ticketRef.id}`,
+          relatedType: "ticket",
+          relatedId: ticketRef.id,
+          relatedNumber: ticketNumber,
+          createdByUid: qhseUid,
+          createdByName: qhseName,
+        });
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // 4 & 5. Ajukan Pembelian Komponen / Butuh Vendor Eksternal — TIDAK
+  // membuat ticket dan TIDAK assign ke Tim IT sebagai tugas aktif, cuma
+  // dicatat + notifikasi QHSE/Admin/Super Admin lain supaya bisa ditindak.
+  const handleQhseRequestPurchaseOrVendor = async (
+    item: MaintenanceWorkOrderItem,
+    kind: "need_purchase" | "need_vendor",
+    note: string
+  ) => {
+    setSaving(true);
+    try {
+      const qhseUid = assetUser?.uid || "";
+      const qhseName = assetUser?.name || "";
+      const followUpStatus = kind === "need_purchase" ? "waiting_purchase" : "waiting_vendor";
+      const itemRef = doc(db, "asset_maintenance_work_orders", workOrder.id, "items", item.id);
+      await updateDoc(
+        itemRef,
+        cleanFirestoreData({
+          followUpStatus,
+          needsQhseReview: false,
+          purchaseDetail: kind === "need_purchase" ? note : null,
+          vendorNote: kind === "need_vendor" ? note : null,
+          qhseDecision: kind,
+          qhseDecisionLabel: QHSE_FOLLOW_UP_DECISION_LABELS[kind],
+          qhseDecisionNote: note,
+          qhseDecisionByUid: qhseUid,
+          qhseDecisionByName: qhseName,
+          qhseDecisionAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }) as Record<string, unknown>
+      );
+      await writeWorkOrderLog({
+        workOrderId: workOrder.id,
+        workOrderNumber: workOrder.workOrderNumber,
+        action: "qhse_finding_decision",
+        note: `QHSE (${qhseName}) menandai ${item.assetName} ${
+          kind === "need_purchase" ? "butuh pembelian komponen" : "butuh vendor eksternal"
+        }. Catatan: ${note}`,
+        performedByUid: qhseUid,
+        performedByName: qhseName,
+      });
+
+      const otherQhse = await fetchActiveUsersByRole("asset_admin");
+      const superAdmins = await fetchActiveUsersByRole("super_admin");
+      const recipients = [...otherQhse, ...superAdmins].filter((u) => u.uid !== qhseUid);
+      await Promise.all(
+        recipients.map((r) =>
+          createAssetNotification({
+            recipientUid: r.uid,
+            recipientName: r.name || "",
+            recipientRole: r.role,
+            title: "Keputusan QHSE atas Temuan",
+            message: `${item.assetName} pada maintenance ${workOrder.title} ${
+              kind === "need_purchase" ? "butuh pembelian komponen" : "butuh vendor eksternal"
+            }. Catatan: ${note}`,
+            type: "maintenance_finding_decided",
+            priority: item.findingSeverity === "urgent" ? "urgent" : "medium",
+            linkUrl: `/maintenance?tab=follow-up&workOrderId=${workOrder.id}`,
+            relatedType: "work_order",
+            relatedId: workOrder.id,
+            relatedNumber: workOrder.workOrderNumber,
+            createdByUid: qhseUid,
+            createdByName: qhseName,
+          })
+        )
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // 6. Tandai Asset Tidak Layak Pakai Sementara — asset ikut diupdate supaya
+  // tidak bisa dipinjam sampai QHSE lanjut memilih vendor/pembelian/tugas IT.
+  const handleQhseMarkAssetUnusable = async (item: MaintenanceWorkOrderItem, note: string) => {
+    setSaving(true);
+    try {
+      const qhseUid = assetUser?.uid || "";
+      const qhseName = assetUser?.name || "";
+      const itemRef = doc(db, "asset_maintenance_work_orders", workOrder.id, "items", item.id);
+      await updateDoc(
+        itemRef,
+        cleanFirestoreData({
+          followUpStatus: "asset_temporarily_unusable",
+          needsQhseReview: false,
+          qhseDecision: "mark_temporarily_unusable",
+          qhseDecisionLabel: QHSE_FOLLOW_UP_DECISION_LABELS.mark_temporarily_unusable,
+          qhseDecisionNote: note,
+          qhseDecisionByUid: qhseUid,
+          qhseDecisionByName: qhseName,
+          qhseDecisionAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }) as Record<string, unknown>
+      );
+
+      const assetRef = doc(db, "assets", item.assetId);
+      const assetSnap = await getDoc(assetRef);
+      let responsiblePersonUid: string | undefined;
+      let responsiblePersonName: string | undefined;
+      if (assetSnap.exists()) {
+        const assetData = assetSnap.data();
+        responsiblePersonUid = assetData.responsiblePersonUid;
+        responsiblePersonName = assetData.responsiblePersonName;
+        await updateDoc(
+          assetRef,
+          cleanFirestoreData({
+            assetStatus: "maintenance",
+            condition: "heavy_damage",
+            isBorrowable: false,
+            updatedAt: serverTimestamp(),
+          }) as Record<string, unknown>
+        );
+      }
+
+      await writeWorkOrderLog({
+        workOrderId: workOrder.id,
+        workOrderNumber: workOrder.workOrderNumber,
+        action: "qhse_finding_decision",
+        note: `QHSE (${qhseName}) menandai ${item.assetName} tidak layak pakai sementara. Catatan: ${note}`,
+        performedByUid: qhseUid,
+        performedByName: qhseName,
+      });
+
+      const notifyRecipients: { uid: string; name: string; role: "asset_admin" | "staff" }[] = [];
+      if (workOrder.requestedByUid && workOrder.requestedByUid !== qhseUid) {
+        notifyRecipients.push({
+          uid: workOrder.requestedByUid,
+          name: workOrder.requestedByName,
+          role: "asset_admin",
+        });
+      }
+      if (responsiblePersonUid) {
+        notifyRecipients.push({
+          uid: responsiblePersonUid,
+          name: responsiblePersonName || "",
+          role: "staff",
+        });
+      }
+      await Promise.all(
+        notifyRecipients.map((r) =>
+          createAssetNotification({
+            recipientUid: r.uid,
+            recipientName: r.name,
+            recipientRole: r.role,
+            title: "Keputusan QHSE atas Temuan",
+            message: `${item.assetName} ditandai tidak layak pakai sementara oleh QHSE. Catatan: ${note}`,
+            type: "maintenance_finding_decided",
+            priority: "high",
+            linkUrl: "/assets",
+            relatedType: "asset",
+            relatedId: item.assetId,
+            createdByUid: qhseUid,
+            createdByName: qhseName,
+          })
+        )
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Tim IT melaporkan temuan ke QHSE — TIDAK create ticket sama sekali di
+  // sini, cuma update flag review di item + parent work order, lalu
+  // notifikasi QHSE yang membuat jadwal ini (workOrder.requestedByUid).
+  // QHSE-lah yang nanti memutuskan lewat salah satu handleQhse* di atas.
+  const handleReportFindingToQhse = async (item: MaintenanceWorkOrderItem) => {
+    // Guard di dalam handler (defense in depth) — kalau item sudah terkunci
+    // (menunggu keputusan QHSE atau sudah final), tolak walau tombolnya
+    // entah kenapa masih ter-render aktif.
+    if (!canEditMaintenanceCheck(item, currentAssetUser)) {
+      setItemFormError("Temuan sudah dikirim ke QHSE. Menunggu keputusan QHSE.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const performerUid = assetUser?.uid || firebaseUser?.uid || "";
+      const performerName =
+        assetUser?.name || firebaseUser?.displayName || firebaseUser?.email || "Tim IT";
+      const severity: "normal" | "urgent" =
+        actionTaken && ["temporarily_unusable", "need_vendor"].includes(actionTaken)
+          ? "urgent"
+          : "normal";
+      const actionLabel = actionTaken ? ACTION_LABELS[actionTaken] : "";
+
+      const itemRef = doc(db, "asset_maintenance_work_orders", workOrder.id, "items", item.id);
+      await updateDoc(
+        itemRef,
+        cleanFirestoreData({
+          actionTaken: actionTaken || null,
+          actionLabel,
+          technicianNote,
+          findingNote: technicianNote,
+          technicalNote: technicianNote,
+          needsQhseReview: true,
+          followUpStatus: "waiting_qhse_decision",
+          findingSeverity: severity,
+          findingAction: actionTaken || null,
+          reportedToQhseAt: serverTimestamp(),
+          reportedToQhseByUid: performerUid,
+          reportedToQhseByName: performerName,
+          updatedAt: serverTimestamp(),
+          updatedByUid: performerUid,
+          updatedByName: performerName,
+        }) as Record<string, unknown>
+      );
+
+      await updateDoc(
+        woRef,
+        cleanFirestoreData({
+          hasFindings: true,
+          needsQhseReview: true,
+          followUpStatus: "waiting_qhse_decision",
+          lastFindingAt: serverTimestamp(),
+          lastFindingByUid: performerUid,
+          lastFindingByName: performerName,
+          lastActivityMessage: "Tim IT melaporkan temuan maintenance kepada QHSE.",
+          updatedAt: serverTimestamp(),
+          updatedByUid: performerUid,
+          updatedByName: performerName,
+        }) as Record<string, unknown>
+      );
+
+      await writeWorkOrderLog({
+        workOrderId: workOrder.id,
+        workOrderNumber: workOrder.workOrderNumber,
+        action: "check_asset_item",
+        note: `Temuan pada ${item.assetName} dilaporkan ke QHSE. Tindakan disarankan: ${actionLabel || "-"}. Catatan: ${technicianNote || "-"}`,
+        performedByUid: performerUid,
+        performedByName: performerName,
+      });
+
+      if (workOrder.requestedByUid) {
+        await createAssetNotification({
+          recipientUid: workOrder.requestedByUid,
+          recipientName: workOrder.requestedByName,
+          recipientRole: "asset_admin",
+          title: "Temuan Maintenance Perlu Review",
+          message: `${performerName} melaporkan temuan pada maintenance ${workOrder.title}. Tindakan yang disarankan: ${
+            actionLabel || "-"
+          }. Catatan: ${technicianNote || "-"}`,
+          type: "maintenance_finding_reported",
+          priority: severity === "urgent" ? "urgent" : "medium",
+          linkUrl: `/maintenance?tab=follow-up&workOrderId=${workOrder.id}`,
+          relatedType: "work_order",
+          relatedId: workOrder.id,
+          relatedNumber: workOrder.workOrderNumber,
+          createdByUid: performerUid,
+          createdByName: performerName,
+        });
+      }
+
+      setExpandedItemId(null);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Tim IT mengirim hasil CEK ULANG (setelah QHSE minta "Minta Cek Ulang") —
+  // beda dari handleReportFindingToQhse (laporan pertama kali): di sini
+  // followUpStatus balik dari "recheck_requested" ke "waiting_qhse_decision"
+  // lagi, dicatat sebagai recheckSubmittedAt/By* supaya kelihatan ini
+  // putaran cek ulang, bukan temuan baru.
+  const handleSubmitRecheckResult = async (item: MaintenanceWorkOrderItem) => {
+    if (!canEditMaintenanceCheck(item, currentAssetUser)) {
+      setItemFormError("Form ini sudah terkunci.");
+      return;
+    }
+    const allChecked = CHECKLIST_LABELS.every(({ key }) => checklist[key]);
+    const actionNeedsNote = !!actionTaken && actionTaken !== "no_action";
+    if (!actionTaken) {
+      setItemFormError("Pilih tindakan sebelum mengirim hasil cek ulang.");
+      return;
+    }
+    if ((!allChecked || actionNeedsNote) && !technicianNote.trim()) {
+      setItemFormError(
+        actionNeedsNote
+          ? `Tindakan "${ACTION_LABELS[actionTaken as MaintenanceActionTaken]}" wajib disertai catatan di "Temuan / Catatan Teknisi".`
+          : 'Ada checklist yang belum dicentang — isi dulu "Temuan / Catatan Teknisi".'
+      );
+      return;
+    }
+    setItemFormError("");
+    setSaving(true);
+    try {
+      const performerUid = assetUser?.uid || firebaseUser?.uid || "";
+      const performerName =
+        assetUser?.name || firebaseUser?.displayName || firebaseUser?.email || "Tim IT";
+      const actionLabel = actionTaken ? ACTION_LABELS[actionTaken] : "";
+
+      const itemRef = doc(db, "asset_maintenance_work_orders", workOrder.id, "items", item.id);
+      await updateDoc(
+        itemRef,
+        cleanFirestoreData({
+          status: "checked",
+          conditionBefore,
+          conditionAfter,
+          checklist,
+          actionTaken: actionTaken || null,
+          actionLabel,
+          technicianNote,
+          findingNote: technicianNote,
+          technicalNote: technicianNote,
+          findings: technicianNote,
+          followUpStatus: "waiting_qhse_decision",
+          needsQhseReview: true,
+          recheckSubmittedAt: serverTimestamp(),
+          recheckSubmittedByUid: performerUid,
+          recheckSubmittedByName: performerName,
+          recheckResponseNote: technicianNote,
+          reportedToQhseAt: serverTimestamp(),
+          reportedToQhseByUid: performerUid,
+          reportedToQhseByName: performerName,
+          updatedAt: serverTimestamp(),
+          updatedByUid: performerUid,
+          updatedByName: performerName,
+        }) as Record<string, unknown>
+      );
+
+      await updateDoc(
+        woRef,
+        cleanFirestoreData({
+          needsQhseReview: true,
+          followUpStatus: "waiting_qhse_decision",
+          lastActivityAt: serverTimestamp(),
+          lastActivityByUid: performerUid,
+          lastActivityByName: performerName,
+          lastActivityMessage: "Tim IT mengirim hasil cek ulang ke QHSE.",
+          updatedAt: serverTimestamp(),
+          updatedByUid: performerUid,
+          updatedByName: performerName,
+        }) as Record<string, unknown>
+      );
+
+      await writeWorkOrderLog({
+        workOrderId: workOrder.id,
+        workOrderNumber: workOrder.workOrderNumber,
+        action: "check_asset_item",
+        note: `Hasil cek ulang ${item.assetName} dikirim ke QHSE. Tindakan: ${actionLabel || "-"}. Catatan: ${technicianNote || "-"}`,
+        performedByUid: performerUid,
+        performedByName: performerName,
+      });
+
+      if (workOrder.requestedByUid) {
+        await createAssetNotification({
+          recipientUid: workOrder.requestedByUid,
+          recipientName: workOrder.requestedByName,
+          recipientRole: "asset_admin",
+          title: "Hasil Cek Ulang Dikirim",
+          message: `${performerName} mengirim hasil cek ulang untuk asset ${item.assetName}. Catatan: ${
+            technicianNote || "-"
+          }`,
+          type: "maintenance_finding_reported",
+          priority: "medium",
+          linkUrl: `/maintenance?tab=follow-up&workOrderId=${workOrder.id}`,
+          relatedType: "work_order",
+          relatedId: workOrder.id,
+          relatedNumber: workOrder.workOrderNumber,
+          createdByUid: performerUid,
+          createdByName: performerName,
+        });
+      }
+
+      setExpandedItemId(null);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Khusus QHSE/Super Admin — bersihkan relasi ticket lanjutan yang stale di
+  // item (mis. ticket-nya sudah dihapus manual saat testing) TANPA menyentuh
+  // timeline lama; tetap tercatat log baru supaya jejaknya ada.
+  const handleResetFollowUpTicket = async (item: MaintenanceWorkOrderItem, reason: string) => {
+    const performerUid = assetUser?.uid || firebaseUser?.uid || "";
+    const performerName =
+      assetUser?.name || firebaseUser?.displayName || firebaseUser?.email || "Admin";
+
+    console.log("[Reset Ticket Lanjutan] START", {
+      workOrderId: workOrder.id,
+      itemId: item.id,
+      followUpTicketId: item.followUpTicketId,
+      reason,
+    });
+
+    const itemRef = doc(db, "asset_maintenance_work_orders", workOrder.id, "items", item.id);
+    await debugFirestoreWrite("reset follow-up ticket relation on item", async () =>
+      updateDoc(
+        itemRef,
+        cleanFirestoreData({
+          followUpTicketId: null,
+          followUpTicketNumber: null,
+          actionTaken: "no_action",
+          resetFollowUpTicketAt: serverTimestamp(),
+          resetFollowUpTicketByUid: performerUid,
+          resetFollowUpTicketByName: performerName,
+          resetFollowUpTicketReason: reason,
+          updatedAt: serverTimestamp(),
+        }) as Record<string, unknown>
+      )
+    );
+
+    await debugFirestoreWrite("create reset follow-up ticket work order log", async () =>
+      writeWorkOrderLog({
+        workOrderId: workOrder.id,
+        workOrderNumber: workOrder.workOrderNumber,
+        action: "reset_follow_up_ticket",
+        note: `Ticket lanjutan di-reset oleh admin dari ${item.assetName}. Alasan: ${reason}`,
+        performedByUid: performerUid,
+        performedByName: performerName,
+      })
+    );
+  };
+
   // Laporan Hasil (section 10) — diagregasi dari checklist per-asset karena
   // belum ada field laporan tunggal di level work order.
   const hasReport = !!workOrder.reportSubmittedAt;
+  const hasAnyQhseFinding = items.some((i) => !!i.needsQhseReview);
   const findingsList = items.filter((i) => i.findings).map((i) => ({ asset: i.assetName, text: i.findings! }));
   const actionsList = items
     .filter((i) => i.actionTaken)
-    .map((i) => ({ asset: i.assetName, text: i.actionTaken! }));
+    .map((i) => ({ asset: i.assetName, text: ACTION_LABELS[i.actionTaken!] || i.actionTaken! }));
   const recommendationList = items
     .filter((i) => i.technicianNote)
     .map((i) => ({ asset: i.assetName, text: i.technicianNote! }));
@@ -1342,7 +2511,12 @@ export default function WorkOrderDetailModal({
   const photosAfter = items.flatMap((i) =>
     (i.photoAfterUrls || []).map((url) => ({ asset: i.assetName, url }))
   );
-  const followUpTickets = items.filter((i) => i.followUpTicketNumber);
+  const followUpTickets = items.filter(
+    (i) =>
+      !!i.needsQhseReview ||
+      !!i.followUpStatus ||
+      ["active", "cancelled"].includes(getTicketBadgeState(i, existingTicketsById))
+  );
 
   const locationLabel =
     workOrder.maintenanceLocationText || workOrder.locationText || "Belum ditentukan";
@@ -1489,12 +2663,53 @@ export default function WorkOrderDetailModal({
                 </p>
               </section>
 
-              <section className="rounded-2xl border border-slate-200 p-4">
+              <section id="wo-laporan-hasil" className="rounded-2xl border border-slate-200 p-4">
                 <h3 className="text-sm font-semibold text-slate-800 mb-3">Laporan Hasil</h3>
                 {!hasReport ? (
-                  <p className="text-sm text-slate-400">Laporan hasil belum dikirim.</p>
+                  isAssignedTechnician ? (
+                    <p className="text-sm text-slate-400">
+                      Laporan akhir belum dikirim. Selesaikan pengecekan asset lalu kirim laporan
+                      ke QHSE.
+                    </p>
+                  ) : (
+                    <p className="text-sm text-slate-400">Laporan hasil belum dikirim.</p>
+                  )
                 ) : (
                   <div className="space-y-4">
+                    {hasAnyQhseFinding && (
+                      <Badge label="Menunggu Review QHSE" colorClass="bg-amber-100 text-amber-700" />
+                    )}
+                    <div className="grid sm:grid-cols-2 gap-x-4 gap-y-2 text-sm">
+                      <Info label="Dikirim oleh" value={workOrder.reportSubmittedByName} />
+                      <Info
+                        label="Waktu kirim"
+                        value={
+                          workOrder.reportSubmittedAt
+                            ? formatDateTimeSeconds(workOrder.reportSubmittedAt)
+                            : undefined
+                        }
+                      />
+                    </div>
+                    {workOrder.reportSummary && (
+                      <div>
+                        <p className="text-xs font-medium text-slate-500 mb-1">Ringkasan</p>
+                        <p className="text-sm text-slate-700 whitespace-pre-line bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+                          {workOrder.reportSummary}
+                        </p>
+                      </div>
+                    )}
+                    {workOrder.reportConclusion && (
+                      <div>
+                        <p className="text-xs font-medium text-slate-500 mb-1">Kesimpulan Teknisi</p>
+                        <p className="text-sm text-slate-700">{workOrder.reportConclusion}</p>
+                      </div>
+                    )}
+                    {workOrder.reportRecommendation && (
+                      <div>
+                        <p className="text-xs font-medium text-slate-500 mb-1">Rekomendasi Teknisi</p>
+                        <p className="text-sm text-slate-700">{workOrder.reportRecommendation}</p>
+                      </div>
+                    )}
                     <ReportField title="Ringkasan Temuan" entries={findingsList} />
                     <ReportField title="Tindakan yang Dilakukan" entries={actionsList} />
                     <ReportField title="Catatan Teknisi / Rekomendasi" entries={recommendationList} />
@@ -1514,20 +2729,61 @@ export default function WorkOrderDetailModal({
                         </div>
                       </div>
                     )}
-                    <div>
-                      <p className="text-xs font-medium text-slate-500 mb-1">Butuh Ticket Lanjutan?</p>
+                    <div id="wo-temuan-qhse">
+                      <p className="text-xs font-medium text-slate-500 mb-1">Temuan / Butuh Tindak Lanjut QHSE</p>
                       {followUpTickets.length === 0 ? (
                         <p className="text-sm text-slate-600">Tidak ada.</p>
                       ) : (
                         <ul className="text-sm text-slate-700 space-y-0.5">
                           {followUpTickets.map((t) => (
                             <li key={t.id}>
-                              {t.assetName} → <span className="text-blue-600">{t.followUpTicketNumber}</span>
+                              {t.assetName} →{" "}
+                              <span className="text-blue-600">
+                                {getFindingStatusLabel(t, existingTicketsById) || "-"}
+                              </span>
                             </li>
                           ))}
                         </ul>
                       )}
                     </div>
+                    {canMarkCompleted && (
+                      <div className="flex flex-wrap gap-2 pt-1 border-t border-slate-100">
+                        <button
+                          type="button"
+                          onClick={handleMarkCompleted}
+                          disabled={saving}
+                          className="rounded-lg bg-emerald-600 text-white px-3 py-1.5 text-xs font-medium cursor-pointer hover:bg-emerald-700 disabled:opacity-60"
+                        >
+                          Tandai Selesai
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setRevisionError("");
+                            setRevisionReason("");
+                            setRevisionModalOpen(true);
+                          }}
+                          disabled={saving}
+                          className="rounded-lg border border-amber-300 bg-amber-50 text-amber-700 px-3 py-1.5 text-xs font-medium cursor-pointer hover:bg-amber-100 disabled:opacity-60"
+                        >
+                          Minta Revisi
+                        </button>
+                        {followUpTickets.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              document
+                                .getElementById("wo-temuan-qhse")
+                                ?.scrollIntoView({ behavior: "smooth", block: "start" })
+                            }
+                            disabled={saving}
+                            className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 cursor-pointer hover:bg-slate-50 disabled:opacity-60"
+                          >
+                            Lihat Temuan Butuh Keputusan
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
               </section>
@@ -1554,13 +2810,33 @@ export default function WorkOrderDetailModal({
                           )}
                         </div>
                         <div className="flex items-center gap-2 shrink-0">
-                          <Badge
-                            label={WORK_ORDER_ITEM_STATUS_LABEL[item.status]}
-                            colorClass={WORK_ORDER_ITEM_STATUS_COLOR[item.status]}
-                          />
-                          {item.followUpTicketNumber && (
-                            <span className="text-xs text-blue-600">{item.followUpTicketNumber}</span>
-                          )}
+                          {(() => {
+                            // Status utama header: kalau ada temuan yang lagi berjalan/final,
+                            // itu lebih relevan daripada status checklist mentah — tampilkan
+                            // SATU badge yang jelas (bukan dua badge kecil bertumpuk).
+                            const findingMeta = getFindingStatusMeta(item);
+                            if (findingMeta) {
+                              return <Badge label={findingMeta.label} colorClass={findingMeta.colorClass} />;
+                            }
+                            const ticketState = getTicketBadgeState(item, existingTicketsById);
+                            if (ticketState === "active") {
+                              return (
+                                <Badge
+                                  label={item.followUpTicketNumber || "Ticket dibuat"}
+                                  colorClass="bg-blue-100 text-blue-700"
+                                />
+                              );
+                            }
+                            if (ticketState === "cancelled") {
+                              return <Badge label="Ticket Dibatalkan" colorClass="bg-slate-100 text-slate-500" />;
+                            }
+                            return (
+                              <Badge
+                                label={WORK_ORDER_ITEM_STATUS_LABEL[item.status]}
+                                colorClass={WORK_ORDER_ITEM_STATUS_COLOR[item.status]}
+                              />
+                            );
+                          })()}
                           {canWorkItems && (
                             <span className="text-xs font-medium text-blue-600">
                               {item.status === "pending" ? "Isi Hasil" : "Detail"}
@@ -1575,8 +2851,195 @@ export default function WorkOrderDetailModal({
                         </div>
                       </button>
 
-                      {expandedItemId === item.id && canWorkItems && (
+                      {(isQhse || isSuperAdminRole) &&
+                        !!item.followUpTicketId &&
+                        getTicketBadgeState(item, existingTicketsById) !== "none" && (
+                          <div className="px-3 pb-2 -mt-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setPendingTicketResetItem(item);
+                                setTicketResetReason("");
+                                setTicketResetError("");
+                              }}
+                              className="text-xs font-medium text-slate-400 cursor-pointer hover:text-red-600 hover:underline"
+                            >
+                              Reset Ticket Lanjutan
+                            </button>
+                          </div>
+                        )}
+
+                      {/* Panel keputusan QHSE — tampil selama temuan masih berjalan ATAU
+                          sudah final (needsQhsePanel), supaya QHSE tetap bisa "Minta Cek
+                          Ulang"/"Ubah Keputusan" walau sudah salah klik sebelumnya (acceptance
+                          #7). Ticket/tugas lanjutan HANYA dibuat lewat tombol di panel ini,
+                          bukan otomatis dari form hasil cek Tim IT. */}
+                      {(isQhse || isSuperAdminRole) && needsQhsePanel(item) && (
+                        <div className="mx-3 mb-3 mt-2 rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-3">
+                          {/* Header */}
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <AlertOctagon size={18} className="text-amber-600 shrink-0" />
+                              <h4 className="text-sm font-semibold text-amber-900">
+                                Keputusan QHSE atas Temuan
+                              </h4>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              {getFindingStatusMeta(item) && (
+                                <Badge
+                                  label={getFindingStatusMeta(item)!.label}
+                                  colorClass={getFindingStatusMeta(item)!.colorClass}
+                                />
+                              )}
+                              {item.findingSeverity === "urgent" && (
+                                <Badge label="Urgent" colorClass="bg-red-100 text-red-700" />
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Body */}
+                          <div className="space-y-2.5">
+                            <p className="text-sm leading-6 text-slate-700">
+                              <span className="font-medium">Asset:</span> {item.assetName}
+                            </p>
+                            <div>
+                              <p className="text-sm font-medium text-slate-700 mb-1">
+                                Tindakan disarankan Tim IT
+                              </p>
+                              <p className="text-base font-semibold text-slate-900">
+                                {item.findingAction ? ACTION_LABELS[item.findingAction] : "-"}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-sm font-medium text-slate-700 mb-1">Catatan Tim IT</p>
+                              <p className="text-sm leading-6 text-slate-700 bg-white border border-slate-200 rounded-xl px-3 py-2.5">
+                                {item.findingNote || item.technicianNote || "-"}
+                              </p>
+                            </div>
+                            {item.qhseDecisionLabel && (
+                              <div>
+                                <p className="text-sm font-medium text-slate-700 mb-1">Keputusan QHSE</p>
+                                <div className="bg-white border border-slate-200 rounded-xl px-3 py-2.5 space-y-1">
+                                  <p className="text-sm font-semibold text-slate-900">
+                                    {item.qhseDecisionLabel}
+                                  </p>
+                                  {item.qhseDecisionNote && (
+                                    <p className="text-sm leading-6 text-slate-600">
+                                      {item.qhseDecisionNote}
+                                    </p>
+                                  )}
+                                  {item.qhseDecisionByName && (
+                                    <p className="text-xs text-slate-400">
+                                      oleh {item.qhseDecisionByName}
+                                      {item.qhseDecisionAt
+                                        ? ` · ${formatDateTimeSeconds(item.qhseDecisionAt)}`
+                                        : ""}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Footer */}
+                          <div className="flex flex-wrap gap-2 pt-1">
+                            {item.followUpStatus === "waiting_qhse_decision" || !item.followUpStatus ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => handleQhseMarkNoted(item)}
+                                  disabled={saving}
+                                  className="min-h-9 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 cursor-pointer hover:bg-slate-50 disabled:opacity-60"
+                                >
+                                  Cukup Dicatat
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setQhseDecisionItem(item);
+                                    setQhseDecisionKind("request_recheck");
+                                    setQhseDecisionNote("");
+                                    setQhseDecisionError("");
+                                  }}
+                                  disabled={saving}
+                                  className="min-h-9 rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2 text-sm font-medium text-blue-700 cursor-pointer hover:bg-blue-100 disabled:opacity-60"
+                                >
+                                  Minta Cek Ulang
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setQhseDecisionItem(item);
+                                    setQhseDecisionKind(null);
+                                    setQhseDecisionNote("");
+                                    setQhseDecisionError("");
+                                  }}
+                                  disabled={saving}
+                                  className="min-h-9 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2 text-sm font-medium text-red-700 cursor-pointer hover:bg-red-100 disabled:opacity-60"
+                                >
+                                  Tindak Lanjuti
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setQhseDecisionItem(item);
+                                    setQhseDecisionKind("request_recheck");
+                                    setQhseDecisionNote("");
+                                    setQhseDecisionError("");
+                                  }}
+                                  disabled={saving}
+                                  className="min-h-9 rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2 text-sm font-medium text-blue-700 cursor-pointer hover:bg-blue-100 disabled:opacity-60"
+                                >
+                                  Minta Cek Ulang
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setQhseDecisionItem(item);
+                                    setQhseDecisionKind(null);
+                                    setQhseDecisionNote("");
+                                    setQhseDecisionError("");
+                                  }}
+                                  disabled={saving}
+                                  className="min-h-9 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 cursor-pointer hover:bg-slate-50 disabled:opacity-60"
+                                >
+                                  Ubah Keputusan
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {expandedItemId === item.id && canWorkItems && (() => {
+                        const isCheckLocked = !canEditMaintenanceCheck(item, currentAssetUser);
+                        return (
                         <div className="px-3 pb-3 pt-1 space-y-3 border-t border-slate-100">
+                          {isFindingLocked(item) && (
+                            <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700">
+                              Temuan sudah dikirim ke QHSE dan sedang menunggu keputusan. Form
+                              dikunci sementara.
+                            </div>
+                          )}
+                          {isFindingFinal(item) && (
+                            <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600">
+                              QHSE sudah mengambil keputusan atas temuan ini (
+                              {getFindingStatusLabel(item, existingTicketsById) || "-"}). Form
+                              dikunci — kalau perlu direvisi, minta QHSE pilih &quot;Minta Cek
+                              Ulang&quot;.
+                            </div>
+                          )}
+                          {item.followUpStatus === "recheck_requested" && (
+                            <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">
+                              <p className="font-medium">QHSE meminta cek ulang</p>
+                              {item.qhseDecisionNote && (
+                                <p className="mt-1">Catatan QHSE: {item.qhseDecisionNote}</p>
+                              )}
+                            </div>
+                          )}
                           <div className="grid grid-cols-2 gap-3">
                             <div>
                               <label className="block text-xs font-medium text-slate-500 mb-1.5">
@@ -1585,7 +3048,8 @@ export default function WorkOrderDetailModal({
                               <select
                                 value={conditionBefore}
                                 onChange={(e) => setConditionBefore(e.target.value as MaintenanceConditionLabel)}
-                                className="input text-sm cursor-pointer"
+                                disabled={isCheckLocked}
+                                className="input text-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                               >
                                 {CONDITION_OPTIONS.map((c) => (
                                   <option key={c} value={c}>
@@ -1601,7 +3065,8 @@ export default function WorkOrderDetailModal({
                               <select
                                 value={conditionAfter}
                                 onChange={(e) => setConditionAfter(e.target.value as MaintenanceConditionLabel)}
-                                className="input text-sm cursor-pointer"
+                                disabled={isCheckLocked}
+                                className="input text-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                               >
                                 {CONDITION_OPTIONS.map((c) => (
                                   <option key={c} value={c}>
@@ -1613,9 +3078,45 @@ export default function WorkOrderDetailModal({
                           </div>
 
                           <div>
-                            <label className="block text-xs font-medium text-slate-500 mb-1.5">
-                              Checklist
-                            </label>
+                            <div className="flex items-center justify-between mb-1.5">
+                              <label className="block text-xs font-medium text-slate-500">
+                                Checklist
+                              </label>
+                              <div className="flex flex-wrap gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setChecklist(ALL_CHECKED_CHECKLIST);
+                                    setItemFormError("");
+                                  }}
+                                  disabled={isCheckLocked}
+                                  className="rounded-full bg-slate-100 text-slate-600 px-2.5 py-1 text-xs font-medium cursor-pointer hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  Centang Semua
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setChecklist(DEFAULT_CHECKLIST)}
+                                  disabled={isCheckLocked}
+                                  className="rounded-full bg-slate-100 text-slate-600 px-2.5 py-1 text-xs font-medium cursor-pointer hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  Kosongkan
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setChecklist(ALL_CHECKED_CHECKLIST);
+                                    setActionTaken("no_action");
+                                    setTechnicianNote(GOOD_CONDITION_NOTE);
+                                    setItemFormError("");
+                                  }}
+                                  disabled={isCheckLocked}
+                                  className="rounded-full bg-emerald-50 text-emerald-700 px-2.5 py-1 text-xs font-medium cursor-pointer hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  Kondisi Baik
+                                </button>
+                              </div>
+                            </div>
                             <div className="grid sm:grid-cols-2 gap-1.5">
                               {CHECKLIST_LABELS.map(({ key, label }) => (
                                 <label
@@ -1628,7 +3129,8 @@ export default function WorkOrderDetailModal({
                                     onChange={(e) =>
                                       setChecklist((prev) => ({ ...prev, [key]: e.target.checked }))
                                     }
-                                    className="cursor-pointer"
+                                    disabled={isCheckLocked}
+                                    className="cursor-pointer disabled:cursor-not-allowed"
                                   />
                                   {label}
                                 </label>
@@ -1638,29 +3140,33 @@ export default function WorkOrderDetailModal({
 
                           <div>
                             <label className="block text-xs font-medium text-slate-500 mb-1.5">
-                              Temuan
-                            </label>
-                            <textarea
-                              value={findings}
-                              onChange={(e) => setFindings(e.target.value)}
-                              rows={2}
-                              className="input text-sm"
-                            />
-                          </div>
-
-                          <div>
-                            <label className="block text-xs font-medium text-slate-500 mb-1.5">
                               Tindakan
                             </label>
                             <select
                               value={actionTaken}
-                              onChange={(e) => setActionTaken(e.target.value as MaintenanceActionTaken)}
-                              className="input text-sm cursor-pointer"
+                              onChange={(e) => {
+                                const nextAction = e.target.value as MaintenanceActionTaken | "";
+                                setActionTaken(nextAction);
+                                // Kalau tindakan diganti dari "Kondisi Baik" ke tindakan lain,
+                                // catatan "Tidak ada temuan..." jadi tidak relevan lagi —
+                                // kosongkan supaya teknisi mengisi catatan sesuai tindakan
+                                // barunya (placeholder textarea otomatis menyesuaikan).
+                                if (
+                                  nextAction &&
+                                  nextAction !== "no_action" &&
+                                  technicianNote.trim() === GOOD_CONDITION_NOTE
+                                ) {
+                                  setTechnicianNote("");
+                                }
+                                setItemFormError("");
+                              }}
+                              disabled={isCheckLocked}
+                              className="input text-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                             >
                               <option value="">Pilih tindakan</option>
                               {ACTION_OPTIONS.map((a) => (
                                 <option key={a} value={a}>
-                                  {a}
+                                  {ACTION_LABELS[a]}
                                 </option>
                               ))}
                             </select>
@@ -1668,40 +3174,85 @@ export default function WorkOrderDetailModal({
 
                           <div>
                             <label className="block text-xs font-medium text-slate-500 mb-1.5">
-                              Catatan Teknisi
+                              Temuan / Catatan Teknisi
                             </label>
                             <textarea
                               value={technicianNote}
-                              onChange={(e) => setTechnicianNote(e.target.value)}
-                              rows={2}
-                              className="input text-sm"
+                              onChange={(e) => {
+                                setTechnicianNote(e.target.value);
+                                if (e.target.value.trim()) setItemFormError("");
+                              }}
+                              rows={3}
+                              placeholder={
+                                (actionTaken && ACTION_NOTE_PLACEHOLDER[actionTaken]) ||
+                                DEFAULT_NOTE_PLACEHOLDER
+                              }
+                              disabled={isCheckLocked}
+                              className="input text-sm disabled:cursor-not-allowed disabled:opacity-60"
                             />
-                          </div>
-
-                          <div className="flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              onClick={() => handleSaveItem(item)}
-                              disabled={saving}
-                              className="rounded-xl bg-emerald-600 text-white px-4 py-2 text-sm font-medium cursor-pointer hover:bg-emerald-700 disabled:opacity-60"
-                            >
-                              Simpan Hasil Cek
-                            </button>
-                            {actionTaken && NEEDS_FOLLOW_UP_ACTIONS.includes(actionTaken) && (
-                              <button
-                                type="button"
-                                onClick={() => handleCreateFollowUpTicket(item)}
-                                disabled={saving || !!item.followUpTicketNumber}
-                                className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-2 text-sm font-medium cursor-pointer hover:bg-red-100 disabled:opacity-60"
-                              >
-                                {item.followUpTicketNumber
-                                  ? `Ticket ${item.followUpTicketNumber} dibuat`
-                                  : "Buat Ticket Kendala dari Temuan Ini?"}
-                              </button>
+                            {itemFormError && (
+                              <p className="text-xs text-red-600 mt-1">{itemFormError}</p>
                             )}
                           </div>
+
+                          {isFindingLocked(item) ? null : item.followUpStatus === "recheck_requested" ? (
+                            // QHSE minta cek ulang — Tim IT MELAKUKAN cek ulang lalu
+                            // mengirim hasilnya, bukan "minta" apa pun lagi. Tombol kedua
+                            // di sini TIDAK PERNAH menampilkan status ("Cek Ulang Diminta
+                            // QHSE" itu badge, bukan aksi) — selalu aksi kirim yang aktif.
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleSaveItem(item)}
+                                disabled={saving || isCheckLocked}
+                                className="rounded-xl bg-emerald-600 text-white px-4 py-2 text-sm font-medium cursor-pointer hover:bg-emerald-700 disabled:opacity-60"
+                              >
+                                Simpan Hasil Cek Ulang
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSubmitRecheckResult(item)}
+                                disabled={saving || isCheckLocked}
+                                className="rounded-xl border border-blue-200 bg-blue-50 text-blue-700 px-4 py-2 text-sm font-medium cursor-pointer hover:bg-blue-100 disabled:opacity-60"
+                              >
+                                Kirim Hasil Cek Ulang ke QHSE
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleSaveItem(item)}
+                                disabled={saving || isCheckLocked}
+                                className="rounded-xl bg-emerald-600 text-white px-4 py-2 text-sm font-medium cursor-pointer hover:bg-emerald-700 disabled:opacity-60"
+                              >
+                                Simpan Hasil Cek
+                              </button>
+                              {(() => {
+                                const isFindingWorthy =
+                                  !!actionTaken &&
+                                  (NEEDS_FOLLOW_UP_ACTIONS.includes(actionTaken) ||
+                                    (actionTaken === "minor_repair" && !!technicianNote.trim()));
+                                if (!isFindingWorthy) return null;
+
+                                const alreadyReported = !!item.needsQhseReview || !!item.followUpStatus;
+
+                                return (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleReportFindingToQhse(item)}
+                                    disabled={saving || alreadyReported || isCheckLocked}
+                                    className="rounded-xl border border-amber-200 bg-amber-50 text-amber-700 px-4 py-2 text-sm font-medium cursor-pointer hover:bg-amber-100 disabled:opacity-60"
+                                  >
+                                    Laporkan Temuan ke QHSE
+                                  </button>
+                                );
+                              })()}
+                            </div>
+                          )}
                         </div>
-                      )}
+                        );
+                      })()}
                     </div>
                   ))}
                 </div>
@@ -1746,8 +3297,19 @@ export default function WorkOrderDetailModal({
                   {canSubmitReport && (
                     <button
                       type="button"
-                      onClick={handleSubmitReport}
-                      disabled={saving}
+                      onClick={() => {
+                        setReportConclusion("");
+                        setReportRecommendation("");
+                        setReportConfirmChecked(false);
+                        setReportModalError("");
+                        setSubmitReportModalOpen(true);
+                      }}
+                      disabled={saving || !progressComplete}
+                      title={
+                        progressComplete
+                          ? undefined
+                          : "Selesaikan pengecekan semua asset dulu (progress harus 100%)."
+                      }
                       className="rounded-xl bg-emerald-600 text-white px-4 py-2 text-sm font-medium cursor-pointer hover:bg-emerald-700 disabled:opacity-60"
                     >
                       Kirim Laporan
@@ -2083,6 +3645,200 @@ export default function WorkOrderDetailModal({
         </div>
       )}
 
+      {submitReportModalOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => !saving && setSubmitReportModalOpen(false)}
+          />
+          <div className="relative bg-white rounded-2xl shadow-lg border border-slate-200 w-full max-w-[1200px] sm:w-[92vw] max-h-[88vh] flex flex-col overflow-hidden">
+            <div className="shrink-0 px-6 sm:px-7 pt-6 sm:pt-7 pb-4 border-b border-slate-100">
+              <h3 className="text-xl font-semibold text-slate-900 mb-1">
+                Kirim Laporan Maintenance ke QHSE
+              </h3>
+              <p className="text-sm text-slate-500">
+                Rekap ini dibuat otomatis dari hasil pengecekan tiap asset — periksa dulu sebelum
+                dikirim ke QHSE.
+              </p>
+            </div>
+
+            {(() => {
+              const reportPreview = buildMaintenanceReportSummary(items);
+              return (
+                <>
+                  <div className="flex-1 overflow-y-auto px-6 sm:px-7 py-6 space-y-7">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-700 mb-3">
+                        1. Ringkasan Pengecekan
+                      </p>
+                      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
+                        <MiniStat label="Total Asset Dicek" value={String(reportPreview.totalAssets)} />
+                        <MiniStat label="Kondisi Baik" value={String(reportPreview.goodCount)} />
+                        <MiniStat label="Ada Temuan" value={String(reportPreview.findingCount)} />
+                        <MiniStat
+                          label="Butuh Keputusan QHSE"
+                          value={String(reportPreview.waitingQhseDecisionCount)}
+                        />
+                        <MiniStat label="Progress" value={`${progressPercent}%`} />
+                      </div>
+                    </div>
+
+                    <div>
+                      <p className="text-sm font-semibold text-slate-700 mb-3">2. Rekap Per Asset</p>
+                      <div className="overflow-x-auto rounded-xl border border-slate-200">
+                        <table className="w-full min-w-[1100px] text-sm">
+                          <thead>
+                            <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
+                              <th className="px-4 py-3 font-semibold min-w-[180px]">Asset</th>
+                              <th className="px-4 py-3 font-semibold min-w-[120px]">Kode</th>
+                              <th className="px-4 py-3 font-semibold min-w-[110px]">Kondisi Sebelum</th>
+                              <th className="px-4 py-3 font-semibold min-w-[110px]">Kondisi Setelah</th>
+                              <th className="px-4 py-3 font-semibold min-w-[160px]">Tindakan</th>
+                              <th className="px-4 py-3 font-semibold min-w-[170px]">Checklist</th>
+                              <th className="px-4 py-3 font-semibold min-w-[220px]">Temuan / Catatan</th>
+                              <th className="px-4 py-3 font-semibold min-w-[140px]">Status Temuan</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {reportPreview.itemSummaries.map((i) => {
+                              const rawItem = items.find((it) => it.assetId === i.assetId);
+                              const checkedCount = rawItem?.checklist
+                                ? CHECKLIST_LABELS.filter(({ key }) => rawItem.checklist![key]).length
+                                : 0;
+                              return (
+                                <tr key={i.assetId} className="border-b border-slate-100 last:border-0 align-top">
+                                  <td className="px-4 py-3 font-medium text-slate-800 min-w-[180px]">
+                                    {i.assetName}
+                                  </td>
+                                  <td className="px-4 py-3 text-slate-500 min-w-[120px]">{i.assetCode}</td>
+                                  <td className="px-4 py-3 text-slate-600 min-w-[110px]">{i.conditionBefore}</td>
+                                  <td className="px-4 py-3 text-slate-600 min-w-[110px]">{i.conditionAfter}</td>
+                                  <td className="px-4 py-3 text-slate-600 min-w-[160px]">{i.actionTaken}</td>
+                                  <td className="px-4 py-3 min-w-[170px]">
+                                    <Badge
+                                      label={`${checkedCount}/${CHECKLIST_LABELS.length} checklist terpenuhi`}
+                                      colorClass={
+                                        checkedCount === CHECKLIST_LABELS.length
+                                          ? "bg-emerald-100 text-emerald-700"
+                                          : "bg-amber-100 text-amber-700"
+                                      }
+                                    />
+                                  </td>
+                                  <td className="px-4 py-3 text-slate-600 min-w-[220px] whitespace-pre-wrap break-words leading-normal">
+                                    {i.technicianNote}
+                                  </td>
+                                  <td className="px-4 py-3 text-slate-600 min-w-[140px]">
+                                    {i.needsQhseReview
+                                      ? getFindingStatusLabel(rawItem!, existingTicketsById) || "-"
+                                      : "-"}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">
+                        3. Kesimpulan Umum Hasil Maintenance <span className="text-red-500">*</span>
+                      </label>
+                      <textarea
+                        value={reportConclusion}
+                        onChange={(e) => {
+                          setReportConclusion(e.target.value);
+                          if (e.target.value.trim()) setReportModalError("");
+                        }}
+                        className="input text-sm min-h-[110px]"
+                        placeholder="Contoh: Seluruh asset telah dicek. 2 asset dalam kondisi baik, 1 asset membutuhkan keputusan QHSE karena tidak layak pakai sementara."
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">
+                        4. Rekomendasi Tindak Lanjut (opsional)
+                      </label>
+                      <textarea
+                        value={reportRecommendation}
+                        onChange={(e) => setReportRecommendation(e.target.value)}
+                        className="input text-sm min-h-[100px]"
+                        placeholder="Contoh: Disarankan mengganti adaptor dan menonaktifkan asset sementara sampai komponen tersedia."
+                      />
+                    </div>
+
+                    <label className="flex items-start gap-2 text-sm text-slate-600 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={reportConfirmChecked}
+                        onChange={(e) => setReportConfirmChecked(e.target.checked)}
+                        className="mt-0.5 cursor-pointer"
+                      />
+                      Saya menyatakan seluruh hasil pengecekan sudah sesuai dan siap dikirim ke QHSE.
+                    </label>
+
+                    {reportModalError && <p className="text-sm text-red-600">{reportModalError}</p>}
+                  </div>
+
+                  <div className="shrink-0 flex items-center justify-between gap-3 px-6 sm:px-7 py-4 border-t border-slate-200 bg-white">
+                    <button
+                      type="button"
+                      onClick={() => setSubmitReportModalOpen(false)}
+                      disabled={saving}
+                      className="min-h-[44px] rounded-xl border border-slate-300 bg-white px-5 text-sm font-medium cursor-pointer hover:bg-slate-50 disabled:opacity-60"
+                    >
+                      Batal
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        // Validasi (section D) — dicek lagi di sini, bukan cuma
+                        // mengandalkan tombol "Kirim Laporan" yang sudah disable.
+                        const allChecked =
+                          items.length > 0 && items.every((i) => i.status !== "pending" && i.status !== "in_progress");
+                        if (!allChecked) {
+                          setReportModalError("Masih ada asset yang belum selesai dicek.");
+                          return;
+                        }
+                        const missingNote = items.some(
+                          (i) => !!i.actionTaken && i.actionTaken !== "no_action" && !i.technicianNote?.trim()
+                        );
+                        if (missingNote) {
+                          setReportModalError(
+                            'Ada asset dengan tindakan selain "Tidak ada tindakan" tapi belum diisi catatan.'
+                          );
+                          return;
+                        }
+                        if (!reportConclusion.trim()) {
+                          setReportModalError("Kesimpulan umum hasil maintenance wajib diisi.");
+                          return;
+                        }
+                        if (!reportConfirmChecked) {
+                          setReportModalError("Konfirmasi kesiapan laporan wajib dicentang.");
+                          return;
+                        }
+                        setReportModalError("");
+                        try {
+                          await handleSubmitReport(reportConclusion.trim(), reportRecommendation.trim());
+                          setSubmitReportModalOpen(false);
+                        } catch (err) {
+                          console.error("[Work Order] gagal mengirim laporan maintenance", err);
+                          setReportModalError("Gagal mengirim laporan. Coba lagi.");
+                        }
+                      }}
+                      disabled={saving}
+                      className="min-h-[44px] rounded-xl bg-emerald-600 text-white px-6 text-sm font-medium cursor-pointer hover:bg-emerald-700 disabled:opacity-60"
+                    >
+                      {saving ? "Mengirim..." : "Kirim Laporan ke QHSE"}
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
       {pendingTestingOption && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
           <div
@@ -2158,6 +3914,17 @@ export default function WorkOrderDetailModal({
                 />
               </div>
             )}
+            {pendingHelpAction.key === "reset_checklist_in_progress" && (
+              <label className="mb-3 flex items-center gap-2 text-sm text-slate-600 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={resetChecklistClearTickets}
+                  onChange={(e) => setResetChecklistClearTickets(e.target.checked)}
+                  className="cursor-pointer"
+                />
+                Hapus relasi ticket lanjutan dari item ini
+              </label>
+            )}
             {helpError && <p className="text-sm text-red-600 mb-3">{helpError}</p>}
             <div className="flex gap-2">
               <button
@@ -2181,6 +3948,277 @@ export default function WorkOrderDetailModal({
                 {saving ? "Menyimpan..." : "Konfirmasi"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {pendingTicketResetItem && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => !ticketResetSaving && setPendingTicketResetItem(null)}
+          />
+          <div className="relative bg-white rounded-2xl shadow-lg border border-slate-200 w-full max-w-md p-5">
+            <h3 className="text-base font-semibold text-slate-900 mb-1">Reset Ticket Lanjutan</h3>
+            <p className="text-sm text-slate-500 mb-3">
+              Relasi ticket lanjutan untuk {pendingTicketResetItem.assetName} akan dibersihkan dari
+              item ini. Tindakan ini dicatat di timeline work order.
+            </p>
+            <div className="mb-3">
+              <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                Alasan <span className="text-red-500">*</span>
+              </label>
+              <textarea
+                value={ticketResetReason}
+                onChange={(e) => setTicketResetReason(e.target.value)}
+                rows={3}
+                className="input text-sm"
+                placeholder="Jelaskan alasan reset ticket lanjutan ini..."
+                autoFocus
+              />
+            </div>
+            {ticketResetError && <p className="text-sm text-red-600 mb-3">{ticketResetError}</p>}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingTicketResetItem(null)}
+                disabled={ticketResetSaving}
+                className="flex-1 rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium cursor-pointer hover:bg-slate-50 disabled:opacity-60"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!ticketResetReason.trim()) {
+                    setTicketResetError("Alasan wajib diisi.");
+                    return;
+                  }
+                  setTicketResetSaving(true);
+                  setTicketResetError("");
+                  try {
+                    await handleResetFollowUpTicket(pendingTicketResetItem, ticketResetReason.trim());
+                    setPendingTicketResetItem(null);
+                    setTicketResetReason("");
+                  } catch (err) {
+                    console.error("[Work Order] gagal reset ticket lanjutan", err);
+                    setTicketResetError("Gagal reset ticket lanjutan. Coba lagi.");
+                  } finally {
+                    setTicketResetSaving(false);
+                  }
+                }}
+                disabled={ticketResetSaving}
+                className="flex-1 rounded-xl bg-red-600 px-4 py-2 text-sm font-medium text-white cursor-pointer hover:bg-red-700 disabled:opacity-60"
+              >
+                {ticketResetSaving ? "Menyimpan..." : "Konfirmasi"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {qhseDecisionItem && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => !qhseDecisionSaving && closeQhseDecisionModal()}
+          />
+          <div className="relative bg-white rounded-2xl shadow-lg border border-slate-200 w-full max-w-md p-5 max-h-[90vh] overflow-y-auto">
+            {qhseDecisionKind === null ? (
+              <>
+                <h3 className="text-base font-semibold text-slate-900 mb-1">Tindak Lanjuti Temuan</h3>
+                <p className="text-sm text-slate-500 mb-3">
+                  Pilih tindak lanjut untuk temuan pada {qhseDecisionItem.assetName}.
+                </p>
+                <div className="space-y-2">
+                  {(
+                    [
+                      "create_corrective_task",
+                      "need_purchase",
+                      "need_vendor",
+                      "mark_temporarily_unusable",
+                    ] as QhseFollowUpDecisionKind[]
+                  ).map((kind) => (
+                    <button
+                      key={kind}
+                      type="button"
+                      onClick={() => setQhseDecisionKind(kind)}
+                      className="w-full text-left rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-medium text-slate-700 cursor-pointer hover:bg-slate-50"
+                    >
+                      {QHSE_FOLLOW_UP_DECISION_LABELS[kind]}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex gap-2 mt-4">
+                  <button
+                    type="button"
+                    onClick={closeQhseDecisionModal}
+                    className="flex-1 rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium cursor-pointer hover:bg-slate-50"
+                  >
+                    Batal
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <h3 className="text-base font-semibold text-slate-900 mb-1">
+                  {qhseDecisionKind === "request_recheck"
+                    ? "Minta Tim IT Cek Ulang"
+                    : QHSE_FOLLOW_UP_DECISION_LABELS[qhseDecisionKind]}
+                </h3>
+                <p className="text-sm text-slate-500 mb-3">
+                  Keputusan untuk temuan pada {qhseDecisionItem.assetName}. Tindakan ini dicatat di
+                  timeline work order.
+                </p>
+
+                {qhseDecisionKind === "create_corrective_task" && (
+                  <div className="mb-3">
+                    <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                      Pilih Tim IT (opsional)
+                    </label>
+                    <select
+                      value={qhseSelectedItUid}
+                      onChange={(e) => setQhseSelectedItUid(e.target.value)}
+                      className="input text-sm cursor-pointer"
+                    >
+                      <option value="">Belum ditentukan</option>
+                      {itTeamOptions.map((u) => (
+                        <option key={u.uid} value={u.uid}>
+                          {u.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {qhseDecisionKind === "need_purchase" && (
+                  <div className="mb-3">
+                    <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                      Detail Komponen yang Dibutuhkan
+                    </label>
+                    <textarea
+                      value={qhsePurchaseDetail}
+                      onChange={(e) => setQhsePurchaseDetail(e.target.value)}
+                      rows={2}
+                      className="input text-sm"
+                      placeholder="Sebutkan komponen yang perlu dibeli..."
+                    />
+                  </div>
+                )}
+
+                {qhseDecisionKind === "need_vendor" && (
+                  <div className="mb-3">
+                    <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                      Nama Vendor / Catatan
+                    </label>
+                    <textarea
+                      value={qhseVendorNote}
+                      onChange={(e) => setQhseVendorNote(e.target.value)}
+                      rows={2}
+                      className="input text-sm"
+                      placeholder="Sebutkan vendor yang disarankan / alasannya..."
+                    />
+                  </div>
+                )}
+
+                {qhseDecisionKind === "mark_temporarily_unusable" && (
+                  <label className="mb-3 flex items-start gap-2 text-sm text-slate-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={qhseConfirmUnusable}
+                      onChange={(e) => setQhseConfirmUnusable(e.target.checked)}
+                      className="mt-0.5 cursor-pointer"
+                    />
+                    Saya konfirmasi asset ini dinonaktifkan sementara dari peminjaman sampai
+                    ditindaklanjuti.
+                  </label>
+                )}
+
+                <div className="mb-3">
+                  <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                    Catatan Keputusan <span className="text-red-500">*</span>
+                  </label>
+                  <textarea
+                    value={qhseDecisionNote}
+                    onChange={(e) => setQhseDecisionNote(e.target.value)}
+                    rows={3}
+                    className="input text-sm"
+                    placeholder="Jelaskan alasan keputusan ini..."
+                    autoFocus
+                  />
+                </div>
+                {qhseDecisionError && (
+                  <p className="text-sm text-red-600 mb-3">{qhseDecisionError}</p>
+                )}
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      qhseDecisionKind === "request_recheck"
+                        ? closeQhseDecisionModal()
+                        : setQhseDecisionKind(null)
+                    }
+                    disabled={qhseDecisionSaving}
+                    className="flex-1 rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium cursor-pointer hover:bg-slate-50 disabled:opacity-60"
+                  >
+                    {qhseDecisionKind === "request_recheck" ? "Batal" : "Kembali"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (!qhseDecisionNote.trim()) {
+                        setQhseDecisionError("Catatan keputusan wajib diisi.");
+                        return;
+                      }
+                      if (qhseDecisionKind === "mark_temporarily_unusable" && !qhseConfirmUnusable) {
+                        setQhseDecisionError("Konfirmasi nonaktifkan peminjaman asset wajib dicentang.");
+                        return;
+                      }
+                      setQhseDecisionSaving(true);
+                      setQhseDecisionError("");
+                      try {
+                        const note = qhseDecisionNote.trim();
+                        switch (qhseDecisionKind) {
+                          case "request_recheck":
+                            await handleQhseRequestRecheck(qhseDecisionItem, note);
+                            break;
+                          case "create_corrective_task":
+                            await handleQhseCreateCorrectiveTask(qhseDecisionItem, note, qhseSelectedItUid);
+                            break;
+                          case "need_purchase":
+                            await handleQhseRequestPurchaseOrVendor(
+                              qhseDecisionItem,
+                              "need_purchase",
+                              qhsePurchaseDetail.trim() || note
+                            );
+                            break;
+                          case "need_vendor":
+                            await handleQhseRequestPurchaseOrVendor(
+                              qhseDecisionItem,
+                              "need_vendor",
+                              qhseVendorNote.trim() || note
+                            );
+                            break;
+                          case "mark_temporarily_unusable":
+                            await handleQhseMarkAssetUnusable(qhseDecisionItem, note);
+                            break;
+                        }
+                        closeQhseDecisionModal();
+                      } catch (err) {
+                        console.error("[Work Order] gagal menyimpan keputusan QHSE", err);
+                        setQhseDecisionError("Gagal menyimpan keputusan. Coba lagi.");
+                      } finally {
+                        setQhseDecisionSaving(false);
+                      }
+                    }}
+                    disabled={qhseDecisionSaving}
+                    className="flex-1 rounded-xl bg-gradient-to-r from-blue-600 to-teal-500 px-4 py-2 text-sm font-medium text-white cursor-pointer hover:brightness-105 disabled:opacity-60"
+                  >
+                    {qhseDecisionSaving ? "Menyimpan..." : "Konfirmasi"}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

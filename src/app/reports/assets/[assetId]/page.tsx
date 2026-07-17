@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { collection, doc, onSnapshot, query, where } from "firebase/firestore";
 import { ArrowLeft, FileDown } from "lucide-react";
 import { db } from "@/lib/firebase";
+import { useAuth } from "@/lib/auth-context";
 import {
   Asset,
   AssetBorrowing,
@@ -35,6 +36,8 @@ import EmptyState from "@/components/EmptyState";
 
 export default function AssetFullReportPage() {
   const { assetId } = useParams<{ assetId: string }>();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const router = useRouter();
   const [asset, setAsset] = useState<Asset | null>(null);
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
@@ -42,35 +45,79 @@ export default function AssetFullReportPage() {
   const [borrowings, setBorrowings] = useState<AssetBorrowing[]>([]);
 
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, "assets", assetId), (snap) => {
-      setAsset(snap.exists() ? ({ id: snap.id, ...snap.data() } as Asset) : null);
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      doc(db, "assets", assetId),
+      (snap) => {
+        console.log("[AssetReportDetailPage Listener] assets doc success:", {
+          id: assetId,
+          exists: snap.exists(),
+        });
+        setAsset(snap.exists() ? ({ id: snap.id, ...snap.data() } as Asset) : null);
+      },
+      (error) => {
+        console.error("[AssetReportDetailPage Listener] assets doc error:", {
+          id: assetId,
+          error,
+        });
+      }
+    );
     return () => unsub();
-  }, [assetId]);
+  }, [assetId, authReady]);
 
   useEffect(() => {
+    if (!authReady) return;
     const q = query(collection(db, "asset_issue_tickets"), where("assetId", "==", assetId));
-    const unsub = onSnapshot(q, (snap) => {
-      setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[AssetReportDetailPage Listener] asset_issue_tickets success:", snap.size);
+        setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
+      },
+      (error) => {
+        console.error("[AssetReportDetailPage Listener] asset_issue_tickets error:", error);
+      }
+    );
     return () => unsub();
-  }, [assetId]);
+  }, [assetId, authReady]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_maintenance_work_orders"), (snap) => {
-      const all = snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder));
-      setWorkOrders(all.filter((w) => w.assetIds?.includes(assetId)));
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_maintenance_work_orders"),
+      (snap) => {
+        console.log(
+          "[AssetReportDetailPage Listener] asset_maintenance_work_orders success:",
+          snap.size
+        );
+        const all = snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder));
+        setWorkOrders(all.filter((w) => w.assetIds?.includes(assetId)));
+      },
+      (error) => {
+        console.error(
+          "[AssetReportDetailPage Listener] asset_maintenance_work_orders error:",
+          error
+        );
+      }
+    );
     return () => unsub();
-  }, [assetId]);
+  }, [assetId, authReady]);
 
   useEffect(() => {
+    if (!authReady) return;
     const q = query(collection(db, "asset_borrowings"), where("assetId", "==", assetId));
-    const unsub = onSnapshot(q, (snap) => {
-      setBorrowings(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing)));
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[AssetReportDetailPage Listener] asset_borrowings success:", snap.size);
+        setBorrowings(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing)));
+      },
+      (error) => {
+        console.error("[AssetReportDetailPage Listener] asset_borrowings error:", error);
+      }
+    );
     return () => unsub();
-  }, [assetId]);
+  }, [assetId, authReady]);
 
   if (!asset) {
     return (

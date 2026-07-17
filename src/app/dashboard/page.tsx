@@ -31,7 +31,8 @@ import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 
 export default function DashboardPage() {
-  const { role, assetUser } = useAuth();
+  const { firebaseUser, role, assetUser, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [assets, setAssets] = useState<Asset[]>([]);
   const [activeBorrowings, setActiveBorrowings] = useState<AssetBorrowing[]>(
     []
@@ -40,42 +41,74 @@ export default function DashboardPage() {
   const [workOrders, setWorkOrders] = useState<MaintenanceWorkOrder[]>([]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "assets"), (snap) => {
-      setAssets(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset))
-      );
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "assets"),
+      (snap) => {
+        console.log("[DashboardPage Listener] assets success:", snap.size);
+        setAssets(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset))
+        );
+      },
+      (error) => {
+        console.error("[DashboardPage Listener] assets error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
+    if (!authReady) return;
     const q = query(
       collection(db, "asset_borrowings"),
       where("status", "==", "borrowed")
     );
-    const unsub = onSnapshot(q, (snap) => {
-      setActiveBorrowings(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))
-      );
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[DashboardPage Listener] asset_borrowings success:", snap.size);
+        setActiveBorrowings(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))
+        );
+      },
+      (error) => {
+        console.error("[DashboardPage Listener] asset_borrowings error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_issue_tickets"), (snap) => {
-      setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_issue_tickets"),
+      (snap) => {
+        console.log("[DashboardPage Listener] asset_issue_tickets success:", snap.size);
+        setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
+      },
+      (error) => {
+        console.error("[DashboardPage Listener] asset_issue_tickets error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_maintenance_work_orders"), (snap) => {
-      setWorkOrders(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder))
-      );
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_maintenance_work_orders"),
+      (snap) => {
+        console.log("[DashboardPage Listener] asset_maintenance_work_orders success:", snap.size);
+        setWorkOrders(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder))
+        );
+      },
+      (error) => {
+        console.error("[DashboardPage Listener] asset_maintenance_work_orders error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   const total = assets.length;
   const available = assets.filter((a) => a.assetStatus === "available").length;

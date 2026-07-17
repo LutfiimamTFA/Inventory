@@ -18,23 +18,31 @@ import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 
 export default function MyBorrowingsPage() {
-  const { assetUser } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [borrowings, setBorrowings] = useState<AssetBorrowing[]>([]);
 
   useEffect(() => {
-    if (!assetUser) return;
+    if (!authReady || !assetUser?.uid) return;
     const q = query(
       collection(db, "asset_borrowings"),
       where("borrowedByUid", "==", assetUser.uid),
       orderBy("borrowedAt", "desc")
     );
-    const unsub = onSnapshot(q, (snap) => {
-      setBorrowings(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))
-      );
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[MyBorrowingsPage Listener] asset_borrowings success:", snap.size);
+        setBorrowings(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))
+        );
+      },
+      (error) => {
+        console.error("[MyBorrowingsPage Listener] asset_borrowings error:", error);
+      }
+    );
     return () => unsub();
-  }, [assetUser]);
+  }, [authReady, assetUser?.uid]);
 
   const active = borrowings.filter((b) => b.status === "borrowed");
   const history = borrowings.filter((b) => b.status !== "borrowed");

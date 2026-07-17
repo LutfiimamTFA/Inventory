@@ -70,6 +70,44 @@ service cloud.firestore {
       return isSuperAdmin() || isAssetAdmin();
     }
 
+    // Section G — Asset Finance: role khusus data finance (harga, invoice,
+    // vendor, sumber dana, dll), TIDAK boleh sentuh lokasi/custodian/
+    // pemakaian/maintenance. Asset Admin/QHSE boleh lihat data finance
+    // read-only (canViewAssetFinance), tapi TIDAK boleh mengeditnya lewat
+    // rule ini (edit finance cuma lewat canEditAssetFinance).
+    function isAssetViewFinance() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/asset_users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/asset_users/$(request.auth.uid)).data.role == "asset_finance"
+        && get(/databases/$(database)/documents/asset_users/$(request.auth.uid)).data.status == "active";
+    }
+
+    function canViewAssetFinance() {
+      return isAssetViewSuperAdmin()
+        || isAssetViewFinance()
+        || isAssetQhseAdmin();
+    }
+
+    function canEditAssetFinance() {
+      return isAssetViewSuperAdmin()
+        || isAssetViewFinance();
+    }
+
+    // Field finance yang boleh diubah Asset Finance — TIDAK termasuk lokasi,
+    // custodian, currentHolder, status pemakaian, maintenance, kategori
+    // utama, nama/kode aset (lihat section G spec).
+    function isAssetFinanceUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return isAssetViewFinance() &&
+        changed.hasOnly([
+          "purchaseDate", "purchasePrice", "vendorName", "invoiceNumber",
+          "fundingSource", "purchaseMethod", "estimatedUsefulLife", "financeNotes",
+          "invoiceFileId", "invoiceDriveFileId", "invoiceFileUrl", "invoiceFileName",
+          "invoiceMimeType", "invoiceSize", "invoiceUploadedAt",
+          "updatedAt", "updatedByUid", "updatedByName"
+        ]);
+    }
+
     function canViewAssetMaintenance() {
       return isAssetViewSuperAdmin()
         || isAssetQhseAdmin()
@@ -119,6 +157,9 @@ service cloud.firestore {
           "report",
           "reportNote",
           "reportSummary",
+          "reportConclusion",
+          "reportRecommendation",
+          "reportData",
           "reportSubmittedAt",
           "reportSubmittedByUid",
           "reportSubmittedByName",
@@ -129,6 +170,22 @@ service cloud.firestore {
           "reopenedByName",
           "reopenReason",
           "retryCount",
+
+          "checklistResetAt",
+          "checklistResetByUid",
+          "checklistResetByName",
+          "checklistResetReason",
+
+          "hasFindings",
+          "needsQhseReview",
+          "followUpStatus",
+          "lastFindingAt",
+          "lastFindingByUid",
+          "lastFindingByName",
+          "lastActivityAt",
+          "lastActivityByUid",
+          "lastActivityByName",
+          "lastActivityMessage",
 
           "updatedAt",
           "updatedByUid",
@@ -183,9 +240,31 @@ service cloud.firestore {
       allow delete: if isSuperAdmin();
     }
 
+    // Custodian/currentHolder boleh menyerahkan-sementara & mengembalikan
+    // aset "assigned_daily" sendiri (handoverTemporary/returnToCustodian di
+    // lib/custodian-actions.ts) — TAPI TIDAK boleh mengubah custodianUid/
+    // usageType (itu hanya lewat isManager(), lihat assignCustodian).
+    function isCustodianOrHolderUsageUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      let isCustodian = resource.data.get("custodianUid", "") == request.auth.uid;
+      let isHolder = resource.data.get("currentHolderUid", "") == request.auth.uid;
+      return isActiveAssetUser() && (isCustodian || isHolder) &&
+        changed.hasOnly([
+          "currentUsageStatus", "currentUsageStatusLabel",
+          "currentHolderUid", "currentHolderName", "currentHolderEmail", "currentHolderDivision",
+          "temporaryUseStartedAt", "temporaryUseExpectedReturnAt", "temporaryUseEndedAt",
+          "temporaryUsePurpose", "temporaryUseNote", "currentUsageNote",
+          "handedOverByUid", "handedOverByName",
+          "returnedByUid", "returnedByName",
+          "updatedAt"
+        ]);
+    }
+
     match /assets/{assetId} {
       allow read: if isActiveAssetUser();
       allow create, update: if isManager() ||
+        isCustodianOrHolderUsageUpdate() ||
+        isAssetFinanceUpdate() ||
         (isActiveAssetUser() &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(["assetStatus", "condition", "currentBorrowingId",
@@ -215,8 +294,12 @@ service cloud.firestore {
     // untuk /my-reports); status/diagnosa hanya boleh diubah oleh manager.
     match /asset_issue_tickets/{ticketId} {
       allow read: if isActiveAssetUser();
+      // QHSE/Super Admin boleh membuat ticket "tugas lanjutan" dari temuan
+      // maintenance dengan reportedByUid = Tim IT yang menemukan (bukan
+      // dirinya sendiri) — dibedakan lewat source == "maintenance_finding".
       allow create: if isActiveAssetUser() &&
-        request.resource.data.reportedByUid == request.auth.uid;
+        (request.resource.data.reportedByUid == request.auth.uid ||
+          (isManager() && request.resource.data.source == "maintenance_finding"));
       allow update: if isManager() || isAssetViewItTeam();
       allow delete: if false;
     }

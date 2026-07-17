@@ -60,7 +60,7 @@ export default function SearchableSelect({
         onClick={() => setOpen((v) => !v)}
         className="input flex items-center justify-between text-left disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed"
       >
-        <span className={selected ? "text-slate-800" : "text-slate-400"}>
+        <span className={`truncate ${selected ? "text-slate-800" : "text-slate-400"}`}>
           {selected ? selected.label : disabled ? disabledHint || placeholder : placeholder}
         </span>
         <div className="flex items-center gap-1 shrink-0">
@@ -93,7 +93,7 @@ export default function SearchableSelect({
               className="w-full rounded-lg border border-slate-200 pl-8 pr-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20"
             />
           </div>
-          <div className="max-h-56 overflow-y-auto py-1">
+          <div className="max-h-[280px] overflow-y-auto py-1">
             {filtered.length === 0 ? (
               <p className="px-4 py-3 text-sm text-slate-400">{emptyText}</p>
             ) : (
@@ -110,9 +110,13 @@ export default function SearchableSelect({
                     item.id === value ? "bg-blue-50/60" : ""
                   }`}
                 >
-                  <p className="text-sm font-medium text-slate-800">{item.label}</p>
+                  <p className="text-sm font-medium text-slate-800 truncate" title={item.label}>
+                    {item.label}
+                  </p>
                   {item.sublabel && (
-                    <p className="text-xs text-slate-400">{item.sublabel}</p>
+                    <p className="text-xs text-slate-400 truncate" title={item.sublabel}>
+                      {item.sublabel}
+                    </p>
                   )}
                 </button>
               ))

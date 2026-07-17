@@ -36,29 +36,75 @@ function detectBrowser(userAgent: string) {
   return "Unknown";
 }
 
+// Registrasi service worker SAJA tidak cukup — kalau getToken()/subscribe()
+// dipanggil sebelum registration-nya benar-benar "active", PushManager
+// melempar "Failed to execute 'subscribe' on 'PushManager': Subscription
+// failed - no active Service Worker". Wajib tunggu navigator.serviceWorker
+// .ready dulu sebelum registration ini dipakai untuk getToken().
+async function getActiveFirebaseMessagingSW(): Promise<ServiceWorkerRegistration> {
+  if (typeof window === "undefined") {
+    throw new Error("Service worker hanya tersedia di browser.");
+  }
+  if (!("serviceWorker" in navigator)) {
+    throw new Error("Browser tidak mendukung Service Worker.");
+  }
+
+  const registration = await navigator.serviceWorker.register("/firebase-messaging-sw.js", {
+    scope: "/",
+  });
+  console.log("[Push Notifications] service worker registered:", registration.scope);
+
+  const readyRegistration = await navigator.serviceWorker.ready;
+
+  if (!readyRegistration.active) {
+    throw new Error("Service Worker belum aktif. Refresh halaman lalu coba lagi.");
+  }
+  console.log(
+    "[Push Notifications] service worker active:",
+    readyRegistration.active.scriptURL
+  );
+
+  return readyRegistration;
+}
+
 // Ambil FCM token dari browser TANPA meminta permission — caller wajib
 // memastikan Notification.permission sudah "granted" sebelum memanggil ini.
+// Semua kegagalan (termasuk AbortError dari PushManager.subscribe) ditangkap
+// di sini dan dikembalikan sebagai { error } — TIDAK PERNAH throw ke caller,
+// supaya tidak muncul sebagai overlay error Next.js.
 async function getMessagingToken(): Promise<{ token: string } | { error: string }> {
-  const supported = await isSupported().catch(() => false);
-  if (!supported || typeof window === "undefined" || !("serviceWorker" in navigator)) {
-    return { error: "unsupported" };
+  try {
+    const supported = await isSupported().catch(() => false);
+    if (!supported || typeof window === "undefined" || !("serviceWorker" in navigator)) {
+      return { error: "unsupported" };
+    }
+
+    const vapidKey = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY;
+    if (!vapidKey) {
+      console.warn("[Push Notifications] NEXT_PUBLIC_FIREBASE_VAPID_KEY belum diset");
+      return { error: "Konfigurasi push notification belum lengkap." };
+    }
+
+    const registration = await getActiveFirebaseMessagingSW();
+
+    const messaging = getMessaging(app);
+    const token = await getToken(messaging, {
+      vapidKey,
+      serviceWorkerRegistration: registration,
+    });
+
+    console.log("[Push Notifications] token:", token ? "available" : "empty");
+    if (!token) return { error: "Gagal mendapatkan token push notification." };
+    return { token };
+  } catch (err) {
+    console.error("[Push Notifications] getMessagingToken error:", err);
+    return {
+      error:
+        err instanceof Error
+          ? err.message
+          : "Gagal mengaktifkan notifikasi browser.",
+    };
   }
-
-  const registration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
-  const vapidKey = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY;
-  if (!vapidKey) {
-    console.error("[Push Notifications] NEXT_PUBLIC_FIREBASE_VAPID_KEY belum diset");
-    return { error: "Konfigurasi push notification belum lengkap." };
-  }
-
-  const messaging = getMessaging(app);
-  const token = await getToken(messaging, {
-    vapidKey,
-    serviceWorkerRegistration: registration,
-  });
-
-  if (!token) return { error: "Gagal mendapatkan token push notification." };
-  return { token };
 }
 
 // Cari token existing milik user ini (uid+token) supaya tidak membuat

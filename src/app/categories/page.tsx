@@ -22,7 +22,8 @@ import EmptyState from "@/components/EmptyState";
 import ConfirmModal from "@/components/ConfirmModal";
 
 export default function CategoriesPage() {
-  const { assetUser, role } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [categories, setCategories] = useState<AssetCategory[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<AssetCategory | null>(null);
@@ -37,14 +38,22 @@ export default function CategoriesPage() {
   const canManage = role === "super_admin" || role === "asset_admin";
 
   useEffect(() => {
+    if (!authReady) return;
     const q = query(collection(db, "asset_categories"), orderBy("categoryName"));
-    const unsub = onSnapshot(q, (snap) => {
-      setCategories(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
-      );
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[CategoriesPage Listener] asset_categories success:", snap.size);
+        setCategories(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
+        );
+      },
+      (error) => {
+        console.error("[CategoriesPage Listener] asset_categories error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   const openCreate = () => {
     setEditing(null);

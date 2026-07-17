@@ -25,7 +25,7 @@ import {
 } from "@/lib/types";
 import { getAssignedMaintenanceRole } from "@/lib/roles";
 import { generateWorkOrderNumber, writeWorkOrderLog } from "@/lib/firestore-helpers";
-import { createAssetNotification } from "@/lib/notifications";
+import { buildChangeMessage, buildChangeSummary, createAssetNotification } from "@/lib/notifications";
 import {
   ASSET_SELECTION_MODE_LABEL,
   computeNextDueDate,
@@ -72,7 +72,8 @@ export default function CreateMaintenanceScheduleModal({
   // dipakai tombol "Duplikat / Jadwalkan Ulang".
   duplicateFrom?: MaintenanceWorkOrder | null;
 }) {
-  const { assetUser, role } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const isEditMode = !!editWorkOrder;
   const prefillSource = editWorkOrder || duplicateFrom || null;
   const [assets, setAssets] = useState<Asset[]>([]);
@@ -106,7 +107,7 @@ export default function CreateMaintenanceScheduleModal({
   const [changeReason, setChangeReason] = useState("");
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !authReady) return;
     const unsub1 = onSnapshot(
       collection(db, "assets"),
       (snap) => {
@@ -161,7 +162,7 @@ export default function CreateMaintenanceScheduleModal({
       unsub3();
       unsub4();
     };
-  }, [open]);
+  }, [open, authReady]);
 
   // Prefill form saat mode Edit ATAU Duplikat/Jadwalkan Ulang — jangan ubah
   // logic Buat Jadwal (addDoc) yang sudah jalan, ini cuma mengisi state yang
@@ -428,9 +429,18 @@ export default function CreateMaintenanceScheduleModal({
         requestedByName: assetUser?.name || "",
         requestedByRole: role,
         assignedToUid: asDraft ? "" : assignedToUid,
-        assignedToName: asDraft ? "" : technician?.name || "",
+        assignedToName: asDraft ? "" : technician?.name || technician?.email || "",
         assignedToEmail: asDraft ? "" : technician?.email || "",
         assignedToRole: asDraft ? null : "it_team",
+        // Alias uid/name/email yang sama — dipertahankan karena beberapa
+        // tempat lain (filter Tim IT, backfill data lama) mengecek nama
+        // field ini juga, bukan cuma assignedToUid.
+        technicianUid: asDraft ? "" : assignedToUid,
+        technicianName: asDraft ? "" : technician?.name || technician?.email || "",
+        technicianEmail: asDraft ? "" : technician?.email || "",
+        assignedTechnicianUid: asDraft ? "" : assignedToUid,
+        assignedTechnicianName: asDraft ? "" : technician?.name || technician?.email || "",
+        assignedTechnicianEmail: asDraft ? "" : technician?.email || "",
         assignedAt: asDraft ? null : serverTimestamp(),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -482,7 +492,7 @@ export default function CreateMaintenanceScheduleModal({
           message: `Anda ditugaskan maintenance ${selectedAssets.length} aset${locationText ? ` di ${locationText}` : ""}.`,
           type: "work_order_assigned",
           priority,
-          linkUrl: `/maintenance?tab=my-tasks&workOrderId=${woRef.id}`,
+          linkUrl: `/maintenance?tab=routine&workOrderId=${woRef.id}`,
           relatedType: "work_order",
           relatedId: woRef.id,
           relatedNumber: workOrderNumber,
@@ -568,9 +578,15 @@ export default function CreateMaintenanceScheduleModal({
             maintenanceAreaName: addressSelection.areaName,
             maintenanceLocationText: locationText,
             assignedToUid,
-            assignedToName: technician?.name || "",
+            assignedToName: technician?.name || technician?.email || "",
             assignedToEmail: technician?.email || "",
             assignedToRole: assignedToUid ? "it_team" : null,
+            technicianUid: assignedToUid,
+            technicianName: technician?.name || technician?.email || "",
+            technicianEmail: technician?.email || "",
+            assignedTechnicianUid: assignedToUid,
+            assignedTechnicianName: technician?.name || technician?.email || "",
+            assignedTechnicianEmail: technician?.email || "",
           };
 
       const newFields: Record<string, unknown> = {
@@ -588,8 +604,10 @@ export default function CreateMaintenanceScheduleModal({
         startMonth: editWorkOrder.startMonth,
         startYear: editWorkOrder.startYear,
         scheduledDayOfMonth: editWorkOrder.scheduledDayOfMonth,
+        dueDateKey: editWorkOrder.dueDateKey,
         maintenanceLocationText: editWorkOrder.maintenanceLocationText,
         assignedToUid: oldAssignedToUid,
+        assignedToName: editWorkOrder.assignedToName,
         assignedToRole: editWorkOrder.assignedToRole,
         priority: editWorkOrder.priority,
         qhseNote: editWorkOrder.qhseNote,
@@ -706,6 +724,25 @@ export default function CreateMaintenanceScheduleModal({
       });
 
       if (applyTo === "current") {
+        // Ringkasan human-readable ("Label: lama → baru") dipakai di semua
+        // pesan notifikasi di bawah supaya penerima langsung tahu APA yang
+        // berubah, bukan cuma "jadwal diperbarui".
+        const changes = buildChangeSummary(oldFields, newFields);
+        const locationChanges = changes.filter((c) => c.startsWith("Lokasi:"));
+        const noteChanges = changes.filter((c) => c.startsWith("Catatan QHSE:"));
+        const onlyLocationChanged =
+          !technicianChanged &&
+          !scheduleChanged &&
+          !assetsChanged &&
+          locationChanges.length > 0 &&
+          locationChanges.length === changes.length;
+        const onlyNoteChanged =
+          !technicianChanged &&
+          !scheduleChanged &&
+          !assetsChanged &&
+          noteChanges.length > 0 &&
+          noteChanges.length === changes.length;
+
         if (technicianChanged) {
           if (oldAssignedToUid) {
             await createAssetNotification({
@@ -716,7 +753,7 @@ export default function CreateMaintenanceScheduleModal({
               message: `Anda tidak lagi ditugaskan untuk ${editWorkOrder.title} — dialihkan ke ${technician?.name || "teknisi lain"}.`,
               type: "work_order_assigned",
               priority,
-              linkUrl: `/maintenance?tab=my-tasks&workOrderId=${editWorkOrder.id}`,
+              linkUrl: `/maintenance?tab=routine&workOrderId=${editWorkOrder.id}`,
               relatedType: "work_order",
               relatedId: editWorkOrder.id,
               relatedNumber: editWorkOrder.workOrderNumber,
@@ -724,21 +761,45 @@ export default function CreateMaintenanceScheduleModal({
               createdByName: assetUser?.name,
             });
           }
+          const technicianMessage = buildChangeMessage(
+            `QHSE memperbarui jadwal "${editWorkOrder.title}".`,
+            changes
+          );
           await createAssetNotification({
             recipientUid: assignedToUid,
             recipientName: technician?.name || "",
             recipientRole: "it_team",
-            title: "Tugas Maintenance Baru",
-            message: `Anda ditugaskan maintenance ${editWorkOrder.title}.`,
+            title: "Jadwal Maintenance Diperbarui",
+            message: technicianMessage,
             type: "work_order_assigned",
             priority,
-            linkUrl: `/maintenance?tab=my-tasks&workOrderId=${editWorkOrder.id}`,
+            linkUrl: `/maintenance?tab=routine&workOrderId=${editWorkOrder.id}`,
             relatedType: "work_order",
             relatedId: editWorkOrder.id,
             relatedNumber: editWorkOrder.workOrderNumber,
+            oldData: oldFields,
+            newData: newFields,
+            changeSummary: changes,
             createdByUid: assetUser?.uid,
             createdByName: assetUser?.name,
           });
+          if (editWorkOrder.requestedByUid && editWorkOrder.requestedByUid !== assetUser?.uid) {
+            await createAssetNotification({
+              recipientUid: editWorkOrder.requestedByUid,
+              recipientName: editWorkOrder.requestedByName,
+              recipientRole: "asset_admin",
+              title: "Teknisi Maintenance Diperbarui",
+              message: `Teknisi maintenance ${editWorkOrder.title} diganti menjadi ${technician?.name || "-"}.`,
+              type: "work_order_assigned",
+              priority,
+              linkUrl: `/maintenance?tab=routine&workOrderId=${editWorkOrder.id}`,
+              relatedType: "work_order",
+              relatedId: editWorkOrder.id,
+              relatedNumber: editWorkOrder.workOrderNumber,
+              createdByUid: assetUser?.uid,
+              createdByName: assetUser?.name,
+            });
+          }
         } else if (scheduleChanged) {
           const recipients = [
             assignedToUid ? { uid: assignedToUid, name: technician?.name || "", role: "it_team" as const } : null,
@@ -746,6 +807,10 @@ export default function CreateMaintenanceScheduleModal({
               ? { uid: editWorkOrder.requestedByUid, name: editWorkOrder.requestedByName, role: "asset_admin" as const }
               : null,
           ].filter((r): r is { uid: string; name: string; role: "it_team" | "asset_admin" } => !!r);
+          const scheduleMessage = buildChangeMessage(
+            `QHSE memperbarui jadwal "${editWorkOrder.title}".`,
+            changes
+          );
           await Promise.all(
             recipients.map((r) =>
               createAssetNotification({
@@ -753,18 +818,65 @@ export default function CreateMaintenanceScheduleModal({
                 recipientName: r.name,
                 recipientRole: r.role,
                 title: "Jadwal Maintenance Diperbarui",
-                message: `Jadwal ${editWorkOrder.title} diperbarui: ${changeReason.trim()}`,
+                message: scheduleMessage,
                 type: "work_order_assigned",
                 priority,
                 linkUrl: `/maintenance?tab=routine&workOrderId=${editWorkOrder.id}`,
                 relatedType: "work_order",
                 relatedId: editWorkOrder.id,
                 relatedNumber: editWorkOrder.workOrderNumber,
+                oldData: oldFields,
+                newData: newFields,
+                changeSummary: changes,
                 createdByUid: assetUser?.uid,
                 createdByName: assetUser?.name,
               })
             )
           );
+        } else if (onlyLocationChanged && assignedToUid) {
+          await createAssetNotification({
+            recipientUid: assignedToUid,
+            recipientName: technician?.name || "",
+            recipientRole: "it_team",
+            title: "Lokasi Maintenance Diperbarui",
+            message: buildChangeMessage(
+              `Lokasi maintenance "${editWorkOrder.title}" diubah.`,
+              locationChanges
+            ),
+            type: "work_order_assigned",
+            priority,
+            linkUrl: `/maintenance?tab=routine&workOrderId=${editWorkOrder.id}`,
+            relatedType: "work_order",
+            relatedId: editWorkOrder.id,
+            relatedNumber: editWorkOrder.workOrderNumber,
+            oldData: oldFields,
+            newData: newFields,
+            changeSummary: locationChanges,
+            createdByUid: assetUser?.uid,
+            createdByName: assetUser?.name,
+          });
+        } else if (onlyNoteChanged && assignedToUid) {
+          await createAssetNotification({
+            recipientUid: assignedToUid,
+            recipientName: technician?.name || "",
+            recipientRole: "it_team",
+            title: "Catatan Maintenance Diperbarui",
+            message: buildChangeMessage(
+              `QHSE memperbarui catatan pada maintenance "${editWorkOrder.title}".`,
+              noteChanges
+            ),
+            type: "work_order_assigned",
+            priority,
+            linkUrl: `/maintenance?tab=routine&workOrderId=${editWorkOrder.id}`,
+            relatedType: "work_order",
+            relatedId: editWorkOrder.id,
+            relatedNumber: editWorkOrder.workOrderNumber,
+            oldData: oldFields,
+            newData: newFields,
+            changeSummary: noteChanges,
+            createdByUid: assetUser?.uid,
+            createdByName: assetUser?.name,
+          });
         }
 
         if (assetsChanged && assignedToUid) {
@@ -773,13 +885,48 @@ export default function CreateMaintenanceScheduleModal({
             recipientName: technician?.name || "",
             recipientRole: "it_team",
             title: "Daftar Asset Maintenance Diperbarui",
-            message: `Daftar asset maintenance ${editWorkOrder.title} diperbarui.`,
+            message: `Daftar asset maintenance ${editWorkOrder.title} diperbarui (${addedAssets.length} ditambah, ${removedAssetIds.length} dikurangi).`,
             type: "work_order_assigned",
             priority,
-            linkUrl: `/maintenance?tab=my-tasks&workOrderId=${editWorkOrder.id}`,
+            linkUrl: `/maintenance?tab=routine&workOrderId=${editWorkOrder.id}`,
             relatedType: "work_order",
             relatedId: editWorkOrder.id,
             relatedNumber: editWorkOrder.workOrderNumber,
+            createdByUid: assetUser?.uid,
+            createdByName: assetUser?.name,
+          });
+        }
+
+        // Perubahan lain (prioritas, dst) yang tidak masuk kategori spesifik
+        // di atas — tetap kabari Tim IT supaya "QHSE edit jadwal" selalu
+        // menghasilkan notifikasi yang menjelaskan APA yang berubah.
+        if (
+          !technicianChanged &&
+          !scheduleChanged &&
+          !assetsChanged &&
+          !onlyLocationChanged &&
+          !onlyNoteChanged &&
+          assignedToUid &&
+          changes.length > 0
+        ) {
+          await createAssetNotification({
+            recipientUid: assignedToUid,
+            recipientName: technician?.name || "",
+            recipientRole: "it_team",
+            title: "Jadwal Maintenance Diperbarui",
+            message: buildChangeMessage(
+              `QHSE memperbarui jadwal "${editWorkOrder.title}".`,
+              changes
+            ),
+            type: "work_order_assigned",
+            priority,
+            linkUrl: `/maintenance?tab=routine&workOrderId=${editWorkOrder.id}`,
+            relatedType: "work_order",
+            relatedId: editWorkOrder.id,
+            relatedNumber: editWorkOrder.workOrderNumber,
+            oldData: oldFields,
+            newData: newFields,
+            changeSummary: changes,
             createdByUid: assetUser?.uid,
             createdByName: assetUser?.name,
           });

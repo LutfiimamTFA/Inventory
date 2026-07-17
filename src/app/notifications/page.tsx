@@ -29,24 +29,32 @@ import EmptyState from "@/components/EmptyState";
 type ReadFilter = "all" | "unread" | "read";
 
 export default function NotificationsPage() {
-  const { assetUser } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const router = useRouter();
   const [notifications, setNotifications] = useState<AssetNotification[]>([]);
   const [readFilter, setReadFilter] = useState<ReadFilter>("all");
   const [typeFilter, setTypeFilter] = useState<NotificationType | "">("");
 
   useEffect(() => {
-    if (!assetUser?.uid) return;
+    if (!authReady || !assetUser?.uid) return;
     const q = query(
       collection(db, "asset_notifications"),
       where("recipientUid", "==", assetUser.uid),
       orderBy("createdAt", "desc")
     );
-    const unsub = onSnapshot(q, (snap) => {
-      setNotifications(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetNotification)));
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[NotificationsPage Listener] asset_notifications success:", snap.size);
+        setNotifications(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetNotification)));
+      },
+      (error) => {
+        console.error("[NotificationsPage Listener] asset_notifications error:", error);
+      }
+    );
     return () => unsub();
-  }, [assetUser?.uid]);
+  }, [authReady, assetUser?.uid]);
 
   const filtered = useMemo(() => {
     return notifications.filter((n) => {
@@ -145,7 +153,19 @@ export default function NotificationsPage() {
                     {!n.isRead && <span className="h-2 w-2 rounded-full bg-blue-500" />}
                   </div>
                 </div>
-                <p className="text-sm text-slate-500 mb-2">{n.message}</p>
+                <p className="whitespace-pre-line text-sm text-slate-500 mb-2">{n.message}</p>
+                {!!n.changeSummary && n.changeSummary.length > 0 && (
+                  <div className="mb-2 rounded-lg bg-slate-50 p-2 text-xs text-slate-600">
+                    {n.changeSummary.slice(0, 3).map((change, index) => (
+                      <div key={index}>• {change}</div>
+                    ))}
+                    {n.changeSummary.length > 3 && (
+                      <div className="text-slate-400">
+                        +{n.changeSummary.length - 3} perubahan lain
+                      </div>
+                    )}
+                  </div>
+                )}
                 <Badge
                   label={NOTIFICATION_TYPE_LABEL[n.type]}
                   colorClass={NOTIFICATION_PRIORITY_COLOR[n.priority]}

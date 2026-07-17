@@ -40,7 +40,8 @@ import QrLabelModal from "@/components/QrLabelModal";
 import BulkQrLabelModal from "@/components/BulkQrLabelModal";
 
 export default function AssetsPage() {
-  const { assetUser, role } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [assets, setAssets] = useState<Asset[]>([]);
   const [categories, setCategories] = useState<AssetCategory[]>([]);
   const [search, setSearch] = useState("");
@@ -58,22 +59,54 @@ export default function AssetsPage() {
 
   const canManage = role === "super_admin" || role === "asset_admin";
 
-  useEffect(() => {
-    const q = query(collection(db, "assets"), orderBy("createdAt", "desc"));
-    const unsub = onSnapshot(q, (snap) => {
-      setAssets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset)));
+  // Section F — ringkasan aset tetap lokasi vs bergerak (AC/meja/CCTV
+  // dipisah dari HP/laptop/kamera). Aset lama belum punya trackingMode
+  // tersimpan, diturunkan dari usageType lama supaya tetap terhitung.
+  const trackingSummary = useMemo(() => {
+    let fixedLocation = 0;
+    let moving = 0;
+    let maintenance = 0;
+    assets.forEach((a) => {
+      const mode = a.trackingMode || (a.usageType === "assigned_daily" ? "assigned_pic" : "shared_borrowable");
+      if (mode === "fixed_location") fixedLocation += 1;
+      else moving += 1;
+      if (a.assetStatus === "maintenance") maintenance += 1;
     });
-    return () => unsub();
-  }, []);
+    return { fixedLocation, moving, maintenance };
+  }, [assets]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_categories"), (snap) => {
-      setCategories(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
-      );
-    });
+    if (!authReady) return;
+    const q = query(collection(db, "assets"), orderBy("createdAt", "desc"));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[AssetsPage Listener] assets success:", snap.size);
+        setAssets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Asset)));
+      },
+      (error) => {
+        console.error("[AssetsPage Listener] assets error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
+
+  useEffect(() => {
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_categories"),
+      (snap) => {
+        console.log("[AssetsPage Listener] asset_categories success:", snap.size);
+        setCategories(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
+        );
+      },
+      (error) => {
+        console.error("[AssetsPage Listener] asset_categories error:", error);
+      }
+    );
+    return () => unsub();
+  }, [authReady]);
 
   const companies = useMemo(
     () =>
@@ -214,6 +247,21 @@ export default function AssetsPage() {
           </>
         }
       />
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-5">
+        <div className="rounded-2xl border border-slate-200 bg-white p-4">
+          <p className="text-xs text-slate-500">Total Aset Tetap Lokasi</p>
+          <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.fixedLocation}</p>
+        </div>
+        <div className="rounded-2xl border border-slate-200 bg-white p-4">
+          <p className="text-xs text-slate-500">Total Aset Bergerak</p>
+          <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.moving}</p>
+        </div>
+        <div className="rounded-2xl border border-slate-200 bg-white p-4">
+          <p className="text-xs text-slate-500">Total Aset Maintenance</p>
+          <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.maintenance}</p>
+        </div>
+      </div>
 
       <FilterCard>
         <div className="relative lg:col-span-2">

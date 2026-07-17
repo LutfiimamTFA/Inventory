@@ -38,7 +38,8 @@ interface Row {
 const REQUIRED_COLUMNS = ["assetName", "categoryName"];
 
 export default function BulkUploadPage() {
-  const { assetUser } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [categories, setCategories] = useState<AssetCategory[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
   const [fileName, setFileName] = useState("");
@@ -46,13 +47,21 @@ export default function BulkUploadPage() {
   const [done, setDone] = useState(false);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "asset_categories"), (snap) => {
-      setCategories(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
-      );
-    });
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      collection(db, "asset_categories"),
+      (snap) => {
+        console.log("[BulkUploadPage Listener] asset_categories success:", snap.size);
+        setCategories(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
+        );
+      },
+      (error) => {
+        console.error("[BulkUploadPage Listener] asset_categories error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   const validateRows = (parsed: Row[]) =>
     parsed.map((r) => {

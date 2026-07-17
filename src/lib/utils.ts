@@ -2,6 +2,9 @@ import {
   AssetCondition,
   AssetSelectionMode,
   AssetStatus,
+  AssetUsageStatus,
+  AssetUsageType,
+  TrackingMode,
   BorrowingStatus,
   IssuePriority,
   IssueTicketStatus,
@@ -93,6 +96,44 @@ export const ASSET_STATUS_COLOR: Record<AssetStatus, string> = {
   lost: "bg-rose-900 text-rose-50 border-rose-900",
   inactive: "bg-slate-100 text-slate-500 border-slate-200",
   disposed: "bg-slate-800 text-slate-100 border-slate-800",
+};
+
+// "assigned_daily" SENGAJA dilabeli "Aset dengan PIC", bukan "Ditugaskan
+// Tetap" — supaya tidak terkesan aset jadi milik pribadi PIC-nya. Aset tetap
+// milik kantor, PIC cuma penanggung jawab operasional; orang lain tetap
+// boleh minta pakai sementara (lihat handoverTemporary di custodian-actions.ts).
+export const ASSET_USAGE_TYPE_LABEL: Record<AssetUsageType, string> = {
+  shared_pool: "Aset Bersama",
+  assigned_daily: "Aset dengan PIC",
+};
+
+export const ASSET_USAGE_STATUS_LABEL: Record<AssetUsageStatus, string> = {
+  available: "Tersedia",
+  with_custodian: "Bersama Custodian",
+  temporary_used_by_other: "Dipakai Sementara",
+  borrowed: "Dipinjam",
+  maintenance: "Maintenance",
+  unavailable: "Tidak Tersedia",
+  fixed_at_location: "Tetap di Lokasi",
+};
+
+export const ASSET_USAGE_STATUS_COLOR: Record<AssetUsageStatus, string> = {
+  available: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  with_custodian: "bg-blue-50 text-blue-700 border-blue-200",
+  temporary_used_by_other: "bg-amber-50 text-amber-700 border-amber-200",
+  borrowed: "bg-amber-50 text-amber-700 border-amber-200",
+  maintenance: "bg-purple-50 text-purple-700 border-purple-200",
+  unavailable: "bg-slate-100 text-slate-500 border-slate-200",
+  fixed_at_location: "bg-slate-100 text-slate-600 border-slate-200",
+};
+
+// Section A — mode tracking aset (lihat AGENTS/spec "Perbaiki konsep Status
+// Pemakaian Aset Kantor"). Menentukan apakah aset ini masuk sistem
+// pemakaian/PIC sama sekali, atau cukup dilacak di lokasi (AC, meja, CCTV).
+export const TRACKING_MODE_LABEL: Record<TrackingMode, string> = {
+  fixed_location: "Aset Tetap Lokasi",
+  assigned_pic: "Aset dengan PIC Operasional",
+  shared_borrowable: "Aset Bersama Bisa Dipakai",
 };
 
 export const CONDITION_LABEL: Record<AssetCondition, string> = {
@@ -350,6 +391,8 @@ export const WORK_ORDER_LOG_ACTION_LABEL: Record<MaintenanceWorkOrderLogAction, 
   check_asset_item: "Asset dicek",
   complete_asset_item: "Asset selesai dicek",
   create_follow_up_ticket: "Ticket lanjutan dibuat",
+  reset_follow_up_ticket: "Relasi ticket lanjutan direset",
+  qhse_finding_decision: "QHSE memutuskan tindak lanjut temuan",
   submit_report: "Laporan dikirim",
   complete_work_order: "Ditandai selesai",
   cancel_work_order: "Dibatalkan",
@@ -564,6 +607,9 @@ export const NOTIFICATION_TYPE_LABEL: Record<NotificationType, string> = {
   asset_borrowed: "Asset Dipinjam",
   asset_returned: "Asset Dikembalikan",
   asset_damage_reported: "Kerusakan Dilaporkan",
+  asset_created: "Asset Baru",
+  asset_updated: "Asset Diperbarui",
+  asset_status_changed: "Status Asset Berubah",
   ticket_created: "Ticket Baru",
   ticket_assigned: "Ticket Ditugaskan",
   ticket_status_updated: "Status Ticket",
@@ -579,6 +625,12 @@ export const NOTIFICATION_TYPE_LABEL: Record<NotificationType, string> = {
   work_order_reopened: "Tugas Dibuka Ulang",
   maintenance_due: "Maintenance Jatuh Tempo",
   maintenance_overdue: "Maintenance Terlambat",
+  maintenance_finding_reported: "Temuan Maintenance Perlu Review",
+  maintenance_finding_decided: "Keputusan QHSE atas Temuan",
+  asset_custodian_assigned: "Anda Menjadi PIC Aset",
+  asset_temporary_handover: "Aset Dipakai Sementara",
+  asset_returned_to_custodian: "Aset Dikembalikan",
+  asset_usage_overdue: "Penggunaan Aset Melewati Estimasi",
   system: "Sistem",
 };
 

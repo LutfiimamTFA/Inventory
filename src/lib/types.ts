@@ -1,4 +1,4 @@
-export type AppRole = "super_admin" | "asset_admin" | "it_team" | "staff";
+export type AppRole = "super_admin" | "asset_admin" | "asset_finance" | "it_team" | "staff";
 
 export type AssetStatus =
   | "available"
@@ -112,11 +112,73 @@ export interface Asset {
   currentBorrowerUid?: string | null;
   currentBorrowerName?: string | null;
 
+  // ── Custodian / pemakaian harian ──────────────────────────────────────
+  // Aset "assigned_daily" (mis. HP sosial media, laptop kerja) punya
+  // custodian tetap yang TIDAK perlu scan/pinjam setiap hari. Kalau aset
+  // dipegang orang lain sementara, currentHolder* berbeda dari custodian*
+  // — begitu dikembalikan, currentHolder* disetel balik ke data custodian.
+  usageType?: AssetUsageType;
+  usageTypeLabel?: string;
+
+  // Mode tracking (section A) — menentukan apakah aset ini masuk sistem
+  // pemakaian/PIC sama sekali. "fixed_location" (AC, meja, CCTV, dll) TIDAK
+  // punya custodian/currentHolder — cukup lokasi + PIC lokasi + maintenance.
+  trackingMode?: TrackingMode;
+  trackingModeLabel?: string;
+
+  custodianUid?: string | null;
+  custodianName?: string | null;
+  custodianEmail?: string | null;
+  custodianDivision?: string | null;
+  custodianRole?: string | null;
+
+  currentHolderUid?: string | null;
+  currentHolderName?: string | null;
+  currentHolderEmail?: string | null;
+  currentHolderDivision?: string | null;
+
+  currentUsageStatus?: AssetUsageStatus;
+  currentUsageStatusLabel?: string;
+  currentUsageStartedAt?: unknown;
+  currentUsageExpectedReturnAt?: string | null;
+  currentUsagePurpose?: string | null;
+  currentUsageNote?: string | null;
+
+  // Alias legacy — beberapa data/tampilan lama membaca PIC dari field ini
+  // alih-alih custodian* (lihat displayCustodianName di assets/[id]/page.tsx).
+  picUid?: string | null;
+  picName?: string | null;
+  picEmail?: string | null;
+
+  temporaryUseStartedAt?: unknown;
+  temporaryUseExpectedReturnAt?: string | null;
+  temporaryUseEndedAt?: unknown;
+  temporaryUsePurpose?: string | null;
+  temporaryUseNote?: string | null;
+
+  handedOverByUid?: string | null;
+  handedOverByName?: string | null;
+  returnedByUid?: string | null;
+  returnedByName?: string | null;
+
   createdByUid: string;
   createdByName: string;
   createdAt: unknown;
   updatedAt: unknown;
 }
+
+export type AssetUsageType = "shared_pool" | "assigned_daily";
+
+export type TrackingMode = "fixed_location" | "assigned_pic" | "shared_borrowable";
+
+export type AssetUsageStatus =
+  | "available"
+  | "with_custodian"
+  | "temporary_used_by_other"
+  | "borrowed"
+  | "maintenance"
+  | "unavailable"
+  | "fixed_at_location";
 
 export interface AssetCategory {
   id: string;
@@ -159,6 +221,19 @@ export interface AssetLog {
   userName: string;
   timestamp: unknown;
   detail?: string;
+
+  // ── Detail perpindahan custodian/pemakai (opsional, hanya diisi untuk
+  // action assigned_to_custodian/custodian_changed/temporary_handover/
+  // temporary_returned/forced_return/holder_corrected) ────────────────────
+  fromUid?: string;
+  fromName?: string;
+  toUid?: string;
+  toName?: string;
+  custodianUid?: string;
+  custodianName?: string;
+  purpose?: string;
+  expectedReturnAt?: string;
+  note?: string;
 }
 
 export interface AssetUser {
@@ -508,6 +583,11 @@ export interface MaintenanceWorkOrder {
   technicianUid?: string;
   technicianName?: string;
   technicianEmail?: string;
+  // Alias legacy — beberapa dokumen lama/jalur berbeda menyimpan penugasan
+  // teknisi di field ini alih-alih assignedToUid/technicianUid.
+  assignedTechnicianUid?: string;
+  assignedTechnicianName?: string;
+  assignedTechnicianEmail?: string;
   assignedAt?: unknown;
 
   checklistItems?: string[];
@@ -539,6 +619,12 @@ export interface MaintenanceWorkOrder {
   reportSubmittedAt?: unknown;
   reportSubmittedByUid?: string;
   reportSubmittedByName?: string;
+
+  // ── Laporan akhir Tim IT (rekap semua item + kesimpulan/rekomendasi) ────
+  reportSummary?: string;
+  reportConclusion?: string;
+  reportRecommendation?: string;
+  reportData?: Record<string, unknown>;
 
   completedAt?: unknown;
   completedByUid?: string;
@@ -582,6 +668,24 @@ export interface MaintenanceWorkOrder {
   // dibuat/generate. Bentuknya subset dari field jadwal (title, frequency,
   // dst) yang sengaja longgar (unknown) karena hanya dipakai sebagai draft.
   nextConfig?: Record<string, unknown>;
+
+  // ── Ringkasan temuan Tim IT yang butuh review QHSE (lihat field serupa di
+  // MaintenanceWorkOrderItem) — dipakai supaya tab "Butuh Tindakan Lanjutan"
+  // QHSE bisa langsung tahu ada temuan tanpa perlu buka tiap item.
+  hasFindings?: boolean;
+  needsQhseReview?: boolean;
+  followUpStatus?:
+    | "waiting_qhse_decision"
+    | "noted"
+    | "recheck_requested"
+    | "corrective_task_created"
+    | "waiting_purchase"
+    | "waiting_vendor"
+    | "asset_temporarily_unusable";
+  lastFindingAt?: unknown;
+  lastFindingByUid?: string;
+  lastFindingByName?: string;
+  lastActivityMessage?: string;
 }
 
 export type WorkOrderItemStatus =
@@ -592,15 +696,17 @@ export type WorkOrderItemStatus =
   | "skipped";
 
 export type MaintenanceActionTaken =
-  | "Tidak Ada Tindakan"
-  | "Dibersihkan"
-  | "Disetting Ulang"
-  | "Update Software"
-  | "Kosongkan Storage"
-  | "Ganti Aksesoris"
-  | "Ganti Sparepart"
-  | "Perlu Vendor"
-  | "Perlu Ticket Kendala Lanjutan";
+  | "no_action"
+  | "cleaned"
+  | "reconfigured"
+  | "minor_repair"
+  | "software_update"
+  | "clear_storage"
+  | "replace_component"
+  | "need_purchase"
+  | "need_vendor"
+  | "need_follow_up_ticket"
+  | "temporarily_unusable";
 
 export type MaintenanceConditionLabel =
   | "Baik"
@@ -641,6 +747,53 @@ export interface MaintenanceWorkOrderItem {
   followUpTicketId?: string;
   followUpTicketNumber?: string;
 
+  // ── Alur temuan → QHSE (bukan Tim IT bikin ticket untuk diri sendiri) ────
+  // Tim IT hanya menandai needsQhseReview lewat handleReportFindingToQhse;
+  // QHSE yang memutuskan followUpStatus berikutnya lewat salah satu
+  // handleQhse* di WorkOrderDetailModal (dicatat/cek ulang/tugas
+  // korektif/pembelian/vendor/tidak layak pakai).
+  needsQhseReview?: boolean;
+  followUpStatus?:
+    | "waiting_qhse_decision"
+    | "noted"
+    | "recheck_requested"
+    | "corrective_task_created"
+    | "waiting_purchase"
+    | "waiting_vendor"
+    | "asset_temporarily_unusable";
+  findingSeverity?: "normal" | "urgent";
+  findingAction?: MaintenanceActionTaken;
+  findingNote?: string;
+  technicalNote?: string;
+  actionLabel?: string;
+  reportedToQhseAt?: unknown;
+  reportedToQhseByUid?: string;
+  reportedToQhseByName?: string;
+
+  // Cek ulang atas permintaan QHSE (followUpStatus "recheck_requested") —
+  // recheckSavedAt = Tim IT klik "Simpan Hasil Cek Ulang" (draft, belum
+  // dikirim), recheckSubmittedAt = Tim IT klik "Kirim Hasil Cek Ulang ke
+  // QHSE" (followUpStatus balik ke waiting_qhse_decision).
+  recheckSavedAt?: unknown;
+  recheckSavedByUid?: string;
+  recheckSavedByName?: string;
+  recheckSubmittedAt?: unknown;
+  recheckSubmittedByUid?: string;
+  recheckSubmittedByName?: string;
+  recheckResponseNote?: string;
+
+  // Keputusan QHSE atas temuan (lihat followUpStatus di atas untuk hasilnya).
+  qhseDecision?: string;
+  qhseDecisionLabel?: string;
+  qhseDecisionNote?: string;
+  qhseDecisionByUid?: string;
+  qhseDecisionByName?: string;
+  qhseDecisionAt?: unknown;
+  purchaseDetail?: string;
+  vendorNote?: string;
+  correctiveAssignedToUid?: string;
+  correctiveAssignedToName?: string;
+
   checkedByUid?: string;
   checkedByName?: string;
   checkedAt?: unknown;
@@ -657,6 +810,8 @@ export type MaintenanceWorkOrderLogAction =
   | "check_asset_item"
   | "complete_asset_item"
   | "create_follow_up_ticket"
+  | "reset_follow_up_ticket"
+  | "qhse_finding_decision"
   | "submit_report"
   | "complete_work_order"
   | "cancel_work_order"
@@ -706,6 +861,9 @@ export type NotificationType =
   | "asset_borrowed"
   | "asset_returned"
   | "asset_damage_reported"
+  | "asset_created"
+  | "asset_updated"
+  | "asset_status_changed"
   | "ticket_created"
   | "ticket_assigned"
   | "ticket_status_updated"
@@ -721,6 +879,12 @@ export type NotificationType =
   | "work_order_reopened"
   | "maintenance_due"
   | "maintenance_overdue"
+  | "maintenance_finding_reported"
+  | "maintenance_finding_decided"
+  | "asset_custodian_assigned"
+  | "asset_temporary_handover"
+  | "asset_returned_to_custodian"
+  | "asset_usage_overdue"
   | "system";
 
 export type NotificationPriority = "low" | "medium" | "high" | "urgent";
@@ -750,6 +914,10 @@ export interface AssetNotification {
   relatedNumber?: string;
 
   dedupeKey?: string;
+
+  oldData?: Record<string, unknown>;
+  newData?: Record<string, unknown>;
+  changeSummary?: string[];
 
   isRead: boolean;
   readAt?: unknown;

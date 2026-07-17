@@ -67,13 +67,14 @@ export default function IssueTicketDetailModal({
   onClose: () => void;
   readOnly?: boolean;
 }) {
-  const { assetUser, role } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [ticket, setTicket] = useState(initialTicket);
   const [logs, setLogs] = useState<AssetIssueLog[]>([]);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !authReady) return;
     const unsub = onSnapshot(
       doc(db, "asset_issue_tickets", initialTicket.id),
       (snap) => {
@@ -91,7 +92,7 @@ export default function IssueTicketDetailModal({
       }
     );
     return () => unsub();
-  }, [open, initialTicket.id]);
+  }, [open, authReady, initialTicket.id]);
 
   const [priority, setPriority] = useState<IssuePriority>(ticket.priority);
   const [reviewNote, setReviewNote] = useState("");
@@ -107,7 +108,7 @@ export default function IssueTicketDetailModal({
   const [technicianNote, setTechnicianNote] = useState(ticket.resolutionNote || "");
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !authReady) return;
     const q = query(
       collection(db, "asset_issue_logs"),
       where("ticketId", "==", ticket.id),
@@ -124,7 +125,7 @@ export default function IssueTicketDetailModal({
       }
     );
     return () => unsub();
-  }, [open, ticket.id]);
+  }, [open, authReady, ticket.id]);
 
   if (!open) return null;
 
@@ -232,7 +233,10 @@ export default function IssueTicketDetailModal({
     });
   };
 
-  const notifyStatusUpdate = async (statusLabel: string, qhseTab: "staff-reports" | "follow-up" = "staff-reports") => {
+  const notifyStatusUpdate = async (
+    statusLabel: string,
+    qhseTab: "staff-reports" | "follow-up" | "history" = "staff-reports"
+  ) => {
     const recipients: { uid: string; name: string; role: "staff" | "asset_admin" }[] = [];
     if (ticket.reportedByUid) {
       recipients.push({ uid: ticket.reportedByUid, name: ticket.reportedByName, role: "staff" });
@@ -275,7 +279,7 @@ export default function IssueTicketDetailModal({
       },
       reviewNote || "Laporan ditolak"
     );
-    await notifyStatusUpdate(ISSUE_STATUS_LABEL.rejected);
+    await notifyStatusUpdate(ISSUE_STATUS_LABEL.rejected, "history");
   };
 
   const handleStartDiagnosis = async () => {
@@ -348,7 +352,7 @@ export default function IssueTicketDetailModal({
 
   const handleClose = async () => {
     await runUpdate("close_ticket", { status: "closed", closedAt: serverTimestamp() }, "Ticket ditutup");
-    await notifyStatusUpdate(ISSUE_STATUS_LABEL.closed);
+    await notifyStatusUpdate(ISSUE_STATUS_LABEL.closed, "history");
   };
 
   return (

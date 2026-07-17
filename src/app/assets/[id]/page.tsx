@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   collection,
@@ -13,9 +13,20 @@ import {
   where,
 } from "firebase/firestore";
 import { QRCodeSVG } from "qrcode.react";
-import { Pencil, Download, ArrowLeft, Image as ImageIcon, History as HistoryIcon, Power, FileBarChart, FileDown } from "lucide-react";
+import { Pencil, Download, ArrowLeft, Image as ImageIcon, History as HistoryIcon, Power, FileBarChart, FileDown, UserCog, ArrowRightLeft, Undo2, ShieldAlert } from "lucide-react";
 import { db } from "@/lib/firebase";
-import { writeAssetLog } from "@/lib/firestore-helpers";
+import {
+  cleanFirestoreData,
+  EmployeeOption,
+  fetchActiveEmployeeOptions,
+  writeAssetLog,
+} from "@/lib/firestore-helpers";
+import {
+  assignCustodian,
+  forceReturnOrCorrectHolder,
+  handoverTemporary,
+  returnToCustodian,
+} from "@/lib/custodian-actions";
 import {
   computeHealthScore,
   exportToExcel,
@@ -29,6 +40,9 @@ import { Asset, AssetBorrowing, AssetIssueTicket, AssetLog } from "@/lib/types";
 import {
   ASSET_STATUS_COLOR,
   ASSET_STATUS_LABEL,
+  ASSET_USAGE_STATUS_COLOR,
+  ASSET_USAGE_STATUS_LABEL,
+  ASSET_USAGE_TYPE_LABEL,
   BORROWING_STATUS_COLOR,
   BORROWING_STATUS_LABEL,
   CONDITION_LABEL,
@@ -39,12 +53,14 @@ import {
 import ProtectedLayout from "@/components/ProtectedLayout";
 import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
+import SearchableSelect, { SearchableSelectItem } from "@/components/SearchableSelect";
 import Link from "next/link";
 
 export default function AssetDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
-  const { assetUser, role } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [asset, setAsset] = useState<Asset | null>(null);
   const [photoImgError, setPhotoImgError] = useState(false);
   const [borrowings, setBorrowings] = useState<AssetBorrowing[]>([]);
@@ -53,59 +69,152 @@ export default function AssetDetailPage() {
   const [deactivateOpen, setDeactivateOpen] = useState(false);
   const [deactivating, setDeactivating] = useState(false);
 
+  const [employeeOptions, setEmployeeOptions] = useState<EmployeeOption[]>([]);
+  const [custodianModalOpen, setCustodianModalOpen] = useState(false);
+  const [handoverModalOpen, setHandoverModalOpen] = useState(false);
+  const [returnConfirmOpen, setReturnConfirmOpen] = useState(false);
+  const [forceModalOpen, setForceModalOpen] = useState(false);
+  const [selectedUserUid, setSelectedUserUid] = useState("");
+  const [handoverPurpose, setHandoverPurpose] = useState("");
+  const [handoverExpectedReturnAt, setHandoverExpectedReturnAt] = useState("");
+  const [handoverNote, setHandoverNote] = useState("");
+  const [forceCorrectedUserUid, setForceCorrectedUserUid] = useState("");
+  const [forceNote, setForceNote] = useState("");
+  const [usageSaving, setUsageSaving] = useState(false);
+  const [usageError, setUsageError] = useState("");
+
   const canManage = role === "super_admin" || role === "asset_admin";
+  // Section E — Finance/Bukti Pembelian: Super Admin/Asset Finance/Asset
+  // Admin boleh LIHAT (Asset Admin read-only, tidak wajib tahu harga tapi
+  // boleh cek); hanya Super Admin/Asset Finance yang boleh EDIT.
+  const canViewFinance = role === "super_admin" || role === "asset_admin" || role === "asset_finance";
+  const canEditFinance = role === "super_admin" || role === "asset_finance";
+  // Custodian/currentHolder boleh serah-terima & kembalikan sendiri — rules
+  // Firestore (isCustodianOrHolderUsageUpdate) sudah menegakkan ini di sisi
+  // server, guard di UI ini cuma supaya tombolnya tidak nyasar ditampilkan.
+  const isCustodian = !!asset && asset.custodianUid === assetUser?.uid;
+  const isCurrentHolder = !!asset && asset.currentHolderUid === assetUser?.uid;
+  const canHandover = canManage || isCustodian || isCurrentHolder;
+  const canReturnToCustodian = canManage || isCustodian || isCurrentHolder;
 
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, "assets", id), (snap) => {
-      if (snap.exists()) {
-        const data = { id: snap.id, ...snap.data() } as Asset;
-        console.debug("[Asset Detail] loaded photo fields:", {
-          photoUrl: data.photoUrl,
-          photoThumbnailUrl: data.photoThumbnailUrl,
-          photoFileName: data.photoFileName,
-          photoDriveFileId: data.photoDriveFileId,
-        });
-        setAsset(data);
-      } else {
-        setAsset(null);
+    if (!authReady) return;
+    const unsub = onSnapshot(
+      doc(db, "assets", id),
+      (snap) => {
+        console.log("[AssetDetailPage Listener] assets doc success:", { id, exists: snap.exists() });
+        if (snap.exists()) {
+          const data = { id: snap.id, ...snap.data() } as Asset;
+          console.debug("[Asset Detail] loaded photo fields:", {
+            photoUrl: data.photoUrl,
+            photoThumbnailUrl: data.photoThumbnailUrl,
+            photoFileName: data.photoFileName,
+            photoDriveFileId: data.photoDriveFileId,
+          });
+          setAsset(data);
+        } else {
+          setAsset(null);
+        }
+      },
+      (error) => {
+        console.error("[AssetDetailPage Listener] assets doc error:", { id, error });
       }
-    });
+    );
     return () => unsub();
-  }, [id]);
+  }, [authReady, id]);
 
   useEffect(() => {
+    if (!authReady) return;
     const q = query(
       collection(db, "asset_borrowings"),
       where("assetId", "==", id),
       orderBy("borrowedAt", "desc")
     );
-    const unsub = onSnapshot(q, (snap) => {
-      setBorrowings(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))
-      );
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[AssetDetailPage Listener] asset_borrowings success:", snap.size);
+        setBorrowings(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))
+        );
+      },
+      (error) => {
+        console.error("[AssetDetailPage Listener] asset_borrowings error:", error);
+      }
+    );
     return () => unsub();
-  }, [id]);
+  }, [authReady, id]);
 
   useEffect(() => {
+    if (!authReady) return;
     const q = query(
       collection(db, "asset_logs"),
       where("assetId", "==", id),
       orderBy("timestamp", "desc")
     );
-    const unsub = onSnapshot(q, (snap) => {
-      setLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetLog)));
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[AssetDetailPage Listener] asset_logs success:", snap.size);
+        setLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetLog)));
+      },
+      (error) => {
+        console.error("[AssetDetailPage Listener] asset_logs error:", error);
+      }
+    );
     return () => unsub();
-  }, [id]);
+  }, [authReady, id]);
 
   useEffect(() => {
+    if (!authReady) return;
     const q = query(collection(db, "asset_issue_tickets"), where("assetId", "==", id));
-    const unsub = onSnapshot(q, (snap) => {
-      setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[AssetDetailPage Listener] asset_issue_tickets success:", snap.size);
+        setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
+      },
+      (error) => {
+        console.error("[AssetDetailPage Listener] asset_issue_tickets error:", error);
+      }
+    );
     return () => unsub();
-  }, [id]);
+  }, [authReady, id]);
+
+  // Daftar KARYAWAN AKTIF untuk dropdown "Pilih Custodian"/"Serahkan
+  // Sementara ke" — dimuat sekali saja saat salah satu modal dibuka pertama
+  // kali. WAJIB dari employee_profiles (semua karyawan), BUKAN asset_users
+  // (cuma user yang punya akses AssetView) — kalau sumbernya asset_users,
+  // dropdown cuma menampilkan segelintir admin/QHSE/Tim IT yang punya akun
+  // AssetView, bukan seluruh karyawan yang bisa jadi PIC/pemakai sementara.
+  useEffect(() => {
+    if (!custodianModalOpen && !handoverModalOpen && !forceModalOpen) return;
+    if (employeeOptions.length > 0) return;
+    let cancelled = false;
+    fetchActiveEmployeeOptions()
+      .then((options) => {
+        if (!cancelled) setEmployeeOptions(options);
+      })
+      .catch((err) => console.error("[AssetDetailPage] gagal memuat daftar karyawan aktif", err));
+    return () => {
+      cancelled = true;
+    };
+  }, [custodianModalOpen, handoverModalOpen, forceModalOpen, employeeOptions.length]);
+
+  // Baris utama dropdown = nama saja, baris kecil = divisi/brand/role —
+  // JANGAN gabung jadi satu label panjang seperti sebelumnya ("Nama — Divisi").
+  const employeeSelectItems: SearchableSelectItem[] = useMemo(
+    () =>
+      employeeOptions.map((u) => ({
+        id: u.uid,
+        label: u.name,
+        sublabel: u.divisionName || u.brandName || u.roleLabel,
+        searchText: [u.name, u.email, u.divisionName, u.brandName, u.roleLabel]
+          .filter(Boolean)
+          .join(" "),
+      })),
+    [employeeOptions]
+  );
 
   if (!asset) {
     return (
@@ -142,6 +251,228 @@ export default function AssetDetailPage() {
       setDeactivateOpen(false);
     } finally {
       setDeactivating(false);
+    }
+  };
+
+  // Fallback tampilan (section C) — jangan cuma baca custodianName/
+  // currentHolderName mentah, karena aset lama bisa saja sudah punya
+  // usageType/currentUsageStatus (mis. diset manual) tapi belum pernah
+  // disentuh assignCustodian sehingga custodian*/currentHolder* masih
+  // kosong. responsiblePersonName adalah field lama yang paling relevan
+  // sebagai pengganti PIC/Custodian untuk data seperti ini.
+  const isFixedLocationAsset =
+    (asset.trackingMode || (asset.usageType === "assigned_daily" ? "assigned_pic" : "shared_borrowable")) ===
+    "fixed_location";
+  const custodianDisplayName =
+    asset.custodianName ||
+    asset.responsiblePersonName ||
+    asset.picName ||
+    asset.custodianEmail ||
+    asset.responsiblePersonEmail ||
+    "-";
+  const currentHolderDisplayName =
+    asset.currentHolderName ||
+    asset.currentBorrowerName ||
+    (asset.usageType === "assigned_daily" || asset.currentUsageStatus === "with_custodian"
+      ? custodianDisplayName
+      : "-");
+  const needsCustodianSync =
+    asset.usageType === "assigned_daily" &&
+    !asset.custodianName &&
+    (!!asset.responsiblePersonName || !!asset.picName);
+  // Custodian dan currentHolder adalah orang yang SAMA — jangan tampilkan
+  // dua blok berisi nama yang sama (membingungkan). "with_custodian" adalah
+  // penanda paling eksplisit; uid/name sama juga dianggap sama untuk data
+  // lama yang belum konsisten pakai currentUsageStatus.
+  const custodianIsCurrentHolder =
+    asset.currentUsageStatus === "with_custodian" ||
+    (!!asset.custodianUid && asset.custodianUid === asset.currentHolderUid) ||
+    (!!custodianDisplayName &&
+      custodianDisplayName !== "-" &&
+      custodianDisplayName === currentHolderDisplayName);
+
+  console.log("[Asset Detail Custodian]", {
+    assetId: asset.id,
+    usageType: asset.usageType,
+    currentUsageStatus: asset.currentUsageStatus,
+    custodianName: asset.custodianName,
+    responsiblePersonName: asset.responsiblePersonName,
+    picName: asset.picName,
+    currentHolderName: asset.currentHolderName,
+  });
+
+  const handleSyncCustodianFromResponsible = async () => {
+    const sourceUid = asset.responsiblePersonUid || asset.picUid || null;
+    const sourceName = asset.responsiblePersonName || asset.picName || null;
+    const sourceEmail = asset.responsiblePersonEmail || asset.picEmail || null;
+    setUsageSaving(true);
+    setUsageError("");
+    try {
+      await updateDoc(
+        doc(db, "assets", asset.id),
+        cleanFirestoreData({
+          custodianUid: sourceUid,
+          custodianName: sourceName,
+          custodianEmail: sourceEmail,
+          custodianDivision: asset.responsiblePersonDivision || null,
+          currentHolderUid: sourceUid,
+          currentHolderName: sourceName,
+          currentHolderEmail: sourceEmail,
+          currentHolderDivision: asset.responsiblePersonDivision || null,
+          currentUsageStatus: "with_custodian",
+          currentUsageStatusLabel: "Bersama Custodian",
+          updatedAt: serverTimestamp(),
+        }) as Record<string, unknown>
+      );
+      await writeAssetLog({
+        assetId: asset.id,
+        assetName: asset.assetName,
+        assetCode: asset.assetCode,
+        action: "custodian_changed",
+        userUid: assetUser?.uid || "",
+        userName: assetUser?.name || "",
+        toUid: sourceUid || undefined,
+        toName: sourceName || undefined,
+        custodianUid: sourceUid || undefined,
+        custodianName: sourceName || undefined,
+        detail: `Custodian disinkronkan dari Penanggung Jawab (${sourceName})`,
+      });
+    } catch (err) {
+      console.error("[AssetDetailPage] gagal sinkronkan custodian dari penanggung jawab", err);
+      setUsageError("Gagal menyinkronkan custodian. Coba lagi.");
+    } finally {
+      setUsageSaving(false);
+    }
+  };
+
+  const closeUsageModals = () => {
+    setCustodianModalOpen(false);
+    setHandoverModalOpen(false);
+    setForceModalOpen(false);
+    setSelectedUserUid("");
+    setHandoverPurpose("");
+    setHandoverExpectedReturnAt("");
+    setHandoverNote("");
+    setForceCorrectedUserUid("");
+    setForceNote("");
+    setUsageError("");
+  };
+
+  const handleAssignCustodian = async () => {
+    const selected = employeeOptions.find((u) => u.uid === selectedUserUid);
+    if (!selected) {
+      setUsageError("Pilih karyawan yang akan jadi custodian.");
+      return;
+    }
+    setUsageSaving(true);
+    setUsageError("");
+    try {
+      const payload = {
+        custodianUid: selected.uid,
+        custodianName: selected.name,
+        custodianEmail: selected.email || "",
+        custodianDivision: selected.divisionName || undefined,
+        custodianRole: selected.roleLabel || undefined,
+        currentHolderUid: selected.uid,
+        currentHolderName: selected.name,
+        currentUsageStatus: "with_custodian",
+      };
+      console.log("[Asset Custodian Submit]", {
+        usageType: "assigned_daily",
+        selectedCustodian: selected,
+        payload,
+      });
+      await assignCustodian({
+        asset,
+        custodianUid: selected.uid,
+        custodianName: selected.name,
+        custodianEmail: selected.email || "",
+        custodianDivision: selected.divisionName || undefined,
+        custodianRole: selected.roleLabel || undefined,
+        performedBy: { uid: assetUser?.uid || "", name: assetUser?.name || "" },
+      });
+      closeUsageModals();
+    } catch (err) {
+      console.error("[AssetDetailPage] gagal menetapkan custodian", err);
+      setUsageError("Gagal menetapkan custodian. Coba lagi.");
+    } finally {
+      setUsageSaving(false);
+    }
+  };
+
+  const handleHandoverTemporary = async () => {
+    const selected = employeeOptions.find((u) => u.uid === selectedUserUid);
+    if (!selected) {
+      setUsageError("Pilih siapa yang akan memakai aset ini.");
+      return;
+    }
+    if (!handoverPurpose.trim()) {
+      setUsageError("Keperluan wajib diisi.");
+      return;
+    }
+    setUsageSaving(true);
+    setUsageError("");
+    try {
+      await handoverTemporary({
+        asset,
+        toUid: selected.uid,
+        toName: selected.name,
+        toEmail: selected.email || undefined,
+        toDivision: selected.divisionName || undefined,
+        purpose: handoverPurpose.trim(),
+        expectedReturnAt: handoverExpectedReturnAt || undefined,
+        note: handoverNote.trim() || undefined,
+        performedBy: { uid: assetUser?.uid || "", name: assetUser?.name || "" },
+      });
+      closeUsageModals();
+    } catch (err) {
+      console.error("[AssetDetailPage] gagal menyerahkan aset sementara", err);
+      setUsageError("Gagal menyerahkan aset. Coba lagi.");
+    } finally {
+      setUsageSaving(false);
+    }
+  };
+
+  const handleReturnToCustodian = async () => {
+    setUsageSaving(true);
+    setUsageError("");
+    try {
+      await returnToCustodian({
+        asset,
+        performedBy: { uid: assetUser?.uid || "", name: assetUser?.name || "" },
+      });
+      setReturnConfirmOpen(false);
+    } catch (err) {
+      console.error("[AssetDetailPage] gagal mengembalikan aset ke custodian", err);
+      setUsageError("Gagal mengembalikan aset. Coba lagi.");
+    } finally {
+      setUsageSaving(false);
+    }
+  };
+
+  const handleForceReturnOrCorrect = async () => {
+    if (!forceNote.trim()) {
+      setUsageError("Catatan/alasan koreksi wajib diisi.");
+      return;
+    }
+    const corrected = employeeOptions.find((u) => u.uid === forceCorrectedUserUid);
+    setUsageSaving(true);
+    setUsageError("");
+    try {
+      await forceReturnOrCorrectHolder({
+        asset,
+        correctedHolderUid: corrected?.uid,
+        correctedHolderName: corrected?.name,
+        correctedHolderEmail: corrected?.email || undefined,
+        note: forceNote.trim(),
+        performedBy: { uid: assetUser?.uid || "", name: assetUser?.name || "" },
+      });
+      closeUsageModals();
+    } catch (err) {
+      console.error("[AssetDetailPage] gagal paksa kembalikan/koreksi pemakai", err);
+      setUsageError("Gagal memproses. Coba lagi.");
+    } finally {
+      setUsageSaving(false);
     }
   };
 
@@ -244,7 +575,7 @@ export default function AssetDetailPage() {
             </div>
           </Section>
 
-          {canManage && (
+          {canViewFinance && (
             <Section title="Finance / Bukti Pembelian">
               <div className="grid sm:grid-cols-2 gap-x-4 gap-y-2 text-sm">
                 <Info label="Tanggal Pembelian" value={formatDate(asset.purchaseDate)} />
@@ -266,6 +597,20 @@ export default function AssetDetailPage() {
                       Lihat file invoice
                     </a>
                   </div>
+                )}
+                {canEditFinance ? (
+                  <div className="sm:col-span-2 pt-2 border-t border-slate-100 mt-1">
+                    <Link
+                      href={`/assets/${asset.id}/edit`}
+                      className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                    >
+                      Edit Data Finance
+                    </Link>
+                  </div>
+                ) : (
+                  <p className="sm:col-span-2 text-xs text-slate-400 pt-2 border-t border-slate-100 mt-1">
+                    Data finance ditampilkan read-only untuk role Anda.
+                  </p>
                 )}
               </div>
             </Section>
@@ -300,7 +645,7 @@ export default function AssetDetailPage() {
             )}
           </Section>
 
-          <Section title="Log Aktivitas">
+          <Section title="Log Aktivitas" anchorId="log-aktivitas">
             {logs.length === 0 ? (
               <EmptyState icon={HistoryIcon} title="Belum ada log aktivitas" />
             ) : (
@@ -349,6 +694,127 @@ export default function AssetDetailPage() {
               )}
             </div>
           </Section>
+
+          {isFixedLocationAsset ? (
+            <Section title="Penempatan Aset">
+              <div className="flex flex-col gap-2.5">
+                <div>
+                  <Badge label="Aset Tetap Lokasi" colorClass="bg-slate-100 text-slate-600" />
+                </div>
+                <Info label="Lokasi" value={asset.locationText || asset.location} />
+                <Info label="PIC Lokasi" value={asset.custodianName || asset.responsiblePersonName} />
+                <Info label="Status" value="Tetap di Lokasi" />
+                <Info label="Kondisi" value={CONDITION_LABEL[asset.condition]} />
+                <Info label="Maintenance Terakhir" value={formatDate(asset.lastMaintenanceAt)} />
+                <div className="flex flex-col gap-2 pt-2 border-t border-slate-100 mt-1">
+                  <a
+                    href="#log-aktivitas"
+                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-500 hover:bg-slate-50"
+                  >
+                    <HistoryIcon size={14} />
+                    Lihat Riwayat
+                  </a>
+                </div>
+              </div>
+            </Section>
+          ) : (
+          <Section title="Pemakaian Aset">
+            <div className="flex flex-col gap-2.5">
+              <div>
+                <Badge
+                  label={
+                    asset.usageType ? ASSET_USAGE_TYPE_LABEL[asset.usageType] : "Aset Bersama"
+                  }
+                  colorClass="bg-slate-100 text-slate-600"
+                />
+              </div>
+              {asset.currentUsageStatus && (
+                <Badge
+                  label={ASSET_USAGE_STATUS_LABEL[asset.currentUsageStatus]}
+                  colorClass={ASSET_USAGE_STATUS_COLOR[asset.currentUsageStatus]}
+                />
+              )}
+              {custodianIsCurrentHolder ? (
+                <Info label="PIC / Pemegang Saat Ini" value={custodianDisplayName} />
+              ) : (
+                <>
+                  <Info label="PIC / Custodian" value={custodianDisplayName} />
+                  <Info label="Pemegang Saat Ini" value={currentHolderDisplayName} />
+                  <p className="text-xs text-amber-600 font-medium">Sedang dipakai sementara</p>
+                </>
+              )}
+              {canManage && needsCustodianSync && (
+                <button
+                  onClick={handleSyncCustodianFromResponsible}
+                  disabled={usageSaving}
+                  className="self-start text-xs font-medium text-blue-600 hover:underline disabled:opacity-60"
+                >
+                  {usageSaving ? "Menyinkronkan..." : "Sinkronkan Custodian dari Penanggung Jawab"}
+                </button>
+              )}
+              {usageError && <p className="text-xs text-red-600">{usageError}</p>}
+              {asset.currentUsageStatus === "temporary_used_by_other" && (
+                <>
+                  <Info label="Keperluan Sementara" value={asset.temporaryUsePurpose || undefined} />
+                  <Info
+                    label="Estimasi Kembali"
+                    value={
+                      asset.temporaryUseExpectedReturnAt
+                        ? formatDate(asset.temporaryUseExpectedReturnAt)
+                        : undefined
+                    }
+                  />
+                </>
+              )}
+
+              <div className="flex flex-col gap-2 pt-2 border-t border-slate-100 mt-1">
+                {canManage && (
+                  <button
+                    onClick={() => setCustodianModalOpen(true)}
+                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    <UserCog size={14} />
+                    {asset.custodianUid ? "Ubah Custodian" : "Tetapkan Custodian"}
+                  </button>
+                )}
+                {canHandover && asset.custodianUid && asset.currentUsageStatus !== "temporary_used_by_other" && (
+                  <button
+                    onClick={() => setHandoverModalOpen(true)}
+                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    <ArrowRightLeft size={14} />
+                    Serahkan Sementara
+                  </button>
+                )}
+                {canReturnToCustodian && asset.currentUsageStatus === "temporary_used_by_other" && (
+                  <button
+                    onClick={() => setReturnConfirmOpen(true)}
+                    className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 text-white px-3 py-2 text-sm font-medium hover:bg-emerald-700"
+                  >
+                    <Undo2 size={14} />
+                    Kembalikan ke Custodian
+                  </button>
+                )}
+                {canManage && asset.custodianUid && (
+                  <button
+                    onClick={() => setForceModalOpen(true)}
+                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700 hover:bg-red-100"
+                  >
+                    <ShieldAlert size={14} />
+                    Paksa Kembalikan / Koreksi Pemakai
+                  </button>
+                )}
+                <a
+                  href="#log-aktivitas"
+                  className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-500 hover:bg-slate-50"
+                >
+                  <HistoryIcon size={14} />
+                  Lihat Riwayat Pemakaian
+                </a>
+              </div>
+            </div>
+          </Section>
+          )}
 
           <Section title="Foto Aset">
             {photoImageSrc && !photoImgError ? (
@@ -464,6 +930,134 @@ export default function AssetDetailPage() {
         onConfirm={handleDeactivate}
         onCancel={() => setDeactivateOpen(false)}
       />
+
+      <ConfirmModal
+        open={custodianModalOpen}
+        title={asset.custodianUid ? "Ubah Custodian" : "Tetapkan Custodian"}
+        description="Custodian tidak perlu scan/pinjam setiap hari — aset ini akan berada langsung padanya."
+        confirmLabel={usageSaving ? "Menyimpan..." : "Tetapkan"}
+        onConfirm={handleAssignCustodian}
+        onCancel={closeUsageModals}
+      >
+        <div className="space-y-2">
+          <label className="block text-xs font-medium text-slate-500">Pilih Custodian</label>
+          <SearchableSelect
+            items={employeeSelectItems}
+            value={selectedUserUid}
+            onChange={setSelectedUserUid}
+            placeholder="Pilih karyawan"
+            searchPlaceholder="Cari nama karyawan..."
+            emptyText="Karyawan tidak ditemukan"
+          />
+          {usageError && <p className="text-sm text-red-600">{usageError}</p>}
+        </div>
+      </ConfirmModal>
+
+      <ConfirmModal
+        open={handoverModalOpen}
+        title="Serahkan Sementara"
+        description="Catat siapa yang sedang memegang aset ini sementara — begitu selesai, kembalikan lewat tombol Kembalikan ke Custodian."
+        confirmLabel={usageSaving ? "Menyimpan..." : "Serahkan"}
+        onConfirm={handleHandoverTemporary}
+        onCancel={closeUsageModals}
+      >
+        <div className="space-y-3">
+          <div>
+            <label className="block text-xs font-medium text-slate-500 mb-1">Dipakai oleh</label>
+            <SearchableSelect
+              items={employeeSelectItems}
+              value={selectedUserUid}
+              onChange={setSelectedUserUid}
+              placeholder="Pilih karyawan"
+              searchPlaceholder="Cari nama karyawan..."
+              emptyText="Karyawan tidak ditemukan"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-500 mb-1">
+              Keperluan <span className="text-red-500">*</span>
+            </label>
+            <input
+              value={handoverPurpose}
+              onChange={(e) => setHandoverPurpose(e.target.value)}
+              placeholder="mis. Konten Instagram acara kantor"
+              className="input text-sm"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-500 mb-1">Estimasi Kembali</label>
+            <input
+              type="date"
+              value={handoverExpectedReturnAt}
+              onChange={(e) => setHandoverExpectedReturnAt(e.target.value)}
+              className="input text-sm"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-500 mb-1">Catatan</label>
+            <textarea
+              value={handoverNote}
+              onChange={(e) => setHandoverNote(e.target.value)}
+              rows={2}
+              className="input text-sm"
+            />
+          </div>
+          {usageError && <p className="text-sm text-red-600">{usageError}</p>}
+        </div>
+      </ConfirmModal>
+
+      <ConfirmModal
+        open={returnConfirmOpen}
+        title="Kembalikan ke Custodian"
+        description={`Aset akan kembali ke pemegang tetapnya, ${asset.custodianName || "custodian"}.`}
+        confirmLabel={usageSaving ? "Menyimpan..." : "Kembalikan"}
+        onConfirm={handleReturnToCustodian}
+        onCancel={() => {
+          setReturnConfirmOpen(false);
+          setUsageError("");
+        }}
+      >
+        {usageError && <p className="text-sm text-red-600">{usageError}</p>}
+      </ConfirmModal>
+
+      <ConfirmModal
+        open={forceModalOpen}
+        title="Paksa Kembalikan / Koreksi Pemakai"
+        description="Dipakai kalau data pemakai salah atau barang tidak dikembalikan sesuai prosedur. Kosongkan pilihan user untuk paksa-kembalikan ke custodian."
+        confirmLabel={usageSaving ? "Menyimpan..." : "Proses"}
+        danger
+        onConfirm={handleForceReturnOrCorrect}
+        onCancel={closeUsageModals}
+      >
+        <div className="space-y-3">
+          <div>
+            <label className="block text-xs font-medium text-slate-500 mb-1">
+              Koreksi pemakai jadi (opsional)
+            </label>
+            <SearchableSelect
+              items={employeeSelectItems}
+              value={forceCorrectedUserUid}
+              onChange={setForceCorrectedUserUid}
+              placeholder="Paksa kembali ke custodian"
+              searchPlaceholder="Cari nama karyawan..."
+              emptyText="Karyawan tidak ditemukan"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-500 mb-1">
+              Catatan / Alasan <span className="text-red-500">*</span>
+            </label>
+            <textarea
+              value={forceNote}
+              onChange={(e) => setForceNote(e.target.value)}
+              rows={2}
+              placeholder="Jelaskan kenapa koreksi ini perlu dilakukan..."
+              className="input text-sm"
+            />
+          </div>
+          {usageError && <p className="text-sm text-red-600">{usageError}</p>}
+        </div>
+      </ConfirmModal>
     </ProtectedLayout>
   );
 }

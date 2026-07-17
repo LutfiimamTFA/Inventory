@@ -41,13 +41,13 @@ const NAV_ITEMS: NavItem[] = [
     href: "/dashboard",
     label: "Dashboard",
     icon: LayoutDashboard,
-    roles: ["super_admin", "asset_admin"],
+    roles: ["super_admin", "asset_admin", "asset_finance"],
   },
   {
     href: "/assets",
     label: "Assets",
     icon: Package,
-    roles: ["super_admin", "asset_admin"],
+    roles: ["super_admin", "asset_admin", "asset_finance"],
   },
   {
     href: "/categories",
@@ -65,7 +65,7 @@ const NAV_ITEMS: NavItem[] = [
     href: "/scan",
     label: "Scan QR",
     icon: QrCode,
-    roles: ["super_admin", "asset_admin", "it_team", "staff"],
+    roles: ["super_admin", "asset_admin", "it_team", "staff", "asset_finance"],
   },
   {
     href: "/my-borrowings",
@@ -89,13 +89,13 @@ const NAV_ITEMS: NavItem[] = [
     href: "/my-reports",
     label: "My Reports",
     icon: ClipboardCheck,
-    roles: ["staff"],
+    roles: ["staff", "asset_finance"],
   },
   {
     href: "/reports",
     label: "Reports",
     icon: FileBarChart,
-    roles: ["super_admin", "asset_admin"],
+    roles: ["super_admin", "asset_admin", "asset_finance"],
   },
   {
     href: "/access",
@@ -114,6 +114,7 @@ const NAV_ITEMS: NavItem[] = [
 const DEFAULT_ROUTE: Record<AppRole, string> = {
   super_admin: "/dashboard",
   asset_admin: "/dashboard",
+  asset_finance: "/dashboard",
   it_team: "/maintenance",
   staff: "/scan",
 };

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { collection, onSnapshot, orderBy, query } from "firebase/firestore";
 import { Search, ClipboardList } from "lucide-react";
 import { db } from "@/lib/firebase";
+import { useAuth } from "@/lib/auth-context";
 import { AssetBorrowing, BorrowingStatus } from "@/lib/types";
 import {
   BORROWING_STATUS_COLOR,
@@ -18,19 +19,29 @@ import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 
 export default function BorrowingsPage() {
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [borrowings, setBorrowings] = useState<AssetBorrowing[]>([]);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<BorrowingStatus | "">("");
 
   useEffect(() => {
+    if (!authReady) return;
     const q = query(collection(db, "asset_borrowings"), orderBy("borrowedAt", "desc"));
-    const unsub = onSnapshot(q, (snap) => {
-      setBorrowings(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))
-      );
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[BorrowingsPage Listener] asset_borrowings success:", snap.size);
+        setBorrowings(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing))
+        );
+      },
+      (error) => {
+        console.error("[BorrowingsPage Listener] asset_borrowings error:", error);
+      }
+    );
     return () => unsub();
-  }, []);
+  }, [authReady]);
 
   const filtered = borrowings.filter((b) => {
     if (

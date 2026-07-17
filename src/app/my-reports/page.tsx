@@ -18,22 +18,30 @@ import EmptyState from "@/components/EmptyState";
 import IssueTicketDetailModal from "@/components/IssueTicketDetailModal";
 
 export default function MyReportsPage() {
-  const { assetUser } = useAuth();
+  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
   const [detailTarget, setDetailTarget] = useState<AssetIssueTicket | null>(null);
 
   useEffect(() => {
-    if (!assetUser?.uid) return;
+    if (!authReady || !assetUser?.uid) return;
     const q = query(
       collection(db, "asset_issue_tickets"),
       where("reportedByUid", "==", assetUser.uid),
       orderBy("createdAt", "desc")
     );
-    const unsub = onSnapshot(q, (snap) => {
-      setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[MyReportsPage Listener] asset_issue_tickets success:", snap.size);
+        setTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket)));
+      },
+      (error) => {
+        console.error("[MyReportsPage Listener] asset_issue_tickets error:", error);
+      }
+    );
     return () => unsub();
-  }, [assetUser?.uid]);
+  }, [authReady, assetUser?.uid]);
 
   return (
     <ProtectedLayout>
