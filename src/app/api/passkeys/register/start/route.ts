@@ -74,7 +74,7 @@ export async function POST(req: NextRequest) {
       excludeCredentials,
       authenticatorSelection: {
         residentKey: "preferred",
-        userVerification: "required",
+        userVerification: "preferred",
       },
       preferredAuthenticatorType: "localDevice",
     });

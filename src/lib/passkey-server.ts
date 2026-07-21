@@ -12,6 +12,8 @@ import { getAdminAuth, getAdminFirestore } from "@/lib/firebase-admin";
 export const PASSKEY_CREDENTIALS_COLLECTION = "passkey_credentials";
 export const PASSKEY_CHALLENGES_COLLECTION = "passkey_challenges";
 export const PASSKEY_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+export const PASSKEY_PRODUCTION_ORIGIN = "https://qhse-care.vercel.app";
+export const PASSKEY_PRODUCTION_RP_ID = "qhse-care.vercel.app";
 export const PASSKEY_RP_NAME =
   process.env.PASSKEY_RP_NAME || process.env.NEXT_PUBLIC_PASSKEY_RP_NAME || "QHSE Care";
 
@@ -97,7 +99,8 @@ export function resolveWebAuthnConfig(req: NextRequest) {
     process.env.NEXT_PUBLIC_APP_URL ||
     process.env.NEXT_PUBLIC_SITE_URL ||
     process.env.APP_URL ||
-    (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+    (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "") ||
+    PASSKEY_PRODUCTION_ORIGIN;
 
   const forwardedProto = req.headers.get("x-forwarded-proto");
   const forwardedHost = req.headers.get("x-forwarded-host");
@@ -108,7 +111,7 @@ export function resolveWebAuthnConfig(req: NextRequest) {
   const rpID =
     process.env.PASSKEY_RP_ID ||
     process.env.NEXT_PUBLIC_PASSKEY_RP_ID ||
-    new URL(origin).hostname;
+    PASSKEY_PRODUCTION_RP_ID;
 
   return { origin, rpID };
 }

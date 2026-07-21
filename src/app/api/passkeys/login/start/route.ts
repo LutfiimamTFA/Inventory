@@ -50,7 +50,7 @@ export async function POST(req: NextRequest) {
     const options = await generateAuthenticationOptions({
       rpID,
       timeout: 60_000,
-      userVerification: "required",
+      userVerification: "preferred",
       allowCredentials: credentialsSnap.docs.map((doc) => {
         const data = doc.data() as StoredPasskeyCredential;
         return {
