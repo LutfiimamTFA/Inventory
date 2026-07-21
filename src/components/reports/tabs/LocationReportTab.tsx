@@ -86,7 +86,7 @@ export default function LocationReportTab({
 
   const handleExport = () => {
     exportToExcel(
-      `AssetView-Location-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Location-Report-${todayStamp()}.xlsx`,
       "Locations",
       rows.map((r) => ({
         Gedung: r.buildingName,

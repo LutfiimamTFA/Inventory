@@ -96,7 +96,7 @@ export default function TicketReportTab({ tickets }: { tickets: AssetIssueTicket
 
   const handleExport = () => {
     exportToExcel(
-      `AssetView-Ticket-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Ticket-Report-${todayStamp()}.xlsx`,
       "Tickets",
       tickets.map((t) => ({
         "Nomor Ticket": t.ticketNumber,

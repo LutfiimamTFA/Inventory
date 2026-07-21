@@ -236,7 +236,7 @@ export default function LocationFormModal({
               {editingNode ? `Edit ${LOCATION_TYPE_LABEL[locationType]}` : "Tambah Lokasi"}
             </h2>
             <p className="mt-1 text-sm text-slate-500">
-              Lengkapi informasi lokasi agar struktur AssetView tetap mudah ditelusuri.
+              Lengkapi informasi lokasi agar struktur QHSE Care tetap mudah ditelusuri.
             </p>
           </div>
           <button

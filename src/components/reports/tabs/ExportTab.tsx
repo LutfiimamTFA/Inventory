@@ -41,7 +41,7 @@ interface ExportTabProps {
 export default function ExportTab({ assets, tickets, workOrders, items, borrowings }: ExportTabProps) {
   const exportAssetHealth = () => {
     exportToExcel(
-      `AssetView-Asset-Health-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Asset-Health-Report-${todayStamp()}.xlsx`,
       "Asset Health",
       assets.map((asset) => {
         const assetTickets = tickets.filter((t) => t.assetId === asset.id);
@@ -70,7 +70,7 @@ export default function ExportTab({ assets, tickets, workOrders, items, borrowin
 
   const exportTickets = () => {
     exportToExcel(
-      `AssetView-Ticket-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Ticket-Report-${todayStamp()}.xlsx`,
       "Tickets",
       tickets.map((t) => ({
         "Nomor Ticket": t.ticketNumber,
@@ -87,7 +87,7 @@ export default function ExportTab({ assets, tickets, workOrders, items, borrowin
 
   const exportMaintenance = () => {
     exportToExcel(
-      `AssetView-Maintenance-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Maintenance-Report-${todayStamp()}.xlsx`,
       "Maintenance",
       workOrders.map((w) => {
         const progress = workOrderProgress(items.filter((i) => i.workOrderId === w.id));
@@ -106,7 +106,7 @@ export default function ExportTab({ assets, tickets, workOrders, items, borrowin
 
   const exportBorrowings = () => {
     exportToExcel(
-      `AssetView-Borrowing-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Borrowing-Report-${todayStamp()}.xlsx`,
       "Borrowings",
       borrowings.map((b) => ({
         Asset: b.assetName,
@@ -128,7 +128,7 @@ export default function ExportTab({ assets, tickets, workOrders, items, borrowin
       byLocation.get(key)!.push(a);
     });
     exportToExcel(
-      `AssetView-Location-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Location-Report-${todayStamp()}.xlsx`,
       "Locations",
       Array.from(byLocation.entries()).map(([location, locAssets]) => ({
         Lokasi: location,
@@ -141,7 +141,7 @@ export default function ExportTab({ assets, tickets, workOrders, items, borrowin
 
   const exportCost = () => {
     exportToExcel(
-      `AssetView-Cost-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Cost-Report-${todayStamp()}.xlsx`,
       "Cost",
       assets.map((a) => ({
         Asset: a.assetName,

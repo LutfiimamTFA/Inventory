@@ -61,7 +61,7 @@ export async function POST(req: NextRequest) {
             notification: { title, body: message },
             webpush: {
               fcmOptions: linkUrl ? { link: linkUrl } : undefined,
-              notification: { icon: "/logo.png" },
+              notification: { icon: "/qhse-care-icon.png" },
             },
           });
           sent += 1;

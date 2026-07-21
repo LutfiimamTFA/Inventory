@@ -78,7 +78,7 @@ export default function CostReportTab({
 
   const handleExport = () => {
     exportToExcel(
-      `AssetView-Cost-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Cost-Report-${todayStamp()}.xlsx`,
       "Cost",
       rows.map((r) => ({
         Asset: r.asset.assetName,

@@ -285,7 +285,7 @@ export default function AccessPage() {
     <ProtectedLayout>
       <PageHeader
         title="User Access"
-        subtitle="Kelola akses Super Admin, Asset Admin/QHSE, Tim IT, dan Staff di AssetView."
+        subtitle="Kelola akses Super Admin, Asset Admin/QHSE, Tim IT, dan Staff di QHSE Care."
         actions={
           <button
             type="button"
@@ -380,8 +380,8 @@ export default function AccessPage() {
                   <th className="px-4 py-3 font-semibold">Email</th>
                   <th className="px-4 py-3 font-semibold">Divisi</th>
                   <th className="px-4 py-3 font-semibold">Jabatan</th>
-                  <th className="px-4 py-3 font-semibold">Role AssetView</th>
-                  <th className="px-4 py-3 font-semibold">Status AssetView</th>
+                  <th className="px-4 py-3 font-semibold">Role QHSE Care</th>
+                  <th className="px-4 py-3 font-semibold">Status QHSE Care</th>
                   <th className="px-4 py-3 font-semibold">Last Login</th>
                   <th className="px-4 py-3 font-semibold text-right">Aksi</th>
                 </tr>
@@ -480,7 +480,7 @@ export default function AccessPage() {
             ? `${pending.target.name} akan diubah rolenya menjadi ${ROLE_LABEL[pending.newRole]}.`
             : `${pending?.target.name} akan ${
                 pending?.newStatus === "active" ? "diaktifkan" : "dinonaktifkan"
-              } aksesnya di AssetView.`
+              } aksesnya di QHSE Care.`
         }
         confirmLabel={processing ? "Memproses..." : "Konfirmasi"}
         danger={pending?.type === "status" && pending.newStatus === "inactive"}

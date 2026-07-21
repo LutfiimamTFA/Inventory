@@ -18,6 +18,19 @@ export const ROLE_BADGE_COLOR: Record<AppRole, string> = {
   staff: "bg-slate-100 text-slate-500 border-slate-200",
 };
 
+export const DEFAULT_ROUTE_BY_ROLE: Record<AppRole, string> = {
+  super_admin: "/dashboard",
+  asset_admin: "/dashboard",
+  asset_finance: "/assets",
+  location_pic: "/dashboard",
+  it_team: "/maintenance",
+  staff: "/scan",
+};
+
+export function getDefaultRouteForRole(role?: AppRole | null) {
+  return role ? DEFAULT_ROUTE_BY_ROLE[role] : "/login";
+}
+
 export function getAssetRoleHelpers(currentAssetUser?: Pick<AssetUser, "role"> | null) {
   const isSuperAdminRole = currentAssetUser?.role === "super_admin";
   const isAssetAdminRole = currentAssetUser?.role === "asset_admin";

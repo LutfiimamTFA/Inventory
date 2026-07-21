@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  Boxes,
   LayoutDashboard,
   Package,
   Tags,
@@ -28,8 +27,9 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
 import { AppRole } from "@/lib/types";
-import { ROLE_LABEL } from "@/lib/roles";
+import { getDefaultRouteForRole, ROLE_LABEL } from "@/lib/roles";
 import NotificationBell from "@/components/NotificationBell";
+import PasskeyActivationPrompt from "@/components/PasskeyActivationPrompt";
 
 interface NavItem {
   href: string;
@@ -121,18 +121,9 @@ const NAV_ITEMS: NavItem[] = [
     href: "/settings",
     label: "Settings",
     icon: Settings,
-    roles: ["super_admin"],
+    roles: ["super_admin", "asset_admin", "asset_finance", "location_pic", "it_team", "staff"],
   },
 ];
-
-const DEFAULT_ROUTE: Record<AppRole, string> = {
-  super_admin: "/dashboard",
-  asset_admin: "/dashboard",
-  asset_finance: "/dashboard",
-  location_pic: "/dashboard",
-  it_team: "/maintenance",
-  staff: "/scan",
-};
 
 const SIDEBAR_COLLAPSED_KEY = "assetview_sidebar_collapsed";
 const SIDEBAR_EXPANDED_WIDTH = 260;
@@ -186,7 +177,7 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
       (item) => item.roles.includes(role) && pathname.startsWith(item.href)
     );
     if (!allowed) {
-      router.replace(DEFAULT_ROUTE[role]);
+      router.replace(getDefaultRouteForRole(role));
     }
   }, [loading, role, pathname, router]);
 
@@ -195,7 +186,7 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
       <div className="flex flex-1 items-center justify-center min-h-screen bg-slate-50">
         <div className="flex flex-col items-center gap-3">
           <div className="h-9 w-9 rounded-full border-2 border-slate-200 border-t-slate-900 animate-spin" />
-          <p className="text-slate-400 text-sm">Memuat AssetView...</p>
+          <p className="text-slate-400 text-sm">Memuat QHSE Care...</p>
         </div>
       </div>
     );
@@ -213,14 +204,16 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
             isCollapsed ? "justify-center px-2" : "gap-2.5 px-5"
           }`}
         >
-          <div className="h-9 w-9 shrink-0 rounded-xl bg-gradient-to-br from-blue-500 to-teal-400 flex items-center justify-center shadow-md shadow-blue-500/20">
-            <Boxes size={19} className="text-white" />
-          </div>
+          <img
+            src="/qhse-care-icon.png"
+            alt="QHSE Care"
+            className="h-9 w-9 shrink-0 rounded-xl object-cover shadow-md shadow-blue-500/20"
+          />
           {!isCollapsed && (
             <div className="min-w-0 overflow-hidden">
-              <p className="text-slate-900 font-semibold leading-tight truncate">AssetView</p>
+              <p className="text-slate-900 font-semibold leading-tight truncate">QHSE Care</p>
               <p className="text-[11px] text-slate-400 leading-tight truncate">
-                Asset Management
+                Safety & Maintenance
               </p>
             </div>
           )}
@@ -349,6 +342,8 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
         </TopbarAndMain>
       </div>
 
+      <PasskeyActivationPrompt />
+
       {isStaff && (
         <nav className="fixed bottom-0 inset-x-0 z-30 md:hidden bg-white border-t border-slate-200 flex items-stretch">
           <Link
@@ -431,7 +426,7 @@ function TopbarAndMain({
         </button>
 
         <div className="hidden sm:flex items-center gap-1.5 text-sm text-slate-400">
-          <span>AssetView</span>
+          <span>QHSE Care</span>
           {currentNav && (
             <>
               <ChevronRight size={14} />

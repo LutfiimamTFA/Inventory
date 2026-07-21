@@ -148,7 +148,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setRole(null);
           setAccessDenied(true);
           setAccessDeniedReason(
-            "Akun Anda belum terdaftar di AssetView. Hubungi Super Admin untuk mendapatkan akses."
+            "Akun Anda belum terdaftar di QHSE Care. Hubungi Super Admin untuk mendapatkan akses."
           );
           return;
         }
@@ -171,7 +171,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setAssetUser(null);
           setRole(null);
           setAccessDenied(true);
-          setAccessDeniedReason("Gagal membuat akses bootstrap AssetView.");
+          setAccessDeniedReason("Gagal membuat akses bootstrap QHSE Care.");
           return;
         }
         setAssetUser({ uid: user.uid, ...createdData });
@@ -183,7 +183,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setAccessDenied(true);
         setAccessDeniedReason(
           isPermissionDenied(err)
-            ? "Tidak bisa membaca data akses AssetView. Periksa Firestore Rules."
+            ? "Tidak bisa membaca data akses QHSE Care. Periksa Firestore Rules."
             : "Terjadi kesalahan saat memvalidasi akun."
         );
       } finally {

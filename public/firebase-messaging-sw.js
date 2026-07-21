@@ -1,4 +1,4 @@
-/* Service worker AssetView untuk background web push (Firebase Cloud Messaging).
+/* Service worker QHSE Care untuk background web push (Firebase Cloud Messaging).
    Nilai di bawah ini adalah Firebase client config publik (NEXT_PUBLIC_*),
    sama seperti yang sudah ada di bundle client — bukan rahasia. */
 importScripts("https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js");
@@ -16,13 +16,14 @@ firebase.initializeApp({
 const messaging = firebase.messaging();
 
 messaging.onBackgroundMessage((payload) => {
-  const title = payload.notification?.title || "AssetView";
+  const title = payload.notification?.title || "QHSE Care";
   const body = payload.notification?.body || "";
   const link = payload.fcmOptions?.link || payload.data?.linkUrl || "/notifications";
 
   self.registration.showNotification(title, {
     body,
-    icon: "/logo.png",
+    icon: "/qhse-care-icon.png",
+    badge: "/qhse-care-icon.png",
     data: { link },
   });
 });

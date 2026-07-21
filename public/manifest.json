@@ -1,0 +1,21 @@
+{
+  "name": "QHSE Care",
+  "short_name": "QHSE Care",
+  "description": "Safety, Asset & Maintenance System",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#06b6d4",
+  "icons": [
+    {
+      "src": "/qhse-care-icon.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/qhse-care-icon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

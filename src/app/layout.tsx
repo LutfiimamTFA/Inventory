@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { AuthProvider } from "@/lib/auth-context";
@@ -14,8 +14,18 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "AssetView — Company Asset Management",
-  description: "Pendataan dan pelacakan aset perusahaan",
+  title: "QHSE Care",
+  description: "Safety, Asset & Maintenance System",
+  manifest: "/manifest.json",
+  icons: {
+    icon: "/qhse-care-icon.png",
+    shortcut: "/qhse-care-icon.png",
+    apple: "/qhse-care-icon.png",
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: "#06b6d4",
 };
 
 export default function RootLayout({

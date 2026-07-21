@@ -592,6 +592,17 @@ service cloud.firestore {
       allow update, delete: if isActiveAssetUser() && resource.data.uid == request.auth.uid;
     }
 
+    // Passkey/WebAuthn credential dan challenge hanya boleh diakses via
+    // Next.js API route dengan Firebase Admin. Data biometrik TIDAK disimpan
+    // di sini; collection ini hanya berisi public credential yang aman.
+    match /passkey_credentials/{credentialId} {
+      allow read, write: if false;
+    }
+
+    match /passkey_challenges/{challengeId} {
+      allow read, write: if false;
+    }
+
     // asset_report_snapshots: snapshot bulanan Reports & Analytics, dibuat
     // oleh Super Admin/Asset Admin dari halaman /reports.
     match /asset_report_snapshots/{snapshotId} {

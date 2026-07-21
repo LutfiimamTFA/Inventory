@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
+import { getDefaultRouteForRole } from "@/lib/roles";
 
 export default function Home() {
   const { firebaseUser, role, loading } = useAuth();
@@ -14,14 +15,12 @@ export default function Home() {
       router.replace("/login");
       return;
     }
-    router.replace(
-      role === "staff" ? "/scan" : role === "it_team" ? "/maintenance" : "/dashboard"
-    );
+    router.replace(getDefaultRouteForRole(role));
   }, [loading, firebaseUser, role, router]);
 
   return (
     <div className="flex flex-1 items-center justify-center">
-      <p className="text-slate-400 text-sm">Memuat AssetView...</p>
+      <p className="text-slate-400 text-sm">Memuat QHSE Care...</p>
     </div>
   );
 }

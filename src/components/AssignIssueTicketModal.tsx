@@ -493,7 +493,7 @@ export default function AssignIssueTicketModal({
                     Penanggung Jawab / Petugas <span className="text-red-500">*</span>
                   </label>
                   <input value={manualName} onChange={(e) => setManualName(e.target.value)} className="input" placeholder="Nama petugas" />
-                  <p className="mt-1 text-[11px] text-slate-400">Belum ada daftar akun untuk tim ini di AssetView — diisi manual.</p>
+                  <p className="mt-1 text-[11px] text-slate-400">Belum ada daftar akun untuk tim ini di QHSE Care — diisi manual.</p>
                 </div>
               )}
 

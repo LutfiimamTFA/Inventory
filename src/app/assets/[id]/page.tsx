@@ -915,7 +915,7 @@ export default function AssetDetailPage() {
                 <button
                   onClick={() =>
                     exportToExcel(
-                      `AssetView-Asset-Report-${asset.assetCode}-${todayStamp()}.xlsx`,
+                      `QHSE-Care-Asset-Report-${asset.assetCode}-${todayStamp()}.xlsx`,
                       "Asset Report",
                       [
                         {

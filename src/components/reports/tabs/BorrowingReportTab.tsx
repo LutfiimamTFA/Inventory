@@ -56,7 +56,7 @@ export default function BorrowingReportTab({ borrowings }: { borrowings: AssetBo
 
   const handleExport = () => {
     exportToExcel(
-      `AssetView-Borrowing-Report-${todayStamp()}.xlsx`,
+      `QHSE-Care-Borrowing-Report-${todayStamp()}.xlsx`,
       "Borrowings",
       borrowings.map((b) => ({
         Asset: b.assetName,
