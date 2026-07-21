@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   PASSKEY_CREDENTIALS_COLLECTION,
   getAdminServices,
+  passkeyAdminUnavailableError,
   passkeyJsonError,
   requireFirebaseUser,
   type StoredPasskeyCredential,
@@ -19,7 +20,7 @@ export async function GET(req: NextRequest) {
 
   const services = getAdminServices();
   if (!services) {
-    return passkeyJsonError("Firebase Admin belum dikonfigurasi untuk passkey.", 500);
+    return passkeyAdminUnavailableError();
   }
 
   try {
@@ -54,7 +55,7 @@ export async function DELETE(req: NextRequest) {
 
   const services = getAdminServices();
   if (!services) {
-    return passkeyJsonError("Firebase Admin belum dikonfigurasi untuk passkey.", 500);
+    return passkeyAdminUnavailableError();
   }
 
   let body: RevokeBody;

@@ -53,14 +53,42 @@ export function passkeyJsonError(message: string, status = 400) {
   return NextResponse.json({ success: false, message }, { status });
 }
 
+export function getMissingPasskeyServerEnv() {
+  const required = [
+    "FIREBASE_PROJECT_ID",
+    "FIREBASE_CLIENT_EMAIL",
+    "FIREBASE_PRIVATE_KEY",
+  ];
+
+  return required.filter((key) => !process.env[key]);
+}
+
+export function getPasskeyAdminUnavailableMessage() {
+  const missing = getMissingPasskeyServerEnv();
+  if (missing.length > 0) {
+    return `Firebase Admin belum lengkap di Vercel. Missing env: ${missing.join(", ")}`;
+  }
+
+  return "Firebase Admin gagal initialize. Periksa format FIREBASE_PRIVATE_KEY di Vercel.";
+}
+
+export function passkeyAdminUnavailableError() {
+  return passkeyJsonError(getPasskeyAdminUnavailableMessage(), 500);
+}
+
 export function normalizeEmail(email?: string | null) {
   return (email || "").trim().toLowerCase();
 }
 
 export function getAdminServices() {
+  if (getMissingPasskeyServerEnv().length > 0) return null;
+
   const firestore = getAdminFirestore();
+  if (!firestore) return null;
+
   const auth = getAdminAuth();
-  if (!firestore || !auth) return null;
+  if (!auth) return null;
+
   return { firestore, auth };
 }
 
@@ -71,10 +99,7 @@ export async function requireFirebaseUser(req: NextRequest): Promise<
   const services = getAdminServices();
   if (!services) {
     return {
-      response: passkeyJsonError(
-        "Firebase Admin belum dikonfigurasi untuk passkey.",
-        500
-      ),
+      response: passkeyAdminUnavailableError(),
     };
   }
 

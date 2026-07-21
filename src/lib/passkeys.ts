@@ -120,6 +120,10 @@ export async function registerPasskey(firebaseUser: User, currentUserName?: stri
       displayName: currentUserName || firebaseUser.displayName || firebaseUser.email,
     }),
   });
+  console.log("[Passkey Register Start]", {
+    status: startRes.status,
+    ok: startRes.ok,
+  });
 
   const options = await readJson<PublicKeyCredentialCreationOptionsJSON>(startRes);
   const credential: RegistrationResponseJSON = await startRegistration({
@@ -136,6 +140,10 @@ export async function registerPasskey(firebaseUser: User, currentUserName?: stri
       uid: firebaseUser.uid,
       credential,
     }),
+  });
+  console.log("[Passkey Register Finish]", {
+    status: finishRes.status,
+    ok: finishRes.ok,
   });
 
   const result = await readJson<RegisterFinishResult>(finishRes);
@@ -228,9 +236,24 @@ export function friendlyPasskeyError(error: unknown, fallback: string) {
 }
 
 async function readJson<T>(res: Response): Promise<T> {
-  const data = await res.json().catch(() => null);
-  if (!res.ok) {
-    throw new Error(data?.message || "Request passkey gagal.");
+  const contentType = res.headers.get("content-type") || "";
+  let data: { message?: string } | null = null;
+  let rawText = "";
+
+  if (contentType.includes("application/json")) {
+    data = await res.json().catch(() => null);
+  } else {
+    rawText = await res.text().catch(() => "");
   }
+
+  if (!res.ok) {
+    const message =
+      data?.message ||
+      rawText.slice(0, 300) ||
+      `Request passkey gagal. Status: ${res.status}`;
+
+    throw new Error(message);
+  }
+
   return data as T;
 }

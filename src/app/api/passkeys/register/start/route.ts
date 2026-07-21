@@ -5,6 +5,7 @@ import {
   PASSKEY_RP_NAME,
   getAdminServices,
   normalizeEmail,
+  passkeyAdminUnavailableError,
   passkeyJsonError,
   requireFirebaseUser,
   resolveWebAuthnConfig,
@@ -26,7 +27,7 @@ export async function POST(req: NextRequest) {
 
   const services = getAdminServices();
   if (!services) {
-    return passkeyJsonError("Firebase Admin belum dikonfigurasi untuk passkey.", 500);
+    return passkeyAdminUnavailableError();
   }
 
   let body: RegisterStartBody;

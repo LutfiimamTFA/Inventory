@@ -10,22 +10,33 @@ let adminApp: App | undefined;
 function getAdminApp(): App | undefined {
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+  const rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
 
-  if (!projectId || !clientEmail || !privateKey) {
-    console.warn("[Firebase Admin] env belum lengkap, push notification dilewati");
+  if (!projectId || !clientEmail || !rawPrivateKey) {
+    console.error("[Firebase Admin] Env belum lengkap:", {
+      hasProjectId: !!projectId,
+      hasClientEmail: !!clientEmail,
+      hasPrivateKey: !!rawPrivateKey,
+    });
     return undefined;
   }
 
-  if (getApps().length > 0) {
-    adminApp = getApps()[0];
-    return adminApp;
-  }
+  const privateKey = rawPrivateKey.replace(/\\n/g, "\n");
 
-  adminApp = initializeApp({
-    credential: cert({ projectId, clientEmail, privateKey }),
-  });
-  return adminApp;
+  try {
+    if (getApps().length > 0) {
+      adminApp = getApps()[0];
+      return adminApp;
+    }
+
+    adminApp = initializeApp({
+      credential: cert({ projectId, clientEmail, privateKey }),
+    });
+    return adminApp;
+  } catch (error) {
+    console.error("[Firebase Admin] gagal initialize:", error);
+    return undefined;
+  }
 }
 
 export function getAdminMessaging() {
