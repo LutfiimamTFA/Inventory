@@ -38,7 +38,7 @@ interface AccessRow {
   lastLoginAt?: unknown;
 }
 
-const ASSIGNABLE_ROLES: AppRole[] = ["staff", "asset_admin", "asset_finance", "it_team"];
+const ASSIGNABLE_ROLES: AppRole[] = ["staff", "asset_admin", "asset_finance", "location_pic", "it_team"];
 
 type PendingAction =
   | { type: "role"; target: AccessRow; newRole: AppRole }
@@ -181,6 +181,7 @@ export default function AccessPage() {
     superAdmin: rows.filter((r) => r.role === "super_admin").length,
     assetAdmin: rows.filter((r) => r.role === "asset_admin").length,
     assetFinance: rows.filter((r) => r.role === "asset_finance").length,
+    locationPic: rows.filter((r) => r.role === "location_pic").length,
     itTeam: rows.filter((r) => r.role === "it_team").length,
     staff: rows.filter((r) => r.role === "staff").length,
     inactive: rows.filter((r) => !r.isDefaultStaff && r.effectiveStatus === "inactive").length,
@@ -298,11 +299,12 @@ export default function AccessPage() {
         }
       />
 
-      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-7 gap-3 mb-5">
+      <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3 mb-5">
         <CounterCard label="Total Karyawan Aktif" value={counters.total} />
         <CounterCard label="Super Admin" value={counters.superAdmin} tone="purple" />
         <CounterCard label="Asset Admin" value={counters.assetAdmin} tone="blue" />
         <CounterCard label="Asset Finance" value={counters.assetFinance} tone="amber" />
+        <CounterCard label="PIC Lokasi" value={counters.locationPic} tone="emerald" />
         <CounterCard label="Tim IT" value={counters.itTeam} tone="emerald" />
         <CounterCard label="Staff" value={counters.staff} tone="slate" />
         <CounterCard label="Inactive" value={counters.inactive} tone="red" />
@@ -330,6 +332,7 @@ export default function AccessPage() {
           <option value="super_admin">Super Admin</option>
           <option value="asset_admin">Asset Admin</option>
           <option value="asset_finance">Asset Finance</option>
+          <option value="location_pic">PIC Lokasi</option>
           <option value="it_team">Tim IT</option>
           <option value="staff">Staff</option>
         </select>

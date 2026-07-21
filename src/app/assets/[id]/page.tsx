@@ -84,11 +84,24 @@ export default function AssetDetailPage() {
   const [usageError, setUsageError] = useState("");
 
   const canManage = role === "super_admin" || role === "asset_admin";
-  // Section E — Finance/Bukti Pembelian: Super Admin/Asset Finance/Asset
-  // Admin boleh LIHAT (Asset Admin read-only, tidak wajib tahu harga tapi
-  // boleh cek); hanya Super Admin/Asset Finance yang boleh EDIT.
-  const canViewFinance = role === "super_admin" || role === "asset_admin" || role === "asset_finance";
-  const canEditFinance = role === "super_admin" || role === "asset_finance";
+  // Finance/Bukti Pembelian: HANYA Super Admin & Asset Finance yang boleh
+  // melihat/mengedit — Asset Admin/QHSE, Staff, Tim IT tidak boleh melihat
+  // nominal harga sama sekali (lihat spec "data Finance hanya tampil untuk
+  // role Asset Finance").
+  const canViewFinance = role === "super_admin" || role === "asset_finance";
+  // Section H — badge status finance, HANYA untuk yang boleh lihat finance
+  // (Asset Admin/QHSE dapat versi tanpa nominal, lihat Section "Status" di
+  // bawah).
+  const financeStatusBadge = !asset
+    ? { label: "Perlu Dilengkapi", colorClass: "bg-slate-100 text-slate-500 border-slate-200" }
+    : asset.financeStatus === "complete" ||
+      (asset.purchasePrice && asset.invoiceNumber)
+    ? { label: "Data Finance Lengkap", colorClass: "bg-emerald-50 text-emerald-700 border-emerald-200" }
+    : !asset.purchasePrice
+    ? { label: "Belum Ada Harga", colorClass: "bg-amber-50 text-amber-700 border-amber-200" }
+    : !asset.invoiceNumber && !asset.invoiceFileUrl
+    ? { label: "Belum Ada Invoice", colorClass: "bg-amber-50 text-amber-700 border-amber-200" }
+    : { label: "Perlu Dilengkapi", colorClass: "bg-slate-100 text-slate-500 border-slate-200" };
   // Custodian/currentHolder boleh serah-terima & kembalikan sendiri — rules
   // Firestore (isCustodianOrHolderUsageUpdate) sudah menegakkan ini di sisi
   // server, guard di UI ini cuma supaya tombolnya tidak nyasar ditampilkan.
@@ -578,6 +591,9 @@ export default function AssetDetailPage() {
           {canViewFinance && (
             <Section title="Finance / Bukti Pembelian">
               <div className="grid sm:grid-cols-2 gap-x-4 gap-y-2 text-sm">
+                <div className="sm:col-span-2">
+                  <Badge label={financeStatusBadge.label} colorClass={financeStatusBadge.colorClass} />
+                </div>
                 <Info label="Tanggal Pembelian" value={formatDate(asset.purchaseDate)} />
                 <Info label="Harga Beli" value={formatCurrency(asset.purchasePrice)} />
                 <Info label="Vendor" value={asset.vendorName} />
@@ -598,20 +614,14 @@ export default function AssetDetailPage() {
                     </a>
                   </div>
                 )}
-                {canEditFinance ? (
-                  <div className="sm:col-span-2 pt-2 border-t border-slate-100 mt-1">
-                    <Link
-                      href={`/assets/${asset.id}/edit`}
-                      className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
-                    >
-                      Edit Data Finance
-                    </Link>
-                  </div>
-                ) : (
-                  <p className="sm:col-span-2 text-xs text-slate-400 pt-2 border-t border-slate-100 mt-1">
-                    Data finance ditampilkan read-only untuk role Anda.
-                  </p>
-                )}
+                <div className="sm:col-span-2 pt-2 border-t border-slate-100 mt-1">
+                  <Link
+                    href={`/assets/${asset.id}/edit`}
+                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Edit Data Finance
+                  </Link>
+                </div>
               </div>
             </Section>
           )}
@@ -692,6 +702,12 @@ export default function AssetDetailPage() {
               {asset.operationalNotes && (
                 <p className="text-xs text-slate-400">{asset.operationalNotes}</p>
               )}
+              {!canViewFinance && asset.financeStatus !== "complete" && (
+                <Badge
+                  label="Data finance belum dilengkapi"
+                  colorClass="bg-slate-100 text-slate-500 border-slate-200"
+                />
+              )}
             </div>
           </Section>
 
@@ -734,11 +750,14 @@ export default function AssetDetailPage() {
                   colorClass={ASSET_USAGE_STATUS_COLOR[asset.currentUsageStatus]}
                 />
               )}
+              {asset.areaPicName && (
+                <Info label="PIC Lokasi" value={asset.areaPicName} />
+              )}
               {custodianIsCurrentHolder ? (
-                <Info label="PIC / Pemegang Saat Ini" value={custodianDisplayName} />
+                <Info label="Pemegang Harian / Saat Ini" value={custodianDisplayName} />
               ) : (
                 <>
-                  <Info label="PIC / Custodian" value={custodianDisplayName} />
+                  <Info label="Custodian / Pemegang Harian" value={custodianDisplayName} />
                   <Info label="Pemegang Saat Ini" value={currentHolderDisplayName} />
                   <p className="text-xs text-amber-600 font-medium">Sedang dipakai sementara</p>
                 </>
@@ -881,7 +900,9 @@ export default function AssetDetailPage() {
                 <Info label="Total Peminjaman" value={String(borrowings.length)} />
                 <Info label="Last Maintenance" value={formatDate(asset.lastMaintenanceAt)} />
                 <Info label="Next Maintenance" value={formatDate(asset.nextMaintenanceAt)} />
-                <Info label="Total Nilai Beli" value={formatCurrency(asset.purchasePrice)} />
+                {canViewFinance && (
+                  <Info label="Total Nilai Beli" value={formatCurrency(asset.purchasePrice)} />
+                )}
               </div>
               <div className="flex gap-2">
                 <Link

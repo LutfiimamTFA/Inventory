@@ -62,6 +62,16 @@ const TABS: { key: TabKey; label: string }[] = [
 export default function ReportsPage() {
   const { firebaseUser, assetUser, role, loading } = useAuth();
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
+
+  // Section A — Recharts menghasilkan id SVG (clipPath, dst) yang beda
+  // antara render server dan client (counter internal Recharts tidak
+  // deterministic lintas proses), jadi chart WAJIB baru dirender setelah
+  // client mounted — bukan langsung ikut initial render/hydration.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    Promise.resolve().then(() => setMounted(true));
+  }, []);
+
   const [activeTab, setActiveTab] = useState<TabKey>("overview");
   const [filters, setFilters] = useState(DEFAULT_REPORT_FILTERS);
 
@@ -170,6 +180,33 @@ export default function ReportsPage() {
     console.debug("[Reports] filters", filters);
   }, [filters]);
 
+  // Debug SEMENTARA (hapus setelah overflow mobile terkonfirmasi beres) —
+  // cari elemen mana persis di dalam .reports-page yang scrollWidth-nya
+  // lebih lebar dari clientWidth-nya.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (window.innerWidth >= 768) return;
+
+    const overflowing = Array.from(document.querySelectorAll(".reports-page *"))
+      .filter((el) => {
+        const element = el as HTMLElement;
+        return element.scrollWidth > element.clientWidth + 2;
+      })
+      .slice(0, 30)
+      .map((el) => {
+        const element = el as HTMLElement;
+        return {
+          tag: element.tagName,
+          className: element.className,
+          scrollWidth: element.scrollWidth,
+          clientWidth: element.clientWidth,
+          text: element.textContent?.slice(0, 60),
+        };
+      });
+
+    console.log("[Reports Mobile Overflow Debug]", overflowing);
+  }, []);
+
   const { from: dateFrom, to: dateTo } = useMemo(
     () => resolveDateRange(filters.datePreset, filters.customFrom, filters.customTo),
     [filters.datePreset, filters.customFrom, filters.customTo]
@@ -182,7 +219,7 @@ export default function ReportsPage() {
   const filteredAssetIds = useMemo(() => new Set(filteredAssets.map((a) => a.id)), [filteredAssets]);
 
   const filteredTickets = useMemo(
-    () => tickets.filter((t) => filteredAssetIds.has(t.assetId)),
+    () => tickets.filter((t) => !!t.assetId && filteredAssetIds.has(t.assetId)),
     [tickets, filteredAssetIds]
   );
   const filteredWorkOrders = useMemo(
@@ -220,8 +257,28 @@ export default function ReportsPage() {
     }
   };
 
+  // Skeleton sebelum client mounted — markup-nya SENGAJA sederhana dan sama
+  // persis di server maupun client pass pertama, supaya tidak ada apapun
+  // yang bisa mismatch. Chart/tab sungguhan baru dirender sesudah ini.
+  if (!mounted) {
+    return (
+      <ProtectedLayout>
+        <div className="reports-page min-h-screen w-full max-w-full overflow-x-hidden bg-slate-50 px-4 pb-[calc(7rem+env(safe-area-inset-bottom))] pt-4 md:px-6 md:pb-6 md:pt-0">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+            <div className="h-24 rounded-2xl bg-white shadow-sm" />
+            <div className="h-24 rounded-2xl bg-white shadow-sm" />
+            <div className="h-24 rounded-2xl bg-white shadow-sm" />
+            <div className="h-24 rounded-2xl bg-white shadow-sm" />
+          </div>
+          <div className="mt-4 h-64 rounded-2xl bg-white shadow-sm" />
+        </div>
+      </ProtectedLayout>
+    );
+  }
+
   return (
     <ProtectedLayout>
+      <div className="reports-page min-h-screen w-full max-w-full overflow-x-hidden bg-slate-50 px-4 pb-[calc(7rem+env(safe-area-inset-bottom))] pt-4 md:px-6 md:pb-6 md:pt-0">
       <PageHeader
         title="Reports & Analytics"
         subtitle="Analisis data asset untuk pengambilan keputusan."
@@ -295,6 +352,7 @@ export default function ReportsPage() {
           borrowings={filteredBorrowings}
         />
       )}
+      </div>
     </ProtectedLayout>
   );
 }

@@ -1,14 +1,17 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { collection, onSnapshot, orderBy, query, where } from "firebase/firestore";
-import { ClipboardCheck } from "lucide-react";
+import { ClipboardCheck, ClipboardPlus } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { AssetIssueTicket } from "@/lib/types";
 import {
   ISSUE_STATUS_COLOR,
-  ISSUE_STATUS_LABEL,
+  ISSUE_STATUS_STAFF_LABEL,
+  ISSUE_REPORT_TYPE_COLOR,
+  ISSUE_REPORT_TYPE_LABEL,
   formatDateTime,
 } from "@/lib/utils";
 import ProtectedLayout from "@/components/ProtectedLayout";
@@ -16,6 +19,14 @@ import PageHeader from "@/components/PageHeader";
 import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 import IssueTicketDetailModal from "@/components/IssueTicketDetailModal";
+
+function reportTypeLabel(ticket: AssetIssueTicket) {
+  return ticket.reportType ? ISSUE_REPORT_TYPE_LABEL[ticket.reportType] : "Kendala Asset";
+}
+
+function reportTypeColor(ticket: AssetIssueTicket) {
+  return ticket.reportType ? ISSUE_REPORT_TYPE_COLOR[ticket.reportType] : "bg-amber-50 text-amber-700 border-amber-200";
+}
 
 export default function MyReportsPage() {
   const { firebaseUser, assetUser, role, loading } = useAuth();
@@ -46,8 +57,17 @@ export default function MyReportsPage() {
   return (
     <ProtectedLayout>
       <PageHeader
-        title="My Reports"
-        subtitle="Laporan kendala asset yang pernah Anda kirim."
+        title="Laporan Saya"
+        subtitle="Laporan kendala yang pernah Anda kirim."
+        actions={
+          <Link
+            href="/staff-reports/new"
+            className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-teal-500 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-blue-900/20 hover:brightness-105"
+          >
+            <ClipboardPlus size={16} />
+            Buat Laporan
+          </Link>
+        }
       />
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
@@ -55,7 +75,7 @@ export default function MyReportsPage() {
           <EmptyState
             icon={ClipboardCheck}
             title="Belum ada laporan"
-            description="Scan QR asset lalu klik Laporkan Kendala untuk membuat laporan."
+            description="Buat laporan dari menu Buat Laporan, atau scan QR jika laporan terkait asset tertentu."
           />
         ) : (
           <div className="overflow-x-auto">
@@ -63,8 +83,9 @@ export default function MyReportsPage() {
               <thead>
                 <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
                   <th className="px-4 py-3 font-semibold">Nomor Ticket</th>
-                  <th className="px-4 py-3 font-semibold">Asset</th>
-                  <th className="px-4 py-3 font-semibold">Gejala</th>
+                  <th className="px-4 py-3 font-semibold">Jenis</th>
+                  <th className="px-4 py-3 font-semibold">Laporan</th>
+                  <th className="px-4 py-3 font-semibold">Asset / Lokasi</th>
                   <th className="px-4 py-3 font-semibold">Status</th>
                   <th className="px-4 py-3 font-semibold">Estimasi Selesai</th>
                   <th className="px-4 py-3 font-semibold">Tanggal Lapor</th>
@@ -78,16 +99,22 @@ export default function MyReportsPage() {
                     className="border-b border-slate-100 last:border-0 hover:bg-slate-50/70 transition-colors cursor-pointer"
                   >
                     <td className="px-4 py-3 font-medium text-slate-800">{t.ticketNumber}</td>
-                    <td className="px-4 py-3 text-slate-600">
-                      <p>{t.assetName}</p>
-                      <p className="text-xs text-slate-400">{t.assetCode}</p>
-                    </td>
-                    <td className="px-4 py-3 text-slate-600">{t.symptomType}</td>
                     <td className="px-4 py-3">
-                      <Badge label={ISSUE_STATUS_LABEL[t.status]} colorClass={ISSUE_STATUS_COLOR[t.status]} />
+                      <Badge label={reportTypeLabel(t)} colorClass={reportTypeColor(t)} />
+                    </td>
+                    <td className="px-4 py-3 text-slate-600">
+                      <p className="font-medium text-slate-800">{t.title || t.symptomType || "-"}</p>
+                      <p className="line-clamp-2 text-xs text-slate-400">{t.description}</p>
+                    </td>
+                    <td className="px-4 py-3 text-slate-600">
+                      <p>{t.assetName || "Tanpa asset"}</p>
+                      <p className="text-xs text-slate-400">{t.assetCode || t.locationText || t.assetLocation || "-"}</p>
+                    </td>
+                    <td className="px-4 py-3">
+                      <Badge label={t.staffStatusLabel || ISSUE_STATUS_STAFF_LABEL[t.status]} colorClass={ISSUE_STATUS_COLOR[t.status]} />
                     </td>
                     <td className="px-4 py-3 text-slate-500">{t.estimatedFinishAt || "-"}</td>
-                    <td className="px-4 py-3 text-slate-500">{formatDateTime(t.reportedAt)}</td>
+                    <td className="px-4 py-3 text-slate-500">{formatDateTime(t.createdAt || t.reportedAt)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -101,7 +128,6 @@ export default function MyReportsPage() {
           ticket={detailTarget}
           open={!!detailTarget}
           onClose={() => setDetailTarget(null)}
-          readOnly
         />
       )}
     </ProtectedLayout>

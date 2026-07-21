@@ -28,6 +28,37 @@ export function buildFullPath(
     .join(" / ");
 }
 
+// Section D — cari PIC Lokasi yang berlaku untuk sebuah aset dengan cascade
+// dari level paling spesifik ke paling umum: Area > Ruangan > Lantai >
+// Gedung. Begitu ketemu level yang punya PIC, langsung dipakai — TIDAK
+// digabung dari beberapa level sekaligus (area punya PIC sendiri berarti
+// area itu yang jadi acuan, bukan PIC lantai/gedungnya).
+export function resolveAreaPic(
+  locations: AssetLocationNode[],
+  ids: { buildingId?: string | null; floorId?: string | null; roomId?: string | null; areaId?: string | null }
+): {
+  uid: string;
+  name: string;
+  email: string | null;
+  locationId: string;
+  locationName: string;
+} | null {
+  const candidateIds = [ids.areaId, ids.roomId, ids.floorId, ids.buildingId].filter(Boolean) as string[];
+  for (const id of candidateIds) {
+    const node = locations.find((n) => n.id === id);
+    if (node?.picUid) {
+      return {
+        uid: node.picUid,
+        name: node.picName || "",
+        email: node.picEmail || null,
+        locationId: node.id,
+        locationName: node.locationLabel,
+      };
+    }
+  }
+  return null;
+}
+
 export function getChildren(nodes: AssetLocationNode[], parentId: string | null) {
   return nodes
     .filter((n) => n.parentId === parentId)

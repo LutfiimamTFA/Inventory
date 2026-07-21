@@ -5,6 +5,7 @@ import { Asset, AssetIssueTicket, MaintenanceWorkOrder } from "@/lib/types";
 import { exportToExcel, healthScoreLabel, HEALTH_LABEL_COLOR, isMaintenanceOverdue, computeHealthScore, todayStamp } from "@/lib/reports";
 import { ChartCard, SimpleBarChart } from "@/components/reports/charts";
 import Badge from "@/components/Badge";
+import ResponsiveTable from "@/components/reports/ResponsiveTable";
 
 export default function LocationReportTab({
   assets,
@@ -25,7 +26,7 @@ export default function LocationReportTab({
 
     return Array.from(byLocation.entries()).map(([location, locAssets]) => {
       const assetIds = new Set(locAssets.map((a) => a.id));
-      const locTickets = tickets.filter((t) => assetIds.has(t.assetId));
+      const locTickets = tickets.filter((t) => !!t.assetId && assetIds.has(t.assetId));
       const locWorkOrders = workOrders.filter((w) => w.assetIds?.some((id) => assetIds.has(id)));
       const brokenCount = locAssets.filter((a) => a.assetStatus === "broken").length;
       const overdueCount = locAssets.filter(isMaintenanceOverdue).length;
@@ -45,7 +46,7 @@ export default function LocationReportTab({
       const scores = locAssets.map((a) => {
         const assetTickets = locTickets.filter((t) => t.assetId === a.id);
         const unresolved = assetTickets.filter(
-          (t) => !["resolved", "closed", "rejected"].includes(t.status)
+          (t) => !["completed", "cancelled", "rejected", "duplicate"].includes(t.status)
         ).length;
         return computeHealthScore({
           asset: a,
@@ -119,38 +120,23 @@ export default function LocationReportTab({
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
-                <th className="px-4 py-3 font-semibold">Lokasi</th>
-                <th className="px-4 py-3 font-semibold">Total Asset</th>
-                <th className="px-4 py-3 font-semibold">Asset Rusak</th>
-                <th className="px-4 py-3 font-semibold">Ticket Kendala</th>
-                <th className="px-4 py-3 font-semibold">Maintenance Overdue</th>
-                <th className="px-4 py-3 font-semibold">WO Aktif</th>
-                <th className="px-4 py-3 font-semibold">Health Score</th>
-                <th className="px-4 py-3 font-semibold">Rekomendasi</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr key={r.location} className="border-b border-slate-100 last:border-0 hover:bg-slate-50/70">
-                  <td className="px-4 py-3 font-medium text-slate-800">{r.location}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.totalAssets}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.brokenCount}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.ticketCount}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.overdueCount}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.activeWO}</td>
-                  <td className="px-4 py-3 font-semibold text-slate-800">{r.avgScore}</td>
-                  <td className="px-4 py-3">
-                    <Badge label={r.label} colorClass={HEALTH_LABEL_COLOR[r.label]} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <ResponsiveTable
+          rows={rows}
+          keyFn={(r) => r.location}
+          columns={[
+            { label: "Lokasi", primary: true, render: (r) => r.location },
+            { label: "Total Asset", render: (r) => r.totalAssets },
+            { label: "Asset Rusak", render: (r) => r.brokenCount },
+            { label: "Ticket Kendala", render: (r) => r.ticketCount },
+            { label: "Maintenance Overdue", render: (r) => r.overdueCount },
+            { label: "WO Aktif", render: (r) => r.activeWO },
+            { label: "Health Score", render: (r) => r.avgScore },
+            {
+              label: "Rekomendasi",
+              render: (r) => <Badge label={r.label} colorClass={HEALTH_LABEL_COLOR[r.label]} />,
+            },
+          ]}
+        />
       </div>
     </div>
   );

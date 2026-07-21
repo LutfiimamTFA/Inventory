@@ -13,6 +13,7 @@ import {
 } from "@/lib/reports";
 import SummaryCard from "@/components/reports/SummaryCard";
 import { ChartCard, SimpleBarChart } from "@/components/reports/charts";
+import ResponsiveTable from "@/components/reports/ResponsiveTable";
 
 export default function CostReportTab({
   assets,
@@ -30,7 +31,7 @@ export default function CostReportTab({
     const computed = assets.map((asset) => {
       const assetTickets = tickets.filter((t) => t.assetId === asset.id);
       const unresolved = assetTickets.filter(
-        (t) => !["resolved", "closed", "rejected"].includes(t.status)
+        (t) => !["completed", "cancelled", "rejected", "duplicate"].includes(t.status)
       ).length;
       const maintenanceOverdue = isMaintenanceOverdue(asset);
       const score = computeHealthScore({
@@ -129,37 +130,30 @@ export default function CostReportTab({
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
-                <th className="px-4 py-3 font-semibold">Asset</th>
-                <th className="px-4 py-3 font-semibold">Kategori</th>
-                <th className="px-4 py-3 font-semibold">Nilai Beli</th>
-                <th className="px-4 py-3 font-semibold">Jumlah Ticket</th>
-                <th className="px-4 py-3 font-semibold">Health Score</th>
-                <th className="px-4 py-3 font-semibold">Rekomendasi</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.slice(0, 50).map((r) => (
-                <tr key={r.asset.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50/70">
-                  <td className="px-4 py-3">
-                    <p className="font-medium text-slate-800">{r.asset.assetName}</p>
-                    <p className="text-xs text-slate-400">{r.asset.assetCode}</p>
-                  </td>
-                  <td className="px-4 py-3 text-slate-600">{r.asset.categoryName}</td>
-                  <td className="px-4 py-3 text-slate-600">{formatCurrency(r.asset.purchasePrice)}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.ticketCount}</td>
-                  <td className="px-4 py-3 font-semibold text-slate-800">{r.score}</td>
-                  <td className="px-4 py-3 text-slate-600 text-xs">
-                    {r.recommendations.length > 0 ? r.recommendations.join("; ") : "-"}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <ResponsiveTable
+          rows={rows.slice(0, 50)}
+          keyFn={(r) => r.asset.id}
+          columns={[
+            {
+              label: "Asset",
+              primary: true,
+              render: (r) => (
+                <>
+                  <p className="font-medium text-slate-800">{r.asset.assetName}</p>
+                  <p className="text-xs text-slate-400">{r.asset.assetCode}</p>
+                </>
+              ),
+            },
+            { label: "Kategori", render: (r) => r.asset.categoryName },
+            { label: "Nilai Beli", render: (r) => formatCurrency(r.asset.purchasePrice) },
+            { label: "Jumlah Ticket", render: (r) => r.ticketCount },
+            { label: "Health Score", render: (r) => r.score },
+            {
+              label: "Rekomendasi",
+              render: (r) => (r.recommendations.length > 0 ? r.recommendations.join("; ") : "-"),
+            },
+          ]}
+        />
       </div>
     </div>
   );

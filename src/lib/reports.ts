@@ -199,8 +199,8 @@ export function isBorrowingOverdue(b: AssetBorrowing): boolean {
 // ── Ticket resolution time ──────────────────────────────────────────────────
 
 export function resolutionTimeLabel(ticket: AssetIssueTicket): string {
-  const resolvedAt = toDateSafe(ticket.resolvedAt);
-  const createdAt = toDateSafe(ticket.reportedAt);
+  const resolvedAt = toDateSafe(ticket.resolvedAt || ticket.closedAt || ticket.updatedAt);
+  const createdAt = toDateSafe(ticket.reportedAt || ticket.createdAt);
   if (!resolvedAt || !createdAt) return "Belum selesai";
   const diffMs = resolvedAt.getTime() - createdAt.getTime();
   const hours = Math.round(diffMs / 3600000);
@@ -235,8 +235,9 @@ export interface MaintenanceRoutineSummary {
 
 export interface MaintenanceCorrectiveSummary {
   staffReports: number;
-  waitingDiagnosis: number;
-  checking: number;
+  waitingReview: number;
+  waitingTeam: number;
+  inProgress: number;
   followUpCount: number;
   resolvedThisMonth: number;
 }
@@ -280,18 +281,31 @@ export function getMaintenanceSummaryCounts({
     }).length,
   };
 
+  // Section E perbaikan alur Laporan Kendala Staff — dihitung dari status
+  // AKTIF (reported..needs_follow_up), BUKAN vocabulary lama (open/
+  // review_by_asset_admin/waiting_diagnosis/dst.) yang sudah dihapus dari
+  // IssueTicketStatus tapi lupa dibersihkan dari sini.
+  const activeTickets = tickets.filter((t) =>
+    [
+      "reported",
+      "under_review",
+      "need_more_info",
+      "assigned",
+      "in_progress",
+      "waiting_reporter_confirmation",
+      "reporter_confirmed",
+      "needs_follow_up",
+    ].includes(t.status)
+  );
   const corrective: MaintenanceCorrectiveSummary = {
-    staffReports: tickets.filter((t) =>
-      ["open", "review_by_asset_admin", "need_more_info"].includes(t.status)
-    ).length,
-    waitingDiagnosis: tickets.filter((t) => t.status === "waiting_diagnosis").length,
-    checking: tickets.filter((t) => ["checking", "minor_fix"].includes(t.status)).length,
-    followUpCount: tickets.filter((t) =>
-      ["needs_follow_up", "waiting_sparepart", "waiting_vendor"].includes(t.status)
-    ).length,
+    staffReports: activeTickets.length,
+    waitingReview: tickets.filter((t) => t.status === "reported" || t.status === "under_review").length,
+    waitingTeam: tickets.filter((t) => t.status === "assigned").length,
+    inProgress: tickets.filter((t) => t.status === "in_progress").length,
+    followUpCount: tickets.filter((t) => t.status === "needs_follow_up").length,
     resolvedThisMonth: tickets.filter((t) => {
-      if (!["resolved", "closed"].includes(t.status)) return false;
-      const d = toDateSafe(t.resolvedAt);
+      if (t.status !== "completed") return false;
+      const d = toDateSafe(t.completedAt || t.resolvedAt || t.updatedAt);
       if (!d) return false;
       return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
     }).length,

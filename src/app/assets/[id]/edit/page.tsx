@@ -11,7 +11,7 @@ import {
   updateDoc,
 } from "firebase/firestore";
 import { QRCodeSVG } from "qrcode.react";
-import { db, EMPLOYEE_PROFILES_COLLECTION } from "@/lib/firebase";
+import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import {
   Asset,
@@ -21,16 +21,21 @@ import {
   AssetStatus,
   AssetUsageType,
   TrackingMode,
-  EmployeeProfile,
   FundingSource,
   HrpBrand,
   HrpDivision,
   OwnershipStatus,
 } from "@/lib/types";
 import { fetchHrpBrands, fetchHrpDivisions } from "@/lib/hrp";
-import { fetchActiveUsersByRoles, isAssetCodeTaken, writeAssetLog } from "@/lib/firestore-helpers";
+import {
+  EmployeeOption,
+  fetchActiveEmployeeOptions,
+  fetchActiveUsersByRoles,
+  isAssetCodeTaken,
+  writeAssetLog,
+} from "@/lib/firestore-helpers";
 import { buildChangeMessage, buildChangeSummary, createAssetNotification } from "@/lib/notifications";
-import { buildFullPath } from "@/lib/locations";
+import { buildFullPath, getDescendantIds, resolveAreaPic } from "@/lib/locations";
 import {
   ASSET_STATUS_HELPER,
   ASSET_STATUS_LABEL,
@@ -110,7 +115,7 @@ export default function EditAssetPage() {
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [asset, setAsset] = useState<Asset | null>(null);
   const [categories, setCategories] = useState<AssetCategory[]>([]);
-  const [employees, setEmployees] = useState<EmployeeProfile[]>([]);
+  const [employeeOptions, setEmployeeOptions] = useState<EmployeeOption[]>([]);
   const [brands, setBrands] = useState<HrpBrand[]>([]);
   const [divisions, setDivisions] = useState<HrpDivision[]>([]);
   const [loadingDivisions, setLoadingDivisions] = useState(false);
@@ -182,38 +187,21 @@ export default function EditAssetPage() {
     return () => unsub();
   }, [authReady]);
 
+  // Sumber tunggal dropdown PIC/Custodian — fetchActiveEmployeeOptions sudah
+  // menormalisasi nama (fullName/employeeName/name/displayName, email cuma
+  // fallback terakhir), mengecualikan kandidat/nonaktif, dan dedupe per
+  // uid/email. Jangan bangun daftar karyawan sendiri di sini lagi.
   useEffect(() => {
     if (!authReady) return;
-    const unsub = onSnapshot(
-      collection(db, EMPLOYEE_PROFILES_COLLECTION),
-      (snap) => {
-        console.log("[EditAssetPage Listener] employee_profiles success:", snap.size);
-        setEmployees(
-          snap.docs
-            // Doc id HARUS jadi fallback terakhir, bukan base yang bisa
-            // ditimpa field "uid" di data (kalau ada field itu di HRP source
-            // dan isinya beda/kosong, PIC yang dipilih jadi tidak match saat
-            // dicari lagi pakai uid ini — inilah kenapa custodian bisa
-            // kesimpen tapi nama-nya gagal di-resolve).
-            .map((d) => {
-              const data = d.data() as Record<string, unknown>;
-              return { ...data, uid: (data.uid as string) || (data.userId as string) || d.id } as EmployeeProfile;
-            })
-            .filter((e) => {
-              const status = String(e.status || "").toLowerCase();
-              const roleText = String(e.role || "").toLowerCase();
-              const isCandidate =
-                roleText.includes("kandidat") || roleText.includes("candidate") || roleText.includes("applicant");
-              const isInactive = status.includes("inactive") || status.includes("nonaktif") || status.includes("rejected");
-              return !isCandidate && !isInactive;
-            })
-        );
-      },
-      (error) => {
-        console.error("[EditAssetPage Listener] employee_profiles error:", error);
-      }
-    );
-    return () => unsub();
+    let cancelled = false;
+    fetchActiveEmployeeOptions()
+      .then((options) => {
+        if (!cancelled) setEmployeeOptions(options);
+      })
+      .catch((err) => console.error("[EditAssetPage] gagal memuat daftar karyawan aktif", err));
+    return () => {
+      cancelled = true;
+    };
   }, [authReady]);
 
   useEffect(() => {
@@ -245,11 +233,13 @@ export default function EditAssetPage() {
   const trackingMode: TrackingMode =
     form.trackingMode || (form.usageType === "assigned_daily" ? "assigned_pic" : "shared_borrowable");
 
-  // Section D — Asset Finance cuma boleh edit section Finance (field lain
-  // read-only lewat <fieldset disabled>); Asset Admin/QHSE kebalikannya:
-  // boleh edit semua KECUALI section Finance (read-only di sana).
+  // Section C/D — Asset Finance cuma boleh edit section Finance (field lain
+  // read-only lewat <fieldset disabled>). Asset Admin/QHSE, Staff, Tim IT
+  // TIDAK boleh melihat section Finance sama sekali (disembunyikan penuh,
+  // bukan cuma read-only) — hanya Super Admin & Asset Finance yang boleh
+  // melihat/mengedit nominal harga.
   const isFinanceOnlyRole = role === "asset_finance";
-  const isFinanceReadOnlyRole = role === "asset_admin";
+  const canViewFinanceEdit = role === "super_admin" || role === "asset_finance";
 
   const locationSelection: LocationSelection = {
     buildingId: form.buildingId || "",
@@ -282,6 +272,22 @@ export default function EditAssetPage() {
     setLoadingDivisions(!!value);
   };
 
+  // Section E — PIC Lokasi hanya boleh memindahkan aset ke lokasi dalam
+  // scope-nya (dirinya + turunannya) — sama seperti create asset.
+  const isLocationPicRole = role === "location_pic";
+  const scopedLocations = useMemo(() => {
+    if (!isLocationPicRole || !assetUser) return locations;
+    const myNodes = locations.filter((n) => n.picUid === assetUser.uid);
+    if (myNodes.length === 0) return [];
+    const idSet = new Set<string>();
+    myNodes.forEach((node) => {
+      node.parentPath.forEach((id) => idSet.add(id));
+      idSet.add(node.id);
+      getDescendantIds(locations, node.id).forEach((id) => idSet.add(id));
+    });
+    return locations.filter((n) => idSet.has(n.id));
+  }, [locations, isLocationPicRole, assetUser]);
+
   const category = useMemo(
     () => categories.find((c) => c.id === form.categoryId),
     [categories, form.categoryId]
@@ -295,21 +301,18 @@ export default function EditAssetPage() {
     [divisions, form.divisionOwnerId]
   );
   const responsiblePerson = useMemo(
-    () => employees.find((e) => e.uid === form.responsiblePersonUid),
-    [employees, form.responsiblePersonUid]
+    () => employeeOptions.find((e) => e.uid === form.responsiblePersonUid),
+    [employeeOptions, form.responsiblePersonUid]
   );
 
-  const employeeItems: SearchableSelectItem[] = employees.map((e) => {
-    const jobTitle = (e.jobTitle as string) || (e.jabatan as string) || "";
-    const division = (e.divisionName as string) || "";
-    const subParts = [jobTitle, division, e.email].filter(Boolean);
-    return {
-      id: e.uid,
-      label: e.name || e.email,
-      sublabel: subParts.join(" · "),
-      searchText: [e.name, e.email, jobTitle, division].filter(Boolean).join(" "),
-    };
-  });
+  // Baris utama SELALU nama, baris kecil divisi/perusahaan/jabatan — email
+  // TIDAK PERNAH ditampilkan, cuma dipakai sebagai kata kunci pencarian.
+  const employeeItems: SearchableSelectItem[] = employeeOptions.map((e) => ({
+    id: e.uid,
+    label: e.name,
+    sublabel: [e.divisionName, e.brandName, e.roleLabel].filter(Boolean).join(" — ") || undefined,
+    searchText: [e.name, e.email, e.divisionName, e.brandName, e.roleLabel].filter(Boolean).join(" "),
+  }));
 
   const brandItems: SearchableSelectItem[] = brands.map((b) => ({
     id: b.id,
@@ -325,6 +328,79 @@ export default function EditAssetPage() {
     if (photoUploading || invoiceUploading) {
       setError("Tunggu proses upload file selesai sebelum menyimpan.");
       return;
+    }
+
+    // Asset Finance HANYA boleh mengubah field finance (lihat
+    // isAssetFinanceUpdate di firestore.rules) — jalur submit ini WAJIB
+    // terpisah dan berjalan SEBELUM validasi field fisik (assetName,
+    // categoryId, lokasi, PIC, condition, dst) supaya tidak pernah mengirim
+    // field non-finance yang bikin updateDoc kena "Missing or insufficient
+    // permissions".
+    if (isFinanceOnlyRole) {
+      setSaving(true);
+      setError("");
+      setFieldErrors({});
+
+      try {
+        const financePayload = {
+          purchaseDate: form.purchaseDate || null,
+          purchasePrice: form.purchasePrice ?? null,
+          vendorName: form.vendorName || "",
+          invoiceNumber: form.invoiceNumber || "",
+
+          invoiceFileUrl: form.invoiceFileUrl || "",
+          invoiceFileName: form.invoiceFileName || "",
+          invoiceDriveFileId: form.invoiceDriveFileId || "",
+          invoiceMimeType: form.invoiceMimeType || "",
+          invoiceSize: form.invoiceSize ?? null,
+          invoiceUploadedAt: form.invoiceUploadedAt || null,
+
+          fundingSource: form.fundingSource || "",
+          purchaseMethod: form.purchaseMethod || "",
+          estimatedUsefulLife: form.estimatedUsefulLife || "",
+          financeNotes: form.financeNotes || "",
+
+          financeStatus:
+            form.purchasePrice || form.invoiceNumber || form.invoiceFileUrl
+              ? "complete"
+              : "pending_finance",
+
+          financeUpdatedAt: serverTimestamp(),
+          financeUpdatedByUid: firebaseUser?.uid || "",
+          financeUpdatedByName: assetUser?.name || firebaseUser?.email || "",
+
+          updatedAt: serverTimestamp(),
+          updatedByUid: firebaseUser?.uid || "",
+          updatedByName: assetUser?.name || firebaseUser?.email || "",
+        };
+
+        console.log("[Asset Finance Submit]", {
+          role,
+          assetId: asset.id,
+          financePayloadKeys: Object.keys(financePayload),
+          financePayload,
+        });
+
+        await updateDoc(doc(db, "assets", asset.id), financePayload);
+
+        setToast({
+          type: "success",
+          message: "Data finance aset berhasil disimpan.",
+        });
+
+        router.push(`/assets/${asset.id}`);
+        return;
+      } catch (err) {
+        console.error("[Asset Finance Submit ERROR]", err);
+        setError("Gagal menyimpan data finance.");
+        setToast({
+          type: "error",
+          message: "Gagal menyimpan data finance.",
+        });
+        return;
+      } finally {
+        setSaving(false);
+      }
     }
 
     const errors: Record<string, string> = {};
@@ -388,6 +464,16 @@ export default function EditAssetPage() {
         areaName: form.areaName || "",
       });
 
+      // Section D — PIC Lokasi ikut dihitung ulang tiap edit tersimpan,
+      // supaya kalau aset dipindah lokasi (atau PIC lokasinya baru saja
+      // ditetapkan/diubah), areaPic* tetap sinkron.
+      const areaPic = resolveAreaPic(locations, {
+        buildingId: form.buildingId,
+        floorId: form.floorId,
+        roomId: form.roomId,
+        areaId: form.areaId,
+      });
+
       // ── Tipe pemakaian & custodian ──────────────────────────────────────
       // custodian* selalu ikut PIC/Custodian di form. currentHolder* HANYA
       // dipaksa ikut custodian kalau belum ada serah-terima sementara aktif
@@ -402,8 +488,8 @@ export default function EditAssetPage() {
       const hasActiveHandover = asset.currentUsageStatus === "temporary_used_by_other";
       const custodianName = responsiblePerson?.name || form.responsiblePersonName || null;
       const custodianEmail = responsiblePerson?.email || form.responsiblePersonEmail || null;
-      const custodianDivision =
-        (responsiblePerson?.divisionName as string) || form.responsiblePersonDivision || null;
+      const custodianDivision = responsiblePerson?.divisionName || form.responsiblePersonDivision || null;
+      const custodianRole = responsiblePerson?.roleLabel || form.custodianRole || null;
 
       const usageFields: Record<string, unknown> = {
         trackingMode: nextTrackingMode,
@@ -424,6 +510,7 @@ export default function EditAssetPage() {
         usageFields.custodianName = null;
         usageFields.custodianEmail = null;
         usageFields.custodianDivision = null;
+        usageFields.custodianRole = null;
         usageFields.currentHolderUid = null;
         usageFields.currentHolderName = null;
         usageFields.currentHolderEmail = null;
@@ -437,6 +524,7 @@ export default function EditAssetPage() {
         usageFields.custodianName = custodianName;
         usageFields.custodianEmail = custodianEmail;
         usageFields.custodianDivision = custodianDivision;
+        usageFields.custodianRole = custodianRole;
         if (nextTrackingMode === "assigned_pic") {
           if (!hasActiveHandover || trackingModeChanged || custodianChanged) {
             usageFields.currentHolderUid = form.responsiblePersonUid || null;
@@ -499,18 +587,20 @@ export default function EditAssetPage() {
         locationId:
           form.areaId || form.roomId || form.floorId || form.buildingId || null,
         locationText: assetLocationText,
+        areaPicUid: areaPic?.uid || null,
+        areaPicName: areaPic?.name || null,
+        areaPicEmail: areaPic?.email || null,
+        areaPicLocationId: areaPic?.locationId || null,
+        areaPicLocationName: areaPic?.locationName || null,
         responsiblePersonUid: form.responsiblePersonUid || null,
         responsiblePersonName:
           responsiblePerson?.name || form.responsiblePersonName || "",
         responsiblePersonEmail:
           responsiblePerson?.email || form.responsiblePersonEmail || "",
         responsiblePersonDivision:
-          (responsiblePerson?.divisionName as string) || form.responsiblePersonDivision || "",
+          responsiblePerson?.divisionName || form.responsiblePersonDivision || "",
         responsiblePersonJobTitle:
-          (responsiblePerson?.jobTitle as string) ||
-          (responsiblePerson?.jabatan as string) ||
-          form.responsiblePersonJobTitle ||
-          "",
+          responsiblePerson?.roleLabel || form.responsiblePersonJobTitle || "",
         ownershipStatus: form.ownershipStatus,
         ...usageFields,
 
@@ -866,7 +956,7 @@ export default function EditAssetPage() {
                     </p>
                   )}
                   <LocationCascadeFields
-                    locations={locations}
+                    locations={scopedLocations}
                     value={locationSelection}
                     onChange={handleLocationSelectionChange}
                   />
@@ -949,7 +1039,7 @@ export default function EditAssetPage() {
               </FormSection>
               </fieldset>
 
-              <fieldset disabled={isFinanceReadOnlyRole} className="space-y-5 disabled:opacity-60">
+              {canViewFinanceEdit && (
               <FormSection step={3} title="Finance / Bukti Pembelian">
                 <Field label="Tanggal Pembelian">
                   <input
@@ -1042,7 +1132,7 @@ export default function EditAssetPage() {
                   />
                 </Field>
               </FormSection>
-              </fieldset>
+              )}
 
               <fieldset disabled={isFinanceOnlyRole} className="space-y-5 disabled:opacity-60">
               <FormSection step={4} title="Tracking & QR">

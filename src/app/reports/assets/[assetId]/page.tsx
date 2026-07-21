@@ -130,7 +130,7 @@ export default function AssetFullReportPage() {
   }
 
   const unresolvedTicketCount = tickets.filter(
-    (t) => !["resolved", "closed", "rejected"].includes(t.status)
+    (t) => !["completed", "cancelled", "resolved", "closed", "rejected"].includes(t.status)
   ).length;
   const maintenanceOverdue = isMaintenanceOverdue(asset);
   const score = computeHealthScore({
@@ -140,6 +140,9 @@ export default function AssetFullReportPage() {
     hasOverdueMaintenance: maintenanceOverdue,
   });
   const label = healthScoreLabel(score);
+  // Hanya Super Admin/Asset Finance yang boleh lihat nominal harga — lihat
+  // spec "data Finance hanya tampil untuk role Asset Finance".
+  const canViewFinance = role === "super_admin" || role === "asset_finance";
 
   const handleExport = () => {
     exportToExcel(
@@ -155,7 +158,7 @@ export default function AssetFullReportPage() {
           "Total Ticket": tickets.length,
           "Total Maintenance": workOrders.length,
           "Total Peminjaman": borrowings.length,
-          "Total Nilai Beli": asset.purchasePrice || 0,
+          ...(canViewFinance ? { "Total Nilai Beli": asset.purchasePrice || 0 } : {}),
           "Last Maintenance": formatDate(asset.lastMaintenanceAt),
           "Next Maintenance": formatDate(asset.nextMaintenanceAt),
         },
@@ -217,7 +220,9 @@ export default function AssetFullReportPage() {
               label="Lokasi"
               value={[asset.buildingName, asset.floor, asset.roomName].filter(Boolean).join(" - ") || asset.location}
             />
-            <Info label="Total Nilai Beli" value={formatCurrency(asset.purchasePrice)} />
+            {canViewFinance && (
+              <Info label="Total Nilai Beli" value={formatCurrency(asset.purchasePrice)} />
+            )}
             <Info label="Last Maintenance" value={formatDate(asset.lastMaintenanceAt)} />
             <Info label="Next Maintenance" value={formatDate(asset.nextMaintenanceAt)} />
             <Info label="Maintenance Overdue" value={maintenanceOverdue ? "Ya" : "Tidak"} />

@@ -46,7 +46,7 @@ export default function ExportTab({ assets, tickets, workOrders, items, borrowin
       assets.map((asset) => {
         const assetTickets = tickets.filter((t) => t.assetId === asset.id);
         const unresolved = assetTickets.filter(
-          (t) => !["resolved", "closed", "rejected"].includes(t.status)
+          (t) => !["completed", "cancelled", "rejected", "duplicate"].includes(t.status)
         ).length;
         const score = computeHealthScore({
           asset,

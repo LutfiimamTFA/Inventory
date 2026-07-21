@@ -14,6 +14,7 @@ import {
 import SummaryCard from "@/components/reports/SummaryCard";
 import { ChartCard, SimpleBarChart, SimpleLineChart } from "@/components/reports/charts";
 import Badge from "@/components/Badge";
+import ResponsiveTable from "@/components/reports/ResponsiveTable";
 
 export default function MaintenanceReportTab({
   assets,
@@ -108,7 +109,7 @@ export default function MaintenanceReportTab({
         <SummaryCard label="Cancelled" value={cancelled} color="bg-slate-100 text-slate-600" />
       </div>
 
-      <div className="grid md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <ChartCard title="Maintenance Completed per Bulan">
           <SimpleLineChart data={completedPerMonth} />
         </ChartCard>
@@ -131,41 +132,32 @@ export default function MaintenanceReportTab({
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
-                <th className="px-4 py-3 font-semibold">Nomor WO</th>
-                <th className="px-4 py-3 font-semibold">Jumlah Asset</th>
-                <th className="px-4 py-3 font-semibold">Lokasi</th>
-                <th className="px-4 py-3 font-semibold">Technician</th>
-                <th className="px-4 py-3 font-semibold">Jadwal</th>
-                <th className="px-4 py-3 font-semibold">Status</th>
-                <th className="px-4 py-3 font-semibold">Progress</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.slice(0, 50).map((r) => (
-                <tr key={r.w.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50/70">
-                  <td className="px-4 py-3 font-medium text-slate-800">{r.w.workOrderNumber}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.w.assetIds?.length || 0}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.w.locationText || "-"}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.w.assignedToName || "-"}</td>
-                  <td className="px-4 py-3 text-slate-500">{formatDate(r.w.scheduledDate)}</td>
-                  <td className="px-4 py-3">
-                    <Badge
-                      label={r.overdue ? "Terlambat" : WORK_ORDER_STATUS_LABEL[r.w.status]}
-                      colorClass={r.overdue ? "bg-red-50 text-red-700 border-red-200" : "bg-slate-100 text-slate-600 border-slate-200"}
-                    />
-                  </td>
-                  <td className="px-4 py-3 text-slate-600">
-                    {r.progress.checked}/{r.progress.total} ({r.progress.percent}%)
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <ResponsiveTable
+          rows={rows.slice(0, 50)}
+          keyFn={(r) => r.w.id}
+          columns={[
+            { label: "Nomor WO", primary: true, render: (r) => r.w.workOrderNumber },
+            { label: "Jumlah Asset", render: (r) => r.w.assetIds?.length || 0 },
+            { label: "Lokasi", render: (r) => r.w.locationText || "-" },
+            { label: "Technician", render: (r) => r.w.assignedToName || "-" },
+            { label: "Jadwal", render: (r) => formatDate(r.w.scheduledDate) },
+            {
+              label: "Status",
+              render: (r) => (
+                <Badge
+                  label={r.overdue ? "Terlambat" : WORK_ORDER_STATUS_LABEL[r.w.status]}
+                  colorClass={
+                    r.overdue ? "bg-red-50 text-red-700 border-red-200" : "bg-slate-100 text-slate-600 border-slate-200"
+                  }
+                />
+              ),
+            },
+            {
+              label: "Progress",
+              render: (r) => `${r.progress.checked}/${r.progress.total} (${r.progress.percent}%)`,
+            },
+          ]}
+        />
       </div>
     </div>
   );

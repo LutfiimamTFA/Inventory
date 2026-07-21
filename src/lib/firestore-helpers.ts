@@ -106,6 +106,24 @@ export async function writeAssetLog(params: {
   });
 }
 
+export async function writeLocationPicLog(params: {
+  locationId: string;
+  locationName: string;
+  action: "location_pic_assigned" | "location_pic_changed" | "location_pic_removed";
+  oldPicUid?: string | null;
+  oldPicName?: string | null;
+  newPicUid?: string | null;
+  newPicName?: string | null;
+  createdByUid: string;
+  createdByName: string;
+}) {
+  const payload = cleanFirestoreData(params) as Record<string, unknown>;
+  await addDoc(collection(db, "asset_location_logs"), {
+    ...payload,
+    createdAt: serverTimestamp(),
+  });
+}
+
 export async function writeAssetUserLog(params: {
   targetUid: string;
   targetName: string;
@@ -213,6 +231,34 @@ export async function writeWorkOrderLog(params: {
   });
 }
 
+// Log lintas-sumber untuk Kanban Board Maintenance & Kendala (section O) —
+// dipakai saat kartu dipindah drag-drop, mencakup work order MAUPUN ticket
+// dalam satu collection supaya Timeline Global bisa baca satu tempat saja.
+export async function writeMaintenanceActivityLog(params: {
+  sourceType: "work_order" | "ticket";
+  sourceId: string;
+  workOrderId?: string | null;
+  ticketId?: string | null;
+  action: string;
+  actionLabel: string;
+  fromStatus?: string;
+  toStatus?: string;
+  fromColumn?: string;
+  toColumn?: string;
+  message: string;
+  createdByUid: string;
+  createdByName: string;
+  locationName?: string;
+  taskNumber?: string;
+  title?: string;
+}) {
+  const payload = cleanFirestoreData(params) as Record<string, unknown>;
+  await addDoc(collection(db, "asset_maintenance_activity_logs"), {
+    ...payload,
+    createdAt: serverTimestamp(),
+  });
+}
+
 // Format: MRP-[TAHUN]-[NOMOR_URUT] mis. MRP-2026-0001 (Maintenance Routine Plan)
 export async function generatePlanNumber(): Promise<string> {
   const year = new Date().getFullYear();
@@ -281,10 +327,25 @@ function isInactiveRecord(e: Record<string, unknown>, status: string): boolean {
 // jadi setiap field dicoba dari beberapa kemungkinan nama. Kandidat/pelamar
 // dan karyawan nonaktif dikecualikan; hasil dideduplikasi per uid (fallback
 // email) supaya tidak ada nama dobel kalau datanya tumpang tindih.
+// Skor kelengkapan data — dipakai saat dedupe untuk memilih record yang
+// paling lengkap (nama lengkap/multi-kata, ada divisi, ada jabatan) kalau
+// satu orang yang sama muncul dobel dari beberapa collection/dokumen.
+function employeeCompletenessScore(o: EmployeeOption): number {
+  let score = 0;
+  if (o.name.trim().includes(" ")) score += 1;
+  if (o.divisionName) score += 1;
+  if (o.brandName) score += 1;
+  if (o.roleLabel && o.roleLabel !== "Karyawan") score += 1;
+  return score;
+}
+
 export async function fetchActiveEmployeeOptions(): Promise<EmployeeOption[]> {
   const snap = await getDocs(collection(db, EMPLOYEE_PROFILES_COLLECTION));
-  const seen = new Set<string>();
-  const options: EmployeeOption[] = [];
+  // Dedupe per uid DAN per email (huruf kecil) — data bisa dobel dari
+  // beberapa collection/dokumen dengan uid berbeda tapi email sama, atau
+  // sebaliknya. Kalau ketemu duplikat, simpan yang datanya paling lengkap.
+  const byUid = new Map<string, EmployeeOption>();
+  const byEmail = new Map<string, EmployeeOption>();
 
   snap.docs.forEach((d) => {
     const data = d.data() as Record<string, unknown>;
@@ -302,14 +363,11 @@ export async function fetchActiveEmployeeOptions(): Promise<EmployeeOption[]> {
       (e.email as string);
     if (!uid || !name) return;
 
-    const dedupeKey = uid || (e.email as string) || "";
-    if (dedupeKey && seen.has(dedupeKey)) return;
-    if (dedupeKey) seen.add(dedupeKey);
-
-    options.push({
+    const email = ((e.email as string) || (e.personalEmail as string) || "").toLowerCase() || null;
+    const option: EmployeeOption = {
       uid,
       name,
-      email: (e.email as string) || (e.personalEmail as string) || null,
+      email,
       divisionName:
         (e.divisionName as string) || (e.division as string) || (e.departmentName as string) || null,
       brandName: (e.brandName as string) || (e.companyName as string) || null,
@@ -319,8 +377,19 @@ export async function fetchActiveEmployeeOptions(): Promise<EmployeeOption[]> {
         (e.position as string) ||
         (e.role as string) ||
         "Karyawan",
-    });
+    };
+
+    const existing = byUid.get(uid) || (email ? byEmail.get(email) : undefined);
+    if (existing && employeeCompletenessScore(existing) >= employeeCompletenessScore(option)) {
+      return;
+    }
+    // Kalau duplikat ditemukan lewat email tapi uid-nya beda, buang entri
+    // uid lama supaya orang yang sama tidak muncul dua kali di hasil akhir.
+    if (existing && existing.uid !== uid) byUid.delete(existing.uid);
+    byUid.set(uid, option);
+    if (email) byEmail.set(email, option);
   });
 
+  const options = Array.from(byUid.values());
   return options.sort((a, b) => a.name.localeCompare(b.name));
 }

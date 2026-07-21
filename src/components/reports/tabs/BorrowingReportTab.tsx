@@ -7,6 +7,7 @@ import { exportToExcel, isBorrowingOverdue, todayStamp, toDateSafe } from "@/lib
 import SummaryCard from "@/components/reports/SummaryCard";
 import { ChartCard, SimpleBarChart, SimpleLineChart } from "@/components/reports/charts";
 import Badge from "@/components/Badge";
+import ResponsiveTable from "@/components/reports/ResponsiveTable";
 
 export default function BorrowingReportTab({ borrowings }: { borrowings: AssetBorrowing[] }) {
   const total = borrowings.length;
@@ -80,7 +81,7 @@ export default function BorrowingReportTab({ borrowings }: { borrowings: AssetBo
         <SummaryCard label="Paling Sering Dipinjam" value={topAsset} color="bg-blue-50 text-blue-600" />
       </div>
 
-      <div className="grid md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <ChartCard title="Borrowing Trend per Bulan">
           <SimpleLineChart data={perMonth} />
         </ChartCard>
@@ -103,44 +104,39 @@ export default function BorrowingReportTab({ borrowings }: { borrowings: AssetBo
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
-                <th className="px-4 py-3 font-semibold">Asset</th>
-                <th className="px-4 py-3 font-semibold">Peminjam</th>
-                <th className="px-4 py-3 font-semibold">Borrowed At</th>
-                <th className="px-4 py-3 font-semibold">Expected Return</th>
-                <th className="px-4 py-3 font-semibold">Returned At</th>
-                <th className="px-4 py-3 font-semibold">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {borrowings.slice(0, 50).map((b) => (
-                <tr key={b.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50/70">
-                  <td className="px-4 py-3">
-                    <p className="font-medium text-slate-800">{b.assetName}</p>
-                    <p className="text-xs text-slate-400">{b.assetCode}</p>
-                  </td>
-                  <td className="px-4 py-3 text-slate-600">{b.borrowedByName}</td>
-                  <td className="px-4 py-3 text-slate-500">{formatDate(b.borrowedAt)}</td>
-                  <td className="px-4 py-3 text-slate-500">{b.estimatedReturnAt || "-"}</td>
-                  <td className="px-4 py-3 text-slate-500">{b.returnedAt ? formatDate(b.returnedAt) : "-"}</td>
-                  <td className="px-4 py-3">
-                    <Badge
-                      label={isBorrowingOverdue(b) ? "Terlambat" : BORROWING_STATUS_LABEL[b.status]}
-                      colorClass={
-                        isBorrowingOverdue(b)
-                          ? "bg-red-50 text-red-700 border-red-200"
-                          : "bg-slate-100 text-slate-600 border-slate-200"
-                      }
-                    />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <ResponsiveTable
+          rows={borrowings.slice(0, 50)}
+          keyFn={(b) => b.id}
+          columns={[
+            {
+              label: "Asset",
+              primary: true,
+              render: (b) => (
+                <>
+                  <p className="font-medium text-slate-800">{b.assetName}</p>
+                  <p className="text-xs text-slate-400">{b.assetCode}</p>
+                </>
+              ),
+            },
+            { label: "Peminjam", render: (b) => b.borrowedByName },
+            { label: "Borrowed At", render: (b) => formatDate(b.borrowedAt) },
+            { label: "Expected Return", render: (b) => b.estimatedReturnAt || "-" },
+            { label: "Returned At", render: (b) => (b.returnedAt ? formatDate(b.returnedAt) : "-") },
+            {
+              label: "Status",
+              render: (b) => (
+                <Badge
+                  label={isBorrowingOverdue(b) ? "Terlambat" : BORROWING_STATUS_LABEL[b.status]}
+                  colorClass={
+                    isBorrowingOverdue(b)
+                      ? "bg-red-50 text-red-700 border-red-200"
+                      : "bg-slate-100 text-slate-600 border-slate-200"
+                  }
+                />
+              ),
+            },
+          ]}
+        />
       </div>
     </div>
   );

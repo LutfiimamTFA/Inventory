@@ -6,6 +6,7 @@ import {
   collection,
   collectionGroup,
   doc,
+  limit,
   onSnapshot,
   orderBy,
   query,
@@ -37,11 +38,14 @@ import {
   MaintenanceWorkOrderItem,
 } from "@/lib/types";
 import { getAssignedMaintenanceRole } from "@/lib/roles";
+import { isAssignmentIncomplete } from "@/lib/issueTicketActions";
 import {
   ASSET_SELECTION_MODE_LABEL,
-  ISSUE_PRIORITY_COLOR,
-  ISSUE_PRIORITY_LABEL,
+  FIELD_IMPACT_COLOR,
+  FIELD_IMPACT_LABEL,
   ISSUE_PRIORITY_RANK,
+  ISSUE_REPORT_TYPE_COLOR,
+  ISSUE_REPORT_TYPE_LABEL,
   ISSUE_STATUS_COLOR,
   ISSUE_STATUS_LABEL,
   computeNextCycleDueDateKey,
@@ -50,6 +54,7 @@ import {
   getDisplayStatus,
   getDueDateKey,
   isWorkOrderOverdue,
+  WORK_ORDER_STATUS_LABEL,
 } from "@/lib/utils";
 import { getMaintenanceSummaryCounts, toDateSafe, workOrderProgress } from "@/lib/reports";
 import ProtectedLayout from "@/components/ProtectedLayout";
@@ -64,6 +69,7 @@ import {
   createAssetNotification,
   dedupeKeyExists,
 } from "@/lib/notifications";
+import { Toast, ToastState } from "@/components/Toast";
 
 type TabKey = "incoming" | "technician" | "follow_up" | "schedule" | "my_tasks" | "history";
 
@@ -82,12 +88,58 @@ const TAB_KEY_FROM_QUERY: Record<string, TabKey> = Object.fromEntries(
   (Object.entries(TAB_QUERY_PARAM) as [TabKey, string][]).map(([key, value]) => [value, key])
 );
 
+// Section A/B perbaikan alur Laporan Kendala Staff — tab "Laporan Kendala
+// Staff" HARUS menampilkan SEMUA laporan aktif (belum final), bukan cuma
+// reported/under_review. Sebelumnya tiket yang sudah "assigned" jadi
+// hilang dari tab ini (hanya muncul di tab Antrian Tim IT), padahal
+// laporan itu masih aktif — bikin tabel di Maintenance & Kendala tidak
+// sinkron dengan Workflow Board (yang sudah benar dari awal).
+const ACTIVE_ISSUE_STATUSES: IssueTicketStatus[] = [
+  "reported",
+  "under_review",
+  "need_more_info",
+  "assigned",
+  "in_progress",
+  "external_coordination",
+  "waiting_reporter_confirmation",
+  "reporter_confirmed",
+  "needs_follow_up",
+];
+const FINAL_ISSUE_STATUSES: IssueTicketStatus[] = ["completed", "cancelled", "rejected", "duplicate"];
+
 const TICKET_TAB_STATUS: Partial<Record<TabKey, IssueTicketStatus[]>> = {
-  incoming: ["open", "review_by_asset_admin", "need_more_info"],
-  technician: ["waiting_diagnosis", "checking", "minor_fix"],
-  follow_up: ["needs_follow_up", "waiting_sparepart", "waiting_vendor"],
-  history: ["resolved", "closed", "rejected"],
+  incoming: ACTIVE_ISSUE_STATUSES,
+  technician: ["assigned", "in_progress", "external_coordination", "waiting_reporter_confirmation", "reporter_confirmed"],
+  follow_up: ["needs_follow_up"],
+  history: FINAL_ISSUE_STATUSES,
 };
+
+// Section C — subfilter kecil di dalam tab Laporan Kendala Staff supaya
+// QHSE masih bisa mempersempit tampilan tanpa kehilangan tiket lain dari
+// tabelnya (beda dengan bug lama: status assigned dulu memang tidak ada
+// di manapun dalam tab ini).
+type IncomingSubFilterKey =
+  | "all_active"
+  | "reported"
+  | "under_review"
+  | "need_more_info"
+  | "assigned"
+  | "in_progress"
+  | "external_coordination"
+  | "waiting_confirmation"
+  | "needs_follow_up";
+
+const INCOMING_SUB_FILTERS: { key: IncomingSubFilterKey; label: string; statuses: IssueTicketStatus[] }[] = [
+  { key: "all_active", label: "Semua Aktif", statuses: ACTIVE_ISSUE_STATUSES },
+  { key: "reported", label: "Laporan Masuk", statuses: ["reported"] },
+  { key: "under_review", label: "Ditinjau QHSE", statuses: ["under_review"] },
+  { key: "need_more_info", label: "Butuh Info", statuses: ["need_more_info"] },
+  { key: "assigned", label: "Menunggu Tim", statuses: ["assigned"] },
+  { key: "in_progress", label: "Sedang Ditangani", statuses: ["in_progress"] },
+  { key: "external_coordination", label: "Koordinasi Eksternal", statuses: ["external_coordination"] },
+  { key: "waiting_confirmation", label: "Menunggu Konfirmasi", statuses: ["waiting_reporter_confirmation", "reporter_confirmed"] },
+  { key: "needs_follow_up", label: "Butuh Tindakan Lanjutan", statuses: ["needs_follow_up"] },
+];
 
 const TABS: { key: TabKey; label: string; roles: AppRole[] }[] = [
   { key: "incoming", label: "Laporan Kendala Staff", roles: ["super_admin", "asset_admin"] },
@@ -114,8 +166,37 @@ function formatBadgeCount(count: number) {
   return String(count);
 }
 
-const HISTORY_DONE_STATUSES = ["completed", "resolved", "closed"];
-const HISTORY_CANCELLED_STATUSES = ["cancelled", "rejected"];
+const HISTORY_DONE_STATUSES = ["completed"];
+const HISTORY_CANCELLED_STATUSES = ["cancelled", "rejected", "duplicate"];
+
+type HistorySourceKind =
+  | "activity_log"
+  | "work_order_log"
+  | "asset_activity_log"
+  | "issue_ticket_log"
+  | "maintenance"
+  | "ticket";
+type HistorySourceFilter = "maintenance" | "ticket";
+type HistoryLogRecord = Record<string, unknown> & { id: string };
+
+interface MaintenanceHistoryItem {
+  id: string;
+  source: HistorySourceFilter;
+  recordSource: HistorySourceKind;
+  sourceId: string;
+  targetType: HistorySourceFilter;
+  number: string;
+  title: string;
+  typeLabel: string;
+  status: string;
+  statusLabel: string;
+  locationText: string;
+  assignedToName: string;
+  actorName: string;
+  completedAt: unknown;
+  resultSummary: string;
+  raw: MaintenanceWorkOrder | AssetIssueTicket | HistoryLogRecord;
+}
 
 function logMaintenanceListenerError(label: string) {
   return (error: unknown) => {
@@ -125,6 +206,183 @@ function logMaintenanceListenerError(label: string) {
 
 function normalizeMatchText(value?: string | null) {
   return (value || "").toLowerCase().trim();
+}
+
+function historyText(value: unknown, fallback = "") {
+  if (typeof value === "string" && value.trim()) return value;
+  if (typeof value === "number") return String(value);
+  return fallback;
+}
+
+function firstHistoryText(values: unknown[], fallback = "") {
+  for (const value of values) {
+    const text = historyText(value);
+    if (text) return text;
+  }
+  return fallback;
+}
+
+function firstHistoryValue(values: unknown[]) {
+  return values.find((value) => value !== undefined && value !== null) ?? null;
+}
+
+function getHistoryStatusLabel(status: string) {
+  return (
+    (WORK_ORDER_STATUS_LABEL as Record<string, string>)[status] ||
+    (ISSUE_STATUS_LABEL as Record<string, string>)[status] ||
+    status ||
+    "-"
+  );
+}
+
+function ticketReportTypeLabel(ticket: AssetIssueTicket) {
+  return ticket.reportType ? ISSUE_REPORT_TYPE_LABEL[ticket.reportType] : "Kendala Asset";
+}
+
+function ticketReportTypeColor(ticket: AssetIssueTicket) {
+  return ticket.reportType ? ISSUE_REPORT_TYPE_COLOR[ticket.reportType] : "bg-amber-50 text-amber-700 border-amber-200";
+}
+
+function ticketTitle(ticket: AssetIssueTicket) {
+  return ticket.title || ticket.symptomType || "Laporan Kendala Staff";
+}
+
+function ticketStatusLabel(ticket: AssetIssueTicket) {
+  return ticket.statusLabel || (ISSUE_STATUS_LABEL as Record<string, string>)[ticket.status] || ticket.status;
+}
+
+function ticketStatusColor(ticket: AssetIssueTicket) {
+  return (ISSUE_STATUS_COLOR as Record<string, string>)[ticket.status] || "bg-slate-100 text-slate-600 border-slate-200";
+}
+
+// Section D/I — jangan biarkan sel "Penanggung Jawab" kosong-tanpa-konteks
+// kalau tim sudah ditentukan tapi orangnya belum dipilih, dan jangan sampai
+// status "assigned" tanpa assignedTeam sama sekali terlihat seperti "belum
+// ditugaskan" — itu data cacat, bukan belum diproses (lihat isAssignmentIncomplete).
+function ticketAssignedPersonLabel(ticket: AssetIssueTicket) {
+  if (isAssignmentIncomplete(ticket)) return "Belum dipilih";
+  if (ticket.assignedToName) return ticket.assignedToName;
+  if (ticket.vendorName) return `${ticket.vendorName} (Vendor)`;
+  if (ticket.assignedTeam) return `${ticket.assignedTeamLabel || ticket.assignedTeam} - belum ada petugas`;
+  return "-";
+}
+
+function ticketAssignedTeamLabel(ticket: AssetIssueTicket) {
+  if (isAssignmentIncomplete(ticket)) return "Belum lengkap";
+  if (ticket.externalHandling) return ticket.externalHandlerLabel || ticket.assignedTeamLabel || "Teknisi Eksternal";
+  return ticket.assignedTeamLabel || ticket.assignedTeam || "-";
+}
+
+function ticketFieldImpact(ticket: AssetIssueTicket) {
+  return ticket.fieldImpact || ticket.severity;
+}
+
+function inferHistorySource(data: HistoryLogRecord, fallback: HistorySourceFilter): HistorySourceFilter {
+  const sourceText = firstHistoryText([
+    data.sourceType,
+    data.taskCategory,
+    data.reportType,
+    data.type,
+    data.source,
+    data.sourceCollection,
+  ]).toLowerCase();
+  if (
+    data.ticketId ||
+    sourceText.includes("ticket") ||
+    sourceText.includes("kendala") ||
+    sourceText.includes("issue") ||
+    sourceText.includes("staff")
+  ) {
+    return "ticket";
+  }
+  return fallback;
+}
+
+function isMaintenanceRelatedAssetLog(data: HistoryLogRecord) {
+  const haystack = [
+    data.type,
+    data.sourceType,
+    data.action,
+    data.detail,
+    data.note,
+    data.message,
+    data.category,
+  ]
+    .map((value) => historyText(value).toLowerCase())
+    .join(" ");
+  return (
+    !!data.workOrderId ||
+    !!data.ticketId ||
+    haystack.includes("maintenance") ||
+    haystack.includes("kendala") ||
+    haystack.includes("ticket") ||
+    haystack.includes("issue") ||
+    haystack.includes("work_order")
+  );
+}
+
+function normalizeHistoryItem(
+  source: HistorySourceKind,
+  docId: string,
+  data: HistoryLogRecord,
+  fallbackSource: HistorySourceFilter = "maintenance"
+): MaintenanceHistoryItem {
+  const sourceKind = inferHistorySource(data, fallbackSource);
+  const sourceId = firstHistoryText(
+    [data.sourceId, data.workOrderId, data.ticketId, data.assetId, docId],
+    docId
+  );
+  const taskNumber = firstHistoryText(
+    [data.taskNumber, data.maintenanceNumber, data.workOrderNumber, data.ticketNumber, data.number],
+    "-"
+  );
+  const title = firstHistoryText(
+    [data.title, data.message, data.actionLabel, data.statusLabel],
+    "Aktivitas maintenance"
+  );
+  const description = firstHistoryText([
+    data.description,
+    data.note,
+    data.detail,
+    data.reason,
+    data.lastActivityMessage,
+    data.message,
+  ]);
+  const actorName = firstHistoryText(
+    [data.createdByName, data.updatedByName, data.actorName, data.movedByName, data.performedByName, data.userName],
+    "-"
+  );
+  const status = firstHistoryText([data.status, data.toStatus, data.newStatus, data.action]);
+  const createdAt = firstHistoryValue([
+    data.createdAt,
+    data.performedAt,
+    data.timestamp,
+    data.updatedAt,
+    data.movedAt,
+    data.lastActivityAt,
+  ]);
+
+  return {
+    id: `${source}-${docId}`,
+    source: sourceKind,
+    recordSource: source,
+    sourceId,
+    targetType: sourceKind,
+    number: taskNumber,
+    title,
+    typeLabel: sourceKind === "ticket" ? "Laporan Kendala" : "Maintenance",
+    status,
+    statusLabel: getHistoryStatusLabel(status),
+    locationText: firstHistoryText([data.locationText, data.locationName, data.assetLocation], "-"),
+    assignedToName: firstHistoryText(
+      [data.assignedToName, data.technicianName, data.assignedTechnicianName],
+      "-"
+    ),
+    actorName,
+    completedAt: createdAt,
+    resultSummary: description || firstHistoryText([data.actionLabel, data.action], "-"),
+    raw: data,
+  };
 }
 
 // Cocokkan work order ke user Tim IT yang sedang login lewat SEMUA field
@@ -194,9 +452,9 @@ function isAssignedToCurrentIt(
 // ditugaskan ke user yang sedang login.
 function isAssignedToCurrentUser(
   item: {
-    assignedToUid?: string;
-    assignedToName?: string;
-    assignedToEmail?: string;
+    assignedToUid?: string | null;
+    assignedToName?: string | null;
+    assignedToEmail?: string | null;
     technicianUid?: string;
     technicianName?: string;
     technicianEmail?: string;
@@ -287,7 +545,12 @@ function MaintenancePageContent() {
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
   const [workOrders, setWorkOrders] = useState<MaintenanceWorkOrder[]>([]);
   const [items, setItems] = useState<MaintenanceWorkOrderItem[]>([]);
+  const [activityLogs, setActivityLogs] = useState<HistoryLogRecord[]>([]);
+  const [workOrderLogs, setWorkOrderLogs] = useState<HistoryLogRecord[]>([]);
+  const [assetActivityLogs, setAssetActivityLogs] = useState<HistoryLogRecord[]>([]);
+  const [issueTicketLogs, setIssueTicketLogs] = useState<HistoryLogRecord[]>([]);
   const [activeTab, setActiveTab] = useState<TabKey>("incoming");
+  const [incomingSubFilter, setIncomingSubFilter] = useState<IncomingSubFilterKey>("all_active");
   const [detailTarget, setDetailTarget] = useState<AssetIssueTicket | null>(null);
   const [woDetailTarget, setWoDetailTarget] = useState<MaintenanceWorkOrder | null>(null);
   const [editWorkOrderTarget, setEditWorkOrderTarget] = useState<MaintenanceWorkOrder | null>(null);
@@ -303,6 +566,7 @@ function MaintenancePageContent() {
   );
   const [historyStatusFilter, setHistoryStatusFilter] = useState<"all" | "done" | "cancelled">("all");
   const [historySearch, setHistorySearch] = useState("");
+  const [toast, setToast] = useState<ToastState | null>(null);
 
   const tabParam = searchParams.get("tab");
   const ticketIdParam = searchParams.get("ticketId");
@@ -370,6 +634,62 @@ function MaintenancePageContent() {
     return () => unsub();
   }, [canViewMaintenancePage]);
 
+  useEffect(() => {
+    if (!canViewMaintenancePage) return;
+    const q = query(collection(db, "asset_maintenance_activity_logs"), orderBy("createdAt", "desc"), limit(500));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[Maintenance Listener] asset_maintenance_activity_logs success:", snap.size);
+        setActivityLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() } as HistoryLogRecord)));
+      },
+      logMaintenanceListenerError("asset_maintenance_activity_logs")
+    );
+    return () => unsub();
+  }, [canViewMaintenancePage]);
+
+  useEffect(() => {
+    if (!canViewMaintenancePage) return;
+    const q = query(collection(db, "asset_maintenance_work_order_logs"), orderBy("performedAt", "desc"), limit(500));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[Maintenance Listener] asset_maintenance_work_order_logs success:", snap.size);
+        setWorkOrderLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() } as HistoryLogRecord)));
+      },
+      logMaintenanceListenerError("asset_maintenance_work_order_logs")
+    );
+    return () => unsub();
+  }, [canViewMaintenancePage]);
+
+  useEffect(() => {
+    if (!canViewMaintenancePage) return;
+    const q = query(collection(db, "asset_logs"), orderBy("timestamp", "desc"), limit(500));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[Maintenance Listener] asset_logs success:", snap.size);
+        setAssetActivityLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() } as HistoryLogRecord)));
+      },
+      logMaintenanceListenerError("asset_logs")
+    );
+    return () => unsub();
+  }, [canViewMaintenancePage]);
+
+  useEffect(() => {
+    if (!canViewMaintenancePage) return;
+    const q = query(collection(db, "asset_issue_logs"), orderBy("performedAt", "desc"), limit(500));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        console.log("[Maintenance Listener] asset_issue_logs success:", snap.size);
+        setIssueTicketLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() } as HistoryLogRecord)));
+      },
+      logMaintenanceListenerError("asset_issue_logs")
+    );
+    return () => unsub();
+  }, [canViewMaintenancePage]);
+
   // Deep link dari notifikasi: begitu data terkait sudah termuat, buka modal
   // detailnya langsung dan sorot barisnya selama 3 detik. Hanya dijalankan
   // sekali per kunjungan supaya menutup modal tidak langsung membukanya lagi.
@@ -424,14 +744,18 @@ function MaintenancePageContent() {
     // ditugaskan ke teknisi yang sedang login — BUKAN jadwal rutin.
     const statuses = TICKET_TAB_STATUS[activeTab];
     if (!statuses) return [];
-    const filtered = tickets.filter((t) => statuses.includes(t.status));
+    let filtered = tickets.filter((t) => statuses.includes(t.status));
+    if (activeTab === "incoming" && incomingSubFilter !== "all_active") {
+      const subStatuses = INCOMING_SUB_FILTERS.find((f) => f.key === incomingSubFilter)?.statuses || [];
+      filtered = filtered.filter((t) => subStatuses.includes(t.status));
+    }
     if (activeTab === "incoming" || activeTab === "technician") {
       return [...filtered].sort(
         (a, b) => ISSUE_PRIORITY_RANK[a.priority] - ISSUE_PRIORITY_RANK[b.priority]
       );
     }
     return filtered;
-  }, [tickets, activeTab]);
+  }, [tickets, activeTab, incomingSubFilter]);
 
   // Jadwal Maintenance Rutin: HANYA taskCategory "routine" — tugas korektif
   // (taskCategory "corrective") tidak boleh muncul di sini.
@@ -469,7 +793,7 @@ function MaintenancePageContent() {
           (task) =>
             task.taskCategory === "corrective" &&
             isAssignedToCurrentIt(task, currentAssetUser, firebaseUser) &&
-            !["completed", "cancelled", "closed"].includes(task.status)
+            !["completed", "cancelled", "rejected", "duplicate"].includes(task.status)
         )
         .sort(sortWorkOrdersNewestFirst),
     [correctiveTasks, currentAssetUser, firebaseUser]
@@ -601,57 +925,133 @@ function MaintenancePageContent() {
 
   const overdueWorkOrders = workOrders.filter((w) => isWorkOrderOverdue(w));
 
-  // Riwayat = arsip pekerjaan yang SUDAH final (selesai/dibatalkan/ditolak/
-  // ditutup), digabung dari dua sumber (work order maintenance + ticket
-  // kendala) dan diurutkan terbaru dulu. Tim IT hanya melihat riwayat yang
-  // pernah ditugaskan ke dirinya — QHSE/super_admin melihat semuanya.
-  const historyItems = useMemo(() => {
-    const maintenanceHistory = workOrders
-      .filter((wo) => ["completed", "cancelled"].includes(wo.status))
-      .filter((wo) =>
-        role === "it_team" ? isAssignedToCurrentUser(wo, currentAssetUser, firebaseUser) : true
+  // Riwayat = gabungan log baru + log lama + fallback dokumen kerja/ticket.
+  // Jangan dibatasi hanya status selesai, karena user perlu melihat pindah
+  // status, laporan dikirim, cek ulang, follow-up, pembatalan, dan selesai.
+  const historyItems = useMemo<MaintenanceHistoryItem[]>(() => {
+    const currentHistoryUid = currentAssetUser?.uid || firebaseUser?.uid || "";
+    const findWorkOrder = (item: MaintenanceHistoryItem) =>
+      workOrders.find((wo) => wo.id === item.sourceId || wo.workOrderNumber === item.number);
+    const findTicket = (item: MaintenanceHistoryItem) =>
+      tickets.find((ticket) => ticket.id === item.sourceId || ticket.ticketNumber === item.number);
+    const visibleForRole = (item: MaintenanceHistoryItem) => {
+      if (role !== "it_team") return true;
+      if (item.targetType === "maintenance") {
+        const workOrder = findWorkOrder(item);
+        if (workOrder) return isAssignedToCurrentUser(workOrder, currentAssetUser, firebaseUser);
+      }
+      if (item.targetType === "ticket") {
+        const ticket = findTicket(item);
+        if (ticket) return isAssignedToCurrentUser(ticket, currentAssetUser, firebaseUser);
+      }
+      const raw = item.raw as HistoryLogRecord;
+      return (
+        raw.createdByUid === currentHistoryUid ||
+        raw.updatedByUid === currentHistoryUid ||
+        raw.performedByUid === currentHistoryUid ||
+        raw.movedByUid === currentHistoryUid ||
+        raw.userUid === currentHistoryUid
+      );
+    };
+
+    const normalizedActivityLogs = activityLogs.map((log) =>
+      normalizeHistoryItem("activity_log", log.id, log, "maintenance")
+    );
+    const normalizedWorkOrderLogs = workOrderLogs.map((log) =>
+      normalizeHistoryItem("work_order_log", log.id, log, "maintenance")
+    );
+    const normalizedAssetActivityLogs = assetActivityLogs
+      .filter(isMaintenanceRelatedAssetLog)
+      .map((log) => normalizeHistoryItem("asset_activity_log", log.id, log, "maintenance"));
+    const normalizedIssueTicketLogs = issueTicketLogs.map((log) =>
+      normalizeHistoryItem("issue_ticket_log", log.id, log, "ticket")
+    );
+
+    const workOrderFallbacks: MaintenanceHistoryItem[] = workOrders
+      .filter(
+        (wo) =>
+          ["completed", "cancelled", "report_submitted", "revision_requested"].includes(wo.status) ||
+          !!wo.followUpStatus
       )
       .map((wo) => ({
-        id: wo.id,
-        source: "maintenance" as const,
+        id: `maintenance-${wo.id}`,
+        source: "maintenance",
+        recordSource: "maintenance",
+        sourceId: wo.id,
+        targetType: "maintenance",
         number: wo.workOrderNumber || wo.id,
         title: wo.title,
         typeLabel: isRoutineWorkOrder(wo) ? "Maintenance Rutin" : "Maintenance Korektif",
         status: wo.status as string,
+        statusLabel: getHistoryStatusLabel(wo.status),
         locationText: wo.maintenanceLocationText || wo.locationText || "-",
-        assignedToName: wo.assignedToName || wo.technicianName || "-",
-        completedAt: wo.completedAt || wo.cancelledAt || wo.updatedAt || wo.createdAt,
-        resultSummary: wo.qhseNote || wo.notes || wo.cancelReason || "-",
-        linkUrl: `/maintenance?tab=history&workOrderId=${wo.id}`,
+        assignedToName: wo.assignedToName || wo.technicianName || wo.assignedTechnicianName || "-",
+        actorName: wo.updatedByName || wo.completedByName || wo.cancelledByName || wo.requestedByName || "-",
+        completedAt:
+          wo.completedAt ||
+          wo.cancelledAt ||
+          wo.reportSubmittedAt ||
+          wo.lastActivityAt ||
+          wo.updatedAt ||
+          wo.createdAt,
+        resultSummary:
+          wo.lastActivityMessage ||
+          wo.reportSummary ||
+          wo.qhseNote ||
+          wo.notes ||
+          wo.cancelReason ||
+          "-",
         raw: wo,
       }));
 
-    const ticketHistory = tickets
-      .filter((t) => ["resolved", "closed", "rejected"].includes(t.status))
+    const ticketFallbacks: MaintenanceHistoryItem[] = tickets
       .filter((t) =>
-        role === "it_team" ? isAssignedToCurrentUser(t, currentAssetUser, firebaseUser) : true
+        ["completed", "cancelled", "rejected", "duplicate", "needs_follow_up"].includes(t.status)
       )
       .map((t) => ({
-        id: t.id,
-        source: "ticket" as const,
+        id: `ticket-${t.id}`,
+        source: "ticket",
+        recordSource: "ticket",
+        sourceId: t.id,
+        targetType: "ticket",
         number: t.ticketNumber || t.id,
         title: t.assetName ? `${t.symptomType} — ${t.assetName}` : t.description || "Laporan Kendala",
-        typeLabel: "Laporan Kendala",
+        typeLabel: ticketReportTypeLabel(t),
         status: t.status as string,
+        statusLabel: getHistoryStatusLabel(t.status),
         locationText: t.locationText || t.assetLocation || "-",
-        assignedToName: t.assignedToName || "-",
+        assignedToName: t.assignedToName || t.assignedTeam || "-",
+        actorName: t.assignedToName || t.assignedTeam || t.reportedByName || "-",
         completedAt: t.resolvedAt || t.closedAt || t.updatedAt || t.createdAt,
-        resultSummary: t.resolutionNote || t.diagnosis || "-",
-        linkUrl: `/maintenance?tab=history&ticketId=${t.id}`,
+        resultSummary: t.resolutionNote || t.diagnosis || t.description || "-",
         raw: t,
       }));
 
-    return [...maintenanceHistory, ...ticketHistory].sort((a, b) => {
-      const aTime = toDateSafe(a.completedAt)?.getTime() || 0;
-      const bTime = toDateSafe(b.completedAt)?.getTime() || 0;
-      return bTime - aTime;
-    });
-  }, [workOrders, tickets, role, currentAssetUser, firebaseUser]);
+    return [
+      ...normalizedActivityLogs,
+      ...normalizedWorkOrderLogs,
+      ...normalizedAssetActivityLogs,
+      ...normalizedIssueTicketLogs,
+      ...workOrderFallbacks,
+      ...ticketFallbacks,
+    ]
+      .filter(visibleForRole)
+      .sort((a, b) => {
+        const aTime = toDateSafe(a.completedAt)?.getTime() || 0;
+        const bTime = toDateSafe(b.completedAt)?.getTime() || 0;
+        return bTime - aTime;
+      });
+  }, [
+    activityLogs,
+    workOrderLogs,
+    assetActivityLogs,
+    issueTicketLogs,
+    workOrders,
+    tickets,
+    role,
+    currentAssetUser,
+    firebaseUser,
+  ]);
 
   const filteredHistoryItems = useMemo(() => {
     const search = historySearch.trim().toLowerCase();
@@ -664,7 +1064,15 @@ function MaintenancePageContent() {
       )
         return false;
       if (search) {
-        const haystack = [item.number, item.title, item.locationText, item.assignedToName]
+        const haystack = [
+          item.number,
+          item.title,
+          item.locationText,
+          item.assignedToName,
+          item.actorName,
+          item.statusLabel,
+          item.resultSummary,
+        ]
           .join(" ")
           .toLowerCase();
         if (!haystack.includes(search)) return false;
@@ -672,6 +1080,24 @@ function MaintenancePageContent() {
       return true;
     });
   }, [historyItems, historySourceFilter, historyStatusFilter, historySearch]);
+
+  useEffect(() => {
+    console.log("[Maintenance History Debug]", {
+      activityLogs: activityLogs.length,
+      workOrderLogs: workOrderLogs.length,
+      assetActivityLogs: assetActivityLogs.filter(isMaintenanceRelatedAssetLog).length,
+      issueTicketLogs: issueTicketLogs.length,
+      workOrderFallbacks: workOrders.filter(
+        (wo) =>
+          ["completed", "cancelled", "report_submitted", "revision_requested"].includes(wo.status) ||
+          !!wo.followUpStatus
+      ).length,
+      ticketFallbacks: tickets.filter((t) =>
+        ["completed", "cancelled", "rejected", "duplicate", "needs_follow_up"].includes(t.status)
+      ).length,
+      mergedHistory: historyItems.length,
+    });
+  }, [activityLogs, workOrderLogs, assetActivityLogs, issueTicketLogs, workOrders, tickets, historyItems.length]);
 
   // Summary card WAJIB menghitung dari kedua collection (tickets + work
   // orders), termasuk status baru (created/accepted/in_progress/
@@ -859,14 +1285,20 @@ function MaintenancePageContent() {
       color: "bg-blue-50 text-blue-600",
     },
     {
-      label: "Menunggu Diagnosa IT",
-      value: summaryCounts.corrective.waitingDiagnosis,
+      label: "Menunggu Diagnosa / Review QHSE",
+      value: summaryCounts.corrective.waitingReview,
       icon: Wrench,
       color: "bg-purple-50 text-purple-600",
     },
     {
-      label: "Sedang Dicek",
-      value: summaryCounts.corrective.checking,
+      label: "Menunggu Tim Terkait",
+      value: summaryCounts.corrective.waitingTeam,
+      icon: Users,
+      color: "bg-amber-50 text-amber-600",
+    },
+    {
+      label: "Sedang Ditangani",
+      value: summaryCounts.corrective.inProgress,
       icon: Wrench,
       color: "bg-indigo-50 text-indigo-600",
     },
@@ -877,7 +1309,7 @@ function MaintenancePageContent() {
       color: "bg-red-50 text-red-600",
     },
     {
-      label: "Selesai",
+      label: "Selesai Bulan Ini",
       value: summaryCounts.corrective.resolvedThisMonth,
       icon: CheckCircle2,
       color: "bg-emerald-50 text-emerald-600",
@@ -934,6 +1366,9 @@ function MaintenancePageContent() {
         </div>
       </div>
 
+      {/* Section A — tab utama dikembalikan (Laporan Kendala Staff,
+          Maintenance Rutin, Tugas Saya, Butuh Tindakan Lanjutan, Riwayat,
+          + Antrian Tim IT) — TIDAK diganti oleh Kanban. */}
       <div className="flex items-center gap-1 mb-4 border-b border-slate-200 overflow-x-auto">
         {visibleTabs.map((t) => {
           const badgeCount = tabBadgeCount[t.key];
@@ -1229,7 +1664,7 @@ function MaintenancePageContent() {
                   type="text"
                   value={historySearch}
                   onChange={(e) => setHistorySearch(e.target.value)}
-                  placeholder="Cari nomor, judul, lokasi, teknisi..."
+                  placeholder="Cari nomor, judul, lokasi, teknisi, aktor..."
                   className="input text-sm ml-auto w-full sm:w-64"
                 />
               </div>
@@ -1254,47 +1689,73 @@ function MaintenancePageContent() {
                         </tr>
                       </thead>
                       <tbody>
-                        {filteredHistoryItems.map((item) => (
-                          <tr
-                            key={`${item.source}-${item.id}`}
-                            className={`border-b border-slate-100 last:border-0 hover:bg-slate-50/70 transition-colors ${
-                              highlightId === item.id ? "bg-amber-50" : ""
-                            }`}
-                          >
-                            <td className="px-4 py-3 text-slate-500">{formatDateTime(item.completedAt)}</td>
-                            <td className="px-4 py-3 font-medium text-slate-800">{item.number}</td>
-                            <td className="px-4 py-3 text-slate-600">{item.typeLabel}</td>
-                            <td className="px-4 py-3 text-slate-600">{item.title}</td>
-                            <td className="px-4 py-3 text-slate-600">{item.locationText}</td>
-                            <td className="px-4 py-3 text-slate-600">{item.assignedToName}</td>
-                            <td className="px-4 py-3">
-                              {item.source === "maintenance" ? (
-                                <WorkOrderStatusBadge workOrder={item.raw as MaintenanceWorkOrder} />
-                              ) : (
-                                <Badge
-                                  label={ISSUE_STATUS_LABEL[(item.raw as AssetIssueTicket).status]}
-                                  colorClass={ISSUE_STATUS_COLOR[(item.raw as AssetIssueTicket).status]}
-                                />
-                              )}
-                            </td>
-                            <td className="px-4 py-3 text-slate-600">{item.resultSummary}</td>
-                            <td className="px-4 py-3 text-right">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  if (item.source === "maintenance") {
-                                    setWoDetailTarget(item.raw as MaintenanceWorkOrder);
-                                  } else {
-                                    setDetailTarget(item.raw as AssetIssueTicket);
-                                  }
-                                }}
-                                className="text-sm font-medium text-blue-600 cursor-pointer hover:underline"
-                              >
-                                Lihat Detail
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
+                        {filteredHistoryItems.map((item) => {
+                          const targetWorkOrder =
+                            item.targetType === "maintenance"
+                              ? workOrders.find((w) => w.id === item.sourceId || w.workOrderNumber === item.number)
+                              : null;
+                          const targetTicket =
+                            item.targetType === "ticket"
+                              ? tickets.find((t) => t.id === item.sourceId || t.ticketNumber === item.number)
+                              : null;
+                          const canOpenDetail = !!targetWorkOrder || !!targetTicket;
+
+                          return (
+                            <tr
+                              key={item.id}
+                              className={`border-b border-slate-100 last:border-0 hover:bg-slate-50/70 transition-colors ${
+                                highlightId === item.sourceId || highlightId === item.id ? "bg-amber-50" : ""
+                              }`}
+                            >
+                              <td className="px-4 py-3 text-slate-500">{formatDateTime(item.completedAt)}</td>
+                              <td className="px-4 py-3 font-medium text-slate-800">{item.number}</td>
+                              <td className="px-4 py-3 text-slate-600">{item.typeLabel}</td>
+                              <td className="px-4 py-3 text-slate-600">{item.title}</td>
+                              <td className="px-4 py-3 text-slate-600">{item.locationText}</td>
+                              <td className="px-4 py-3 text-slate-600">{item.assignedToName}</td>
+                              <td className="px-4 py-3">
+                                {targetWorkOrder ? (
+                                  <WorkOrderStatusBadge workOrder={targetWorkOrder} />
+                                ) : targetTicket ? (
+                                  <Badge
+                                    label={ISSUE_STATUS_LABEL[targetTicket.status]}
+                                    colorClass={ISSUE_STATUS_COLOR[targetTicket.status]}
+                                  />
+                                ) : (
+                                  <Badge label={item.statusLabel} colorClass="bg-slate-100 text-slate-600 border-slate-200" />
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-slate-600">
+                                <div>
+                                  <p>{item.resultSummary}</p>
+                                  {item.actorName !== "-" && (
+                                    <p className="mt-1 text-xs text-slate-400">Oleh {item.actorName}</p>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="px-4 py-3 text-right">
+                                <button
+                                  type="button"
+                                  disabled={!canOpenDetail}
+                                  onClick={() => {
+                                    if (targetWorkOrder) {
+                                      setWoDetailTarget(targetWorkOrder);
+                                    } else if (targetTicket) {
+                                      setDetailTarget(targetTicket);
+                                    }
+                                  }}
+                                  className={`text-sm font-medium ${
+                                    canOpenDetail
+                                      ? "text-blue-600 cursor-pointer hover:underline"
+                                      : "text-slate-400 cursor-not-allowed"
+                                  }`}
+                                >
+                                  {canOpenDetail ? "Lihat Detail" : "Log Saja"}
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -1303,6 +1764,24 @@ function MaintenancePageContent() {
             </div>
           ) : (
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+              {activeTab === "incoming" && (
+                <div className="flex flex-wrap gap-2 border-b border-slate-100 px-4 py-3">
+                  {INCOMING_SUB_FILTERS.map((f) => (
+                    <button
+                      key={f.key}
+                      type="button"
+                      onClick={() => setIncomingSubFilter(f.key)}
+                      className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+                        incomingSubFilter === f.key
+                          ? "border-slate-800 bg-slate-800 text-white"
+                          : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+              )}
               {ticketsForTab.length === 0 ? (
             <EmptyState
               icon={Inbox}
@@ -1313,19 +1792,23 @@ function MaintenancePageContent() {
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
-                    <th className="px-4 py-3 font-semibold">Nomor Ticket</th>
-                    <th className="px-4 py-3 font-semibold">Asset</th>
+                    <th className="px-4 py-3 font-semibold">Nomor Laporan</th>
+                    <th className="px-4 py-3 font-semibold">Judul</th>
+                    <th className="px-4 py-3 font-semibold">Jenis Laporan</th>
+                    <th className="px-4 py-3 font-semibold">Lokasi</th>
                     <th className="px-4 py-3 font-semibold">Pelapor</th>
-                    <th className="px-4 py-3 font-semibold">Gejala</th>
-                    <th className="px-4 py-3 font-semibold">Dampak</th>
-                    <th className="px-4 py-3 font-semibold">Prioritas</th>
+                    <th className="px-4 py-3 font-semibold">Tingkat Dampak</th>
+                    <th className="px-4 py-3 font-semibold">Tim Terkait</th>
+                    <th className="px-4 py-3 font-semibold">Penanggung Jawab</th>
                     <th className="px-4 py-3 font-semibold">Status</th>
                     <th className="px-4 py-3 font-semibold">Tanggal Lapor</th>
                     <th className="px-4 py-3 font-semibold text-right">Aksi</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {ticketsForTab.map((t) => (
+                  {ticketsForTab.map((t) => {
+                    const impact = ticketFieldImpact(t);
+                    return (
                     <tr
                       key={t.id}
                       className={`border-b border-slate-100 last:border-0 hover:bg-slate-50/70 transition-colors ${
@@ -1334,19 +1817,38 @@ function MaintenancePageContent() {
                     >
                       <td className="px-4 py-3 font-medium text-slate-800">{t.ticketNumber}</td>
                       <td className="px-4 py-3 text-slate-600">
-                        <p>{t.assetName}</p>
-                        <p className="text-xs text-slate-400">{t.assetCode}</p>
+                        <p className="font-medium text-slate-800">{ticketTitle(t)}</p>
+                        <p className="line-clamp-2 text-xs text-slate-400">{t.description}</p>
+                        <p className="text-xs text-slate-400">{t.assetName ? `${t.assetName} (${t.assetCode || "-"})` : "Tanpa asset"}</p>
+                      </td>
+                      <td className="px-4 py-3">
+                        <Badge label={ticketReportTypeLabel(t)} colorClass={ticketReportTypeColor(t)} />
+                      </td>
+                      <td className="px-4 py-3 text-slate-600">
+                        <p>{t.locationText || t.assetLocation || "-"}</p>
+                        <p className="text-xs text-slate-400">{t.detailArea || "-"}</p>
                       </td>
                       <td className="px-4 py-3 text-slate-600">{t.reportedByName}</td>
-                      <td className="px-4 py-3 text-slate-600">{t.symptomType}</td>
-                      <td className="px-4 py-3 text-slate-600">{t.impactLevel}</td>
                       <td className="px-4 py-3">
-                        <Badge label={ISSUE_PRIORITY_LABEL[t.priority]} colorClass={ISSUE_PRIORITY_COLOR[t.priority]} />
+                        {impact ? (
+                          <Badge label={t.fieldImpactLabel || FIELD_IMPACT_LABEL[impact]} colorClass={FIELD_IMPACT_COLOR[impact]} />
+                        ) : (
+                          <span className="text-slate-400">-</span>
+                        )}
                       </td>
+                      <td className="px-4 py-3 text-slate-600">
+                        {ticketAssignedTeamLabel(t)}
+                        {isAssignmentIncomplete(t) && (
+                          <span className="mt-1 block">
+                            <Badge label="Penugasan belum lengkap" colorClass="bg-amber-50 text-amber-700 border-amber-200" />
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-slate-600">{ticketAssignedPersonLabel(t)}</td>
                       <td className="px-4 py-3">
-                        <Badge label={ISSUE_STATUS_LABEL[t.status]} colorClass={ISSUE_STATUS_COLOR[t.status]} />
+                        <Badge label={ticketStatusLabel(t)} colorClass={ticketStatusColor(t)} />
                       </td>
-                      <td className="px-4 py-3 text-slate-500">{formatDateTime(t.reportedAt)}</td>
+                      <td className="px-4 py-3 text-slate-500">{formatDateTime(t.createdAt || t.reportedAt)}</td>
                       <td className="px-4 py-3 text-right">
                         <button
                           type="button"
@@ -1357,7 +1859,8 @@ function MaintenancePageContent() {
                         </button>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1366,6 +1869,8 @@ function MaintenancePageContent() {
           )}
         </div>
       )}
+
+      <Toast toast={toast} onClose={() => setToast(null)} />
 
       {detailTarget && (
         <IssueTicketDetailModal

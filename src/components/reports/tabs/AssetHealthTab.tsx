@@ -14,6 +14,7 @@ import {
   toDateSafe,
 } from "@/lib/reports";
 import Badge from "@/components/Badge";
+import ResponsiveTable from "@/components/reports/ResponsiveTable";
 
 const PAGE_SIZE = 25;
 
@@ -32,10 +33,10 @@ export default function AssetHealthTab({
     return assets.map((asset) => {
       const assetTickets = tickets.filter((t) => t.assetId === asset.id);
       const unresolvedCount = assetTickets.filter(
-        (t) => !["resolved", "closed", "rejected"].includes(t.status)
+        (t) => !["completed", "cancelled", "rejected", "duplicate"].includes(t.status)
       ).length;
       const resolvedLast30d = assetTickets.filter((t) => {
-        if (t.status !== "resolved" && t.status !== "closed") return false;
+        if (t.status !== "completed") return false;
         const resolvedAt = toDateSafe(t.resolvedAt);
         if (!resolvedAt) return false;
         return Date.now() - resolvedAt.getTime() <= 30 * 86400000;
@@ -107,51 +108,42 @@ export default function AssetHealthTab({
         </button>
       </div>
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
-                <th className="px-4 py-3 font-semibold">Asset</th>
-                <th className="px-4 py-3 font-semibold">Kategori</th>
-                <th className="px-4 py-3 font-semibold">Lokasi</th>
-                <th className="px-4 py-3 font-semibold">Kondisi</th>
-                <th className="px-4 py-3 font-semibold">Status</th>
-                <th className="px-4 py-3 font-semibold">Ticket</th>
-                <th className="px-4 py-3 font-semibold">Maintenance</th>
-                <th className="px-4 py-3 font-semibold">Next Maintenance</th>
-                <th className="px-4 py-3 font-semibold">Health Score</th>
-                <th className="px-4 py-3 font-semibold">Rekomendasi</th>
-              </tr>
-            </thead>
-            <tbody>
-              {paged.map((r) => (
-                <tr key={r.asset.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50/70">
-                  <td className="px-4 py-3">
-                    <Link href={`/reports/assets/${r.asset.id}`} className="font-medium text-blue-600 hover:underline">
-                      {r.asset.assetName}
-                    </Link>
-                    <p className="text-xs text-slate-400">{r.asset.assetCode}</p>
-                  </td>
-                  <td className="px-4 py-3 text-slate-600">{r.asset.categoryName}</td>
-                  <td className="px-4 py-3 text-slate-600">
-                    {[r.asset.buildingName, r.asset.floor, r.asset.roomName].filter(Boolean).join(" - ") ||
-                      r.asset.location ||
-                      "-"}
-                  </td>
-                  <td className="px-4 py-3 text-slate-600">{CONDITION_LABEL[r.asset.condition]}</td>
-                  <td className="px-4 py-3 text-slate-600">{ASSET_STATUS_LABEL[r.asset.assetStatus]}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.ticketCount}</td>
-                  <td className="px-4 py-3 text-slate-600">{r.maintenanceCount}</td>
-                  <td className="px-4 py-3 text-slate-500">{formatDate(r.asset.nextMaintenanceAt)}</td>
-                  <td className="px-4 py-3 font-semibold text-slate-800">{r.score}</td>
-                  <td className="px-4 py-3">
-                    <Badge label={r.label} colorClass={HEALTH_LABEL_COLOR[r.label]} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <ResponsiveTable
+          rows={paged}
+          keyFn={(r) => r.asset.id}
+          columns={[
+            {
+              label: "Asset",
+              primary: true,
+              render: (r) => (
+                <>
+                  <Link href={`/reports/assets/${r.asset.id}`} className="font-medium text-blue-600 hover:underline">
+                    {r.asset.assetName}
+                  </Link>
+                  <p className="text-xs text-slate-400">{r.asset.assetCode}</p>
+                </>
+              ),
+            },
+            { label: "Kategori", render: (r) => r.asset.categoryName },
+            {
+              label: "Lokasi",
+              render: (r) =>
+                [r.asset.buildingName, r.asset.floor, r.asset.roomName].filter(Boolean).join(" - ") ||
+                r.asset.location ||
+                "-",
+            },
+            { label: "Kondisi", render: (r) => CONDITION_LABEL[r.asset.condition] },
+            { label: "Status", render: (r) => ASSET_STATUS_LABEL[r.asset.assetStatus] },
+            { label: "Ticket", render: (r) => r.ticketCount },
+            { label: "Maintenance", render: (r) => r.maintenanceCount },
+            { label: "Next Maintenance", render: (r) => formatDate(r.asset.nextMaintenanceAt) },
+            { label: "Health Score", render: (r) => r.score },
+            {
+              label: "Rekomendasi",
+              render: (r) => <Badge label={r.label} colorClass={HEALTH_LABEL_COLOR[r.label]} />,
+            },
+          ]}
+        />
         {totalPages > 1 && (
           <div className="flex items-center justify-between px-4 py-3 border-t border-slate-100 text-sm">
             <span className="text-slate-500">

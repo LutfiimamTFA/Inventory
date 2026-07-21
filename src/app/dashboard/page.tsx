@@ -20,10 +20,16 @@ import { Asset, AssetBorrowing, AssetIssueTicket, MaintenanceWorkOrder } from "@
 import {
   ASSET_STATUS_COLOR,
   ASSET_STATUS_LABEL,
-  formatCurrency,
   formatDate,
 } from "@/lib/utils";
 import { isWorkOrderOverdueRecord } from "@/lib/reports";
+import {
+  formatRupiah,
+  getAssetPrice,
+  hasInvoice,
+  hasPrice,
+  isFinanceComplete,
+} from "@/lib/assetFinance";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
 import StatCard from "@/components/StatCard";
@@ -39,6 +45,16 @@ export default function DashboardPage() {
   );
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
   const [workOrders, setWorkOrders] = useState<MaintenanceWorkOrder[]>([]);
+
+  // Section A — Asset Finance TIDAK boleh akses maintenance/kendala sama
+  // sekali (bukan ranahnya, dan rules Firestore memang tidak mengizinkan) —
+  // listener-nya harus di-skip, bukan cuma disembunyikan di UI, supaya tidak
+  // memicu "Missing or insufficient permissions".
+  const isAssetFinanceRole = role === "asset_finance";
+  const isAssetAdminRole = role === "asset_admin";
+  const isSuperAdminRole = role === "super_admin";
+  const isItTeamRole = role === "it_team";
+  const canViewMaintenanceDashboard = isSuperAdminRole || isAssetAdminRole || isItTeamRole;
 
   useEffect(() => {
     if (!authReady) return;
@@ -80,6 +96,11 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (!authReady) return;
+    // Section C — bukan ranah Asset Finance, skip listener sama sekali.
+    if (isAssetFinanceRole) {
+      console.log("[DashboardPage] skip asset_issue_tickets listener for asset_finance");
+      return;
+    }
     const unsub = onSnapshot(
       collection(db, "asset_issue_tickets"),
       (snap) => {
@@ -91,10 +112,19 @@ export default function DashboardPage() {
       }
     );
     return () => unsub();
-  }, [authReady]);
+  }, [authReady, isAssetFinanceRole]);
 
   useEffect(() => {
     if (!authReady) return;
+    // Section B — rules Firestore tidak mengizinkan role selain Super
+    // Admin/Asset Admin/Tim IT membaca work order maintenance, jadi listener
+    // ini WAJIB di-skip (bukan cuma disembunyikan di UI) supaya tidak
+    // memicu "Missing or insufficient permissions" untuk role lain
+    // (termasuk Asset Finance, Staff, Location PIC).
+    if (!canViewMaintenanceDashboard) {
+      console.log("[DashboardPage] skip asset_maintenance_work_orders listener for role:", role);
+      return;
+    }
     const unsub = onSnapshot(
       collection(db, "asset_maintenance_work_orders"),
       (snap) => {
@@ -108,7 +138,7 @@ export default function DashboardPage() {
       }
     );
     return () => unsub();
-  }, [authReady]);
+  }, [authReady, role, canViewMaintenanceDashboard]);
 
   const total = assets.length;
   const available = assets.filter((a) => a.assetStatus === "available").length;
@@ -119,7 +149,57 @@ export default function DashboardPage() {
   const broken = assets.filter(
     (a) => a.assetStatus === "broken" || a.assetStatus === "lost"
   ).length;
-  const totalValue = assets.reduce((sum, a) => sum + (a.purchasePrice || 0), 0);
+  // Section A/D — nominal harga di dashboard utama HANYA dihitung untuk
+  // Asset Finance. QHSE/Asset Admin, Tim IT, Staff — bahkan Super Admin di
+  // dashboard utama ini — tidak boleh lihat nominal, jadi tidak perlu
+  // dihitung sama sekali untuk mereka.
+  const canViewFinancialValue = isAssetFinanceRole;
+
+  // Section C/D — dashboard finance untuk Asset Finance, dihitung MURNI dari
+  // collection assets (tidak butuh maintenance/tickets sama sekali), dan
+  // HANYA dihitung kalau role-nya memang Asset Finance.
+  const financeSummary = useMemo(() => {
+    if (!canViewFinancialValue) {
+      return {
+        totalAssetValue: 0,
+        pricedCount: 0,
+        noPriceCount: 0,
+        noInvoiceCount: 0,
+        completeCount: 0,
+        noInvoiceValue: 0,
+        thisMonthValue: 0,
+        averageAssetValue: 0,
+      };
+    }
+    const pricedAssets = assets.filter(hasPrice);
+    const noPriceCount = assets.filter((a) => !hasPrice(a)).length;
+    const noInvoiceAssets = assets.filter((a) => !hasInvoice(a));
+    const completeCount = assets.filter(isFinanceComplete).length;
+    const totalAssetValue = assets.reduce((sum, a) => sum + getAssetPrice(a), 0);
+    const noInvoiceValue = noInvoiceAssets.reduce((sum, a) => sum + getAssetPrice(a), 0);
+    const averageAssetValue = pricedAssets.length > 0 ? totalAssetValue / pricedAssets.length : 0;
+
+    const now = new Date();
+    const thisMonthValue = assets.reduce((sum, a) => {
+      if (!a.purchaseDate) return sum;
+      const d = new Date(a.purchaseDate);
+      if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth()) {
+        return sum + getAssetPrice(a);
+      }
+      return sum;
+    }, 0);
+
+    return {
+      totalAssetValue,
+      pricedCount: pricedAssets.length,
+      noPriceCount,
+      noInvoiceCount: noInvoiceAssets.length,
+      completeCount,
+      noInvoiceValue,
+      thisMonthValue,
+      averageAssetValue,
+    };
+  }, [assets, canViewFinancialValue]);
 
   const recentAssets = [...assets]
     .sort((a, b) => {
@@ -130,7 +210,7 @@ export default function DashboardPage() {
     .slice(0, 5);
 
   const unresolvedTickets = tickets.filter(
-    (t) => !["resolved", "closed", "rejected"].includes(t.status)
+    (t) => !["completed", "cancelled", "resolved", "closed", "rejected"].includes(t.status)
   ).length;
 
   const myRoutineWorkOrders = useMemo(
@@ -149,8 +229,24 @@ export default function DashboardPage() {
   const maintenanceCompleted = workOrders.filter((w) => w.status === "completed").length;
   const maintenanceOverdueAll = workOrders.filter((w) => isWorkOrderOverdueRecord(w)).length;
   const staffReportsPending = tickets.filter((t) =>
-    ["open", "review_by_asset_admin", "need_more_info"].includes(t.status)
+    ["reported", "under_review", "need_more_info"].includes(t.status)
   ).length;
+
+  // Section K — widget ringkas "Monitoring Pekerjaan Aktif", 4 card saja
+  // (bukan Kanban besar) dengan tombol ke Workflow Board penuh. Rutin dan
+  // Kendala Staff dihitung dari status masing-masing alur sendiri, BUKAN
+  // dari satu kolom kanban gabungan (keduanya punya arti berbeda).
+  const workflowSummary = useMemo(() => {
+    const created = workOrders.filter((w) => ["draft", "created", "overdue"].includes(w.status)).length +
+      tickets.filter((t) => t.status === "reported").length;
+    const inProgress = workOrders.filter((w) => ["in_progress", "partially_completed"].includes(w.status)).length +
+      tickets.filter((t) => t.status === "in_progress").length;
+    const waitingQhse = workOrders.filter((w) => w.status === "report_submitted" && w.needsQhseReview).length +
+      tickets.filter((t) => t.status === "waiting_reporter_confirmation" || t.status === "reporter_confirmed").length;
+    const needsFollowUp = workOrders.filter((w) => w.status === "revision_requested").length +
+      tickets.filter((t) => t.status === "needs_follow_up").length;
+    return { created, inProgress, waitingQhse, needsFollowUp };
+  }, [workOrders, tickets]);
 
   return (
     <ProtectedLayout>
@@ -159,34 +255,81 @@ export default function DashboardPage() {
         subtitle="Ringkasan kondisi seluruh aset perusahaan saat ini."
       />
 
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
-        <StatCard icon={Package} label="Total Aset" value={total} tone="slate" />
-        <StatCard
-          icon={CheckCircle2}
-          label="Tersedia"
-          value={available}
-          tone="emerald"
-        />
-        <StatCard icon={Clock} label="Dipinjam" value={borrowed} tone="amber" />
-        <StatCard
-          icon={Wrench}
-          label="Maintenance"
-          value={maintenance}
-          tone="purple"
-        />
-        <StatCard
-          icon={AlertTriangle}
-          label="Rusak / Hilang"
-          value={broken}
-          tone="red"
-        />
-        <StatCard
-          icon={Wallet}
-          label="Total Nilai Aset"
-          value={formatCurrency(totalValue)}
-          tone="blue"
-        />
-      </div>
+      {isAssetFinanceRole ? (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+          <StatCard
+            icon={Wallet}
+            label="Total Nilai Aset"
+            value={formatRupiah(financeSummary.totalAssetValue)}
+            tone="blue"
+          />
+          <StatCard
+            icon={CheckCircle2}
+            label="Aset Sudah Ada Harga"
+            value={financeSummary.pricedCount}
+            tone="emerald"
+          />
+          <StatCard
+            icon={AlertTriangle}
+            label="Aset Belum Ada Harga"
+            value={financeSummary.noPriceCount}
+            tone="red"
+          />
+          <StatCard
+            icon={Inbox}
+            label="Aset Belum Ada Invoice"
+            value={financeSummary.noInvoiceCount}
+            tone="amber"
+          />
+          <StatCard
+            icon={CheckCircle2}
+            label="Data Finance Lengkap"
+            value={financeSummary.completeCount}
+            tone="emerald"
+          />
+          <StatCard
+            icon={Wallet}
+            label="Nilai Aset Tanpa Invoice"
+            value={formatRupiah(financeSummary.noInvoiceValue)}
+            tone="amber"
+          />
+          <StatCard
+            icon={Wallet}
+            label="Pembelian Bulan Ini"
+            value={formatRupiah(financeSummary.thisMonthValue)}
+            tone="blue"
+          />
+          <StatCard
+            icon={Wallet}
+            label="Rata-rata Nilai Aset"
+            value={formatRupiah(financeSummary.averageAssetValue)}
+            tone="slate"
+          />
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">
+          <StatCard icon={Package} label="Total Aset" value={total} tone="slate" />
+          <StatCard
+            icon={CheckCircle2}
+            label="Tersedia"
+            value={available}
+            tone="emerald"
+          />
+          <StatCard icon={Clock} label="Dipinjam" value={borrowed} tone="amber" />
+          <StatCard
+            icon={Wrench}
+            label="Maintenance"
+            value={maintenance}
+            tone="purple"
+          />
+          <StatCard
+            icon={AlertTriangle}
+            label="Rusak / Hilang"
+            value={broken}
+            tone="red"
+          />
+        </div>
+      )}
 
       {role === "super_admin" && (
         <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
@@ -202,6 +345,27 @@ export default function DashboardPage() {
           <StatCard icon={CheckCircle2} label="Maintenance Selesai" value={maintenanceCompleted} tone="emerald" />
           <StatCard icon={AlertTriangle} label="Maintenance Overdue" value={maintenanceOverdueAll} tone="red" />
           <StatCard icon={Inbox} label="Laporan Kendala Staff Belum Ditangani" value={staffReportsPending} tone="amber" />
+        </div>
+      )}
+
+      {canViewMaintenanceDashboard && (
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="font-semibold text-slate-800">Monitoring Pekerjaan Aktif</h2>
+            <Link
+              href="/workflow-board"
+              className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:underline"
+            >
+              Lihat Workflow Board
+              <ArrowRight size={12} />
+            </Link>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <StatCard icon={Inbox} label="Laporan Masuk" value={workflowSummary.created} tone="blue" />
+            <StatCard icon={Wrench} label="Sedang Dikerjakan" value={workflowSummary.inProgress} tone="purple" />
+            <StatCard icon={CheckCircle2} label="Menunggu Review QHSE" value={workflowSummary.waitingQhse} tone="slate" />
+            <StatCard icon={AlertTriangle} label="Butuh Tindakan Lanjutan" value={workflowSummary.needsFollowUp} tone="red" />
+          </div>
         </div>
       )}
 

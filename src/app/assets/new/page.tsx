@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { addDoc, collection, onSnapshot, serverTimestamp } from "firebase/firestore";
 import { QRCodeSVG } from "qrcode.react";
 import { Wand2, Pencil } from "lucide-react";
-import { db, EMPLOYEE_PROFILES_COLLECTION } from "@/lib/firebase";
+import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import {
   AssetCategory,
@@ -15,7 +15,6 @@ import {
   AssetUsageType,
   TrackingMode,
   DriveUploadResult,
-  EmployeeProfile,
   FundingSource,
   HrpBrand,
   HrpDivision,
@@ -23,13 +22,15 @@ import {
 } from "@/lib/types";
 import { fetchHrpBrands, fetchHrpDivisions } from "@/lib/hrp";
 import {
+  EmployeeOption,
+  fetchActiveEmployeeOptions,
   fetchActiveUsersByRoles,
   generateAssetCode,
   isAssetCodeTaken,
   writeAssetLog,
 } from "@/lib/firestore-helpers";
 import { createAssetNotification } from "@/lib/notifications";
-import { buildFullPath } from "@/lib/locations";
+import { buildFullPath, getDescendantIds, resolveAreaPic } from "@/lib/locations";
 import {
   ASSET_STATUS_HELPER,
   ASSET_STATUS_LABEL,
@@ -122,8 +123,15 @@ export default function NewAssetPage() {
       router.replace("/assets");
     }
   }, [authReady, role, router]);
+
+  // Section B — Asset Admin/QHSE TIDAK boleh melihat/mengisi section Finance
+  // sama sekali di Create Asset (harga dilengkapi belakangan oleh Asset
+  // Finance). Asset Finance sendiri sudah di-redirect keluar dari halaman
+  // ini di atas, jadi hanya Super Admin yang tersisa untuk melihat section
+  // ini kalau memang mau isi harga saat create.
+  const canViewFinanceCreate = role === "super_admin";
   const [categories, setCategories] = useState<AssetCategory[]>([]);
-  const [employees, setEmployees] = useState<EmployeeProfile[]>([]);
+  const [employeeOptions, setEmployeeOptions] = useState<EmployeeOption[]>([]);
   const [brands, setBrands] = useState<HrpBrand[]>([]);
   const [divisions, setDivisions] = useState<HrpDivision[]>([]);
   const [loadingDivisions, setLoadingDivisions] = useState(false);
@@ -184,6 +192,24 @@ export default function NewAssetPage() {
   const [accessories, setAccessories] = useState("");
   const [operationalNotes, setOperationalNotes] = useState("");
 
+  // Section E — PIC Lokasi hanya boleh membuat aset di lokasi yang dia
+  // pegang: LocationCascadeFields cuma diberi node-node dalam scope-nya
+  // (dirinya + leluhur untuk konteks cascade + seluruh turunannya), jadi
+  // secara struktural tidak mungkin memilih lokasi lain.
+  const isLocationPicRole = role === "location_pic";
+  const scopedLocations = useMemo(() => {
+    if (!isLocationPicRole || !assetUser) return locations;
+    const myNodes = locations.filter((n) => n.picUid === assetUser.uid);
+    if (myNodes.length === 0) return [];
+    const idSet = new Set<string>();
+    myNodes.forEach((node) => {
+      node.parentPath.forEach((id) => idSet.add(id));
+      idSet.add(node.id);
+      getDescendantIds(locations, node.id).forEach((id) => idSet.add(id));
+    });
+    return locations.filter((n) => idSet.has(n.id));
+  }, [locations, isLocationPicRole, assetUser]);
+
   const category = useMemo(
     () => categories.find((c) => c.id === categoryId),
     [categories, categoryId]
@@ -197,8 +223,8 @@ export default function NewAssetPage() {
     [divisions, divisionOwnerId]
   );
   const responsiblePerson = useMemo(
-    () => employees.find((e) => e.uid === responsiblePersonUid),
-    [employees, responsiblePersonUid]
+    () => employeeOptions.find((e) => e.uid === responsiblePersonUid),
+    [employeeOptions, responsiblePersonUid]
   );
 
   useEffect(() => {
@@ -239,37 +265,21 @@ export default function NewAssetPage() {
     return () => unsub();
   }, [authReady]);
 
+  // Sumber tunggal dropdown PIC/Custodian — fetchActiveEmployeeOptions sudah
+  // menormalisasi nama (fullName/employeeName/name/displayName, email cuma
+  // fallback terakhir), mengecualikan kandidat/nonaktif, dan dedupe per
+  // uid/email. Jangan bangun daftar karyawan sendiri di sini lagi.
   useEffect(() => {
     if (!authReady) return;
-    const unsub = onSnapshot(
-      collection(db, EMPLOYEE_PROFILES_COLLECTION),
-      (snap) => {
-        console.log("[NewAssetPage Listener] employee_profiles success:", snap.size);
-        setEmployees(
-          snap.docs
-            // Doc id HARUS jadi fallback terakhir, bukan base yang bisa
-            // ditimpa field "uid" di data (kalau ada field itu di HRP source
-            // dan isinya beda/kosong, PIC yang dipilih jadi tidak match saat
-            // dicari lagi pakai uid ini).
-            .map((d) => {
-              const data = d.data() as Record<string, unknown>;
-              return { ...data, uid: (data.uid as string) || (data.userId as string) || d.id } as EmployeeProfile;
-            })
-            .filter((e) => {
-              const status = String(e.status || "").toLowerCase();
-              const roleText = String(e.role || "").toLowerCase();
-              const isCandidate =
-                roleText.includes("kandidat") || roleText.includes("candidate") || roleText.includes("applicant");
-              const isInactive = status.includes("inactive") || status.includes("nonaktif") || status.includes("rejected");
-              return !isCandidate && !isInactive;
-            })
-        );
-      },
-      (error) => {
-        console.error("[NewAssetPage Listener] employee_profiles error:", error);
-      }
-    );
-    return () => unsub();
+    let cancelled = false;
+    fetchActiveEmployeeOptions()
+      .then((options) => {
+        if (!cancelled) setEmployeeOptions(options);
+      })
+      .catch((err) => console.error("[NewAssetPage] gagal memuat daftar karyawan aktif", err));
+    return () => {
+      cancelled = true;
+    };
   }, [authReady]);
 
   useEffect(() => {
@@ -327,17 +337,14 @@ export default function NewAssetPage() {
     if (next && category) setGeneratingCode(true);
   };
 
-  const employeeItems: SearchableSelectItem[] = employees.map((e) => {
-    const jobTitle = (e.jobTitle as string) || (e.jabatan as string) || "";
-    const division = (e.divisionName as string) || "";
-    const subParts = [jobTitle, division, e.email].filter(Boolean);
-    return {
-      id: e.uid,
-      label: e.name || e.email,
-      sublabel: subParts.join(" · "),
-      searchText: [e.name, e.email, jobTitle, division].filter(Boolean).join(" "),
-    };
-  });
+  // Baris utama SELALU nama, baris kecil divisi/perusahaan/jabatan — email
+  // TIDAK PERNAH ditampilkan, cuma dipakai sebagai kata kunci pencarian.
+  const employeeItems: SearchableSelectItem[] = employeeOptions.map((e) => ({
+    id: e.uid,
+    label: e.name,
+    sublabel: [e.divisionName, e.brandName, e.roleLabel].filter(Boolean).join(" — ") || undefined,
+    searchText: [e.name, e.email, e.divisionName, e.brandName, e.roleLabel].filter(Boolean).join(" "),
+  }));
 
   const brandItems: SearchableSelectItem[] = brands.map((b) => ({
     id: b.id,
@@ -413,6 +420,15 @@ export default function NewAssetPage() {
         areaName: locationSelection.areaName,
       });
 
+      // Section D — PIC Lokasi diisi OTOMATIS dari asset_locations (cascade
+      // Area > Ruangan > Lantai > Gedung), BUKAN dipilih manual di form.
+      const areaPic = resolveAreaPic(locations, {
+        buildingId: locationSelection.buildingId,
+        floorId: locationSelection.floorId,
+        roomId: locationSelection.roomId,
+        areaId: locationSelection.areaId,
+      });
+
       const docRef = await addDoc(collection(db, "assets"), {
         assetName: assetName.trim(),
         assetCode: assetCode.trim(),
@@ -446,12 +462,16 @@ export default function NewAssetPage() {
           locationSelection.buildingId ||
           null,
         locationText: assetLocationText,
+        areaPicUid: areaPic?.uid || null,
+        areaPicName: areaPic?.name || null,
+        areaPicEmail: areaPic?.email || null,
+        areaPicLocationId: areaPic?.locationId || null,
+        areaPicLocationName: areaPic?.locationName || null,
         responsiblePersonUid: responsiblePersonUid || null,
         responsiblePersonName: responsiblePerson?.name || "",
         responsiblePersonEmail: responsiblePerson?.email || "",
-        responsiblePersonDivision: (responsiblePerson?.divisionName as string) || "",
-        responsiblePersonJobTitle:
-          (responsiblePerson?.jobTitle as string) || (responsiblePerson?.jabatan as string) || "",
+        responsiblePersonDivision: responsiblePerson?.divisionName || "",
+        responsiblePersonJobTitle: responsiblePerson?.roleLabel || "",
         ownershipStatus,
 
         // ── Mode tracking, tipe pemakaian & custodian ─────────────────────
@@ -467,13 +487,13 @@ export default function NewAssetPage() {
         custodianUid: trackingMode === "fixed_location" ? null : responsiblePersonUid || null,
         custodianName: trackingMode === "fixed_location" ? null : responsiblePerson?.name || null,
         custodianEmail: trackingMode === "fixed_location" ? null : responsiblePerson?.email || null,
-        custodianDivision:
-          trackingMode === "fixed_location" ? null : (responsiblePerson?.divisionName as string) || null,
+        custodianDivision: trackingMode === "fixed_location" ? null : responsiblePerson?.divisionName || null,
+        custodianRole: trackingMode === "fixed_location" ? null : responsiblePerson?.roleLabel || null,
         currentHolderUid: trackingMode === "assigned_pic" ? responsiblePersonUid || null : null,
         currentHolderName: trackingMode === "assigned_pic" ? responsiblePerson?.name || null : null,
         currentHolderEmail: trackingMode === "assigned_pic" ? responsiblePerson?.email || null : null,
         currentHolderDivision:
-          trackingMode === "assigned_pic" ? (responsiblePerson?.divisionName as string) || null : null,
+          trackingMode === "assigned_pic" ? responsiblePerson?.divisionName || null : null,
         currentUsageStatus:
           trackingMode === "fixed_location"
             ? "fixed_at_location"
@@ -494,20 +514,27 @@ export default function NewAssetPage() {
         picName: responsiblePerson?.name || null,
         picEmail: responsiblePerson?.email || null,
 
-        purchaseDate: purchaseDate || null,
-        purchasePrice: purchasePrice ?? null,
-        vendorName: vendorName.trim(),
-        invoiceNumber: invoiceNumber.trim(),
-        invoiceFileUrl: invoice?.url || "",
-        invoiceFileName: invoice?.fileName || "",
-        invoiceDriveFileId: invoice?.fileId || "",
-        invoiceMimeType: invoice?.mimeType || "",
-        invoiceSize: invoice?.size ?? null,
-        invoiceUploadedAt: invoice?.uploadedAt || null,
-        fundingSource,
-        purchaseMethod: purchaseMethod.trim(),
-        estimatedUsefulLife: estimatedUsefulLife.trim(),
-        financeNotes: financeNotes.trim(),
+        // Section B/G — Asset Admin/QHSE boleh create aset TANPA data
+        // finance sama sekali; field finance disimpan default kosong +
+        // financeStatus "pending_finance" supaya Asset Finance tahu aset ini
+        // masih perlu dilengkapi. Cuma Super Admin yang bisa langsung isi
+        // harga saat create (section Finance-nya juga cuma tampil untuknya).
+        purchaseDate: canViewFinanceCreate ? purchaseDate || null : null,
+        purchasePrice: canViewFinanceCreate ? purchasePrice ?? null : null,
+        vendorName: canViewFinanceCreate ? vendorName.trim() : "",
+        invoiceNumber: canViewFinanceCreate ? invoiceNumber.trim() : "",
+        invoiceFileUrl: canViewFinanceCreate ? invoice?.url || "" : "",
+        invoiceFileName: canViewFinanceCreate ? invoice?.fileName || "" : "",
+        invoiceDriveFileId: canViewFinanceCreate ? invoice?.fileId || "" : "",
+        invoiceMimeType: canViewFinanceCreate ? invoice?.mimeType || "" : "",
+        invoiceSize: canViewFinanceCreate ? invoice?.size ?? null : null,
+        invoiceUploadedAt: canViewFinanceCreate ? invoice?.uploadedAt || null : null,
+        fundingSource: canViewFinanceCreate ? fundingSource : "",
+        purchaseMethod: canViewFinanceCreate ? purchaseMethod.trim() : "",
+        estimatedUsefulLife: canViewFinanceCreate ? estimatedUsefulLife.trim() : "",
+        financeNotes: canViewFinanceCreate ? financeNotes.trim() : "",
+        financeStatus:
+          canViewFinanceCreate && purchasePrice && invoiceNumber.trim() ? "complete" : "pending_finance",
 
         assetStatus,
         condition,
@@ -754,12 +781,17 @@ export default function NewAssetPage() {
                     Lokasi Asset <span className="text-red-500">*</span>
                   </label>
                   <LocationCascadeFields
-                    locations={locations}
+                    locations={scopedLocations}
                     value={locationSelection}
                     onChange={setLocationSelection}
                   />
                   {fieldErrors.location && (
                     <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
+                  )}
+                  {isLocationPicRole && scopedLocations.length === 0 && (
+                    <p className="mt-1 text-xs text-amber-600">
+                      Anda belum ditetapkan sebagai PIC lokasi manapun — hubungi Asset Admin/QHSE.
+                    </p>
                   )}
                 </div>
                 <Field
@@ -829,6 +861,7 @@ export default function NewAssetPage() {
                 </Field>
               </FormSection>
 
+              {canViewFinanceCreate && (
               <FormSection step={3} title="Finance / Bukti Pembelian">
                 <Field label="Tanggal Pembelian">
                   <input
@@ -909,6 +942,7 @@ export default function NewAssetPage() {
                   />
                 </Field>
               </FormSection>
+              )}
 
               <FormSection
                 step={4}

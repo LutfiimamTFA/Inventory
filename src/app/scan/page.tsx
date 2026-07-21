@@ -22,6 +22,7 @@ import {
   Boxes,
   History,
   ClipboardList,
+  ClipboardPlus,
   Eye,
   User,
   MapPin,
@@ -396,6 +397,34 @@ export default function ScanPage() {
   const [modalTickets, setModalTickets] = useState<AssetIssueTicket[]>([]);
   const [modalHistoryLoading, setModalHistoryLoading] = useState(false);
   const scannerRef = useRef<Html5Qrcode | null>(null);
+
+  // Debug SEMENTARA (hapus setelah overflow mobile terkonfirmasi beres) —
+  // cari elemen mana persis di dalam .scan-page yang scrollWidth-nya lebih
+  // lebar dari clientWidth-nya, supaya tidak nebak-nebak lagi class mana
+  // yang jadi biang overflow horizontal di HP.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (window.innerWidth >= 768) return;
+
+    const overflowing = Array.from(document.querySelectorAll(".scan-page *"))
+      .filter((el) => {
+        const element = el as HTMLElement;
+        return element.scrollWidth > element.clientWidth + 2;
+      })
+      .slice(0, 30)
+      .map((el) => {
+        const element = el as HTMLElement;
+        return {
+          tag: element.tagName,
+          className: element.className,
+          scrollWidth: element.scrollWidth,
+          clientWidth: element.clientWidth,
+          text: element.textContent?.slice(0, 50),
+        };
+      });
+
+    console.log("[Scan Mobile Overflow Debug]", overflowing);
+  }, []);
 
   // Daftar karyawan aktif — dimuat sekali saat halaman dibuka (bukan lazy
   // lagi) karena sekarang dipakai untuk menerjemahkan uid/email jadi nama di
@@ -817,14 +846,19 @@ export default function ScanPage() {
 
   return (
     <ProtectedLayout>
+      <div className="scan-page min-h-screen w-full max-w-full overflow-x-hidden bg-slate-50 px-4 pb-[calc(6rem+env(safe-area-inset-bottom))] pt-4 md:px-6 md:pb-6 md:pt-0">
+      <div className="block md:hidden rounded-xl bg-green-50 p-2 text-xs font-semibold text-green-700">
+        Mobile Scan Layout Aktif
+      </div>
+
       <PageHeader
         title="Scan QR Aset"
         subtitle="Arahkan kamera ke QR code pada aset, atau masukkan kode secara manual."
       />
 
-      <div className="grid md:grid-cols-2 gap-5">
+      <div className="grid w-full max-w-full grid-cols-1 gap-5 md:grid-cols-2">
         {/* Kiri: area scan — tidak diubah alurnya, cuma dipertahankan */}
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 md:p-6">
+        <div className="w-full min-w-0 max-w-full overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 shadow-sm md:p-6">
           <div className="flex items-center gap-2 mb-4">
             <div className="h-9 w-9 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
               <ScanLine size={18} />
@@ -835,7 +869,7 @@ export default function ScanPage() {
           {!scanning ? (
             <button
               onClick={startScanner}
-              className="w-full inline-flex flex-col items-center justify-center gap-2 rounded-2xl bg-gradient-to-br from-blue-600 to-teal-500 text-white py-10 text-sm font-medium hover:brightness-105 shadow-md shadow-blue-900/20 cursor-pointer"
+              className="w-full min-w-0 inline-flex flex-col items-center justify-center gap-2 rounded-2xl bg-gradient-to-br from-blue-600 to-teal-500 text-white py-10 text-sm font-medium hover:brightness-105 shadow-md shadow-blue-900/20 cursor-pointer"
             >
               <Camera size={30} />
               Mulai Scan
@@ -843,7 +877,7 @@ export default function ScanPage() {
           ) : (
             <div
               id={SCANNER_ID}
-              className="w-full rounded-2xl overflow-hidden border border-slate-200"
+              className="w-full max-w-full min-w-0 rounded-2xl overflow-hidden border border-slate-200"
             />
           )}
           {error && (
@@ -856,26 +890,33 @@ export default function ScanPage() {
             <h3 className="text-sm font-semibold text-slate-700 mb-2">
               Input Manual Kode Aset
             </h3>
-            <div className="flex gap-2">
+            <div className="grid w-full min-w-0 grid-cols-1 gap-2 md:grid-cols-[1fr_auto]">
               <input
                 value={manualCode}
                 onChange={(e) => setManualCode(e.target.value)}
                 placeholder="mis. LAP-2601-AB12"
-                className="input"
+                className="input w-full min-w-0"
               />
               <button
                 onClick={() => lookupAsset(manualCode)}
-                className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium hover:bg-slate-50 inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                className="w-full md:w-auto rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium hover:bg-slate-50 inline-flex items-center justify-center gap-1.5 shrink-0 cursor-pointer"
               >
                 <Search size={14} />
                 Cari
               </button>
             </div>
           </div>
+          <Link
+            href="/staff-reports/new"
+            className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-700 hover:bg-blue-100"
+          >
+            <ClipboardPlus size={15} />
+            Buat Laporan Tanpa QR
+          </Link>
         </div>
 
         {/* Kanan: hasil scan, atau panel informasi ringkas kalau belum scan */}
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 md:p-6">
+        <div className="w-full min-w-0 max-w-full overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 shadow-sm md:p-6">
           {notFound && (
             <>
               <h2 className="font-semibold text-slate-800 mb-4">Hasil</h2>
@@ -887,7 +928,7 @@ export default function ScanPage() {
 
           {!asset && !notFound && (
             <div className="space-y-5">
-              <div className="grid grid-cols-3 gap-2.5">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
                 <SummaryStat
                   icon={Boxes}
                   label="Sedang Dipakai"
@@ -916,7 +957,7 @@ export default function ScanPage() {
                   <EmptyState
                     icon={PackageSearch}
                     title="Belum ada aset dipindai"
-                    description="Scan QR atau masukkan kode aset untuk melihat detail."
+                    description="Scan QR, masukkan kode aset, atau buat laporan tanpa QR."
                   />
                 ) : (
                   <ul className="space-y-1.5">
@@ -1186,9 +1227,9 @@ export default function ScanPage() {
       {/* Status Pemakaian Aset Kantor — daftar aset kantor (bukan cuma
           milik user login) yang sedang dipinjam/dipakai/maintenance, supaya
           satu kantor tahu posisi barang. */}
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 md:p-6 mt-5">
+      <div className="w-full min-w-0 max-w-full overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 shadow-sm md:p-6 mt-5">
         <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
-          <div>
+          <div className="min-w-0">
             <h2 className="font-semibold text-slate-800">Status Pemakaian Aset Kantor</h2>
             <p className="text-sm text-slate-500 mt-0.5">
               Lihat posisi, PIC operasional, dan pemegang saat ini untuk aset kantor.
@@ -1198,20 +1239,20 @@ export default function ScanPage() {
 
         {/* Summary cards — ringkasan utama, tampil sebelum filter/daftar,
             angka global (bukan cuma milik user login). */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+        <div className="grid w-full min-w-0 grid-cols-1 gap-3 mb-4 sm:grid-cols-2 lg:grid-cols-4">
           <SummaryStat icon={Boxes} label="Sedang Dipakai" value={summary.sedangDipakai} colorClass="bg-blue-50 text-blue-600" />
           <SummaryStat icon={CheckCircle2} label="Tersedia" value={summary.tersedia} colorClass="bg-emerald-50 text-emerald-600" />
           <SummaryStat icon={Wrench} label="Maintenance" value={summary.maintenance} colorClass="bg-purple-50 text-purple-600" />
           <SummaryStat icon={AlertTriangle} label="Terlambat Kembali" value={summary.terlambat} colorClass="bg-red-50 text-red-600" />
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 mb-3">
+        <div className="flex gap-2 overflow-x-auto pb-2 md:flex-wrap md:overflow-visible mb-3 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
           {USAGE_FILTERS.map((f) => (
             <button
               key={f.key}
               type="button"
               onClick={() => setUsageFilter(f.key)}
-              className={`rounded-xl border px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
+              className={`shrink-0 rounded-xl border px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
                 usageFilter === f.key
                   ? "border-blue-500 bg-blue-50 text-blue-700"
                   : "border-slate-200 text-slate-600 hover:bg-slate-50"
@@ -1236,8 +1277,9 @@ export default function ScanPage() {
             description="Saat ada aset yang dipinjam atau digunakan karyawan, datanya akan muncul di sini."
           />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+          <>
+          <div className="hidden md:block overflow-x-auto">
+            <table className="w-full min-w-[880px] text-sm">
               <thead>
                 <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
                   <th className="px-4 py-3 font-semibold">Nama Aset</th>
@@ -1405,6 +1447,157 @@ export default function ScanPage() {
               </tbody>
             </table>
           </div>
+
+          {/* Mobile — card list menggantikan table (section C). */}
+          <div className="block md:hidden space-y-3">
+            {filteredUsageRows.map((row) => {
+              const a = row.raw;
+              const overdue = isOverdue(row.expectedReturnAt);
+              const mineBorrowed = a.currentBorrowerUid === assetUser?.uid;
+              const mineInUse =
+                a.responsiblePersonUid === assetUser?.uid && a.assetStatus === "in_use";
+              const isMineHolder = !!assetUser?.uid && row.currentHolderUid === assetUser.uid;
+              const isMineCustodian = !!assetUser?.uid && row.custodianUid === assetUser.uid;
+              return (
+                <div
+                  key={row.id}
+                  className="w-full max-w-full rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-semibold text-slate-900 break-words">
+                        {row.assetName || "-"}
+                      </h3>
+                      <p className="mt-0.5 text-xs text-slate-500 break-all">{row.assetCode || "-"}</p>
+                    </div>
+                    <div className="flex flex-col items-end gap-1">
+                      <Badge
+                        label={row.statusLabel}
+                        colorClass={
+                          row.status === "in_use"
+                            ? "bg-blue-100 text-blue-700"
+                            : row.status === "maintenance"
+                            ? "bg-purple-100 text-purple-700"
+                            : "bg-emerald-100 text-emerald-700"
+                        }
+                      />
+                      {overdue && <Badge label="Terlambat" colorClass="bg-red-100 text-red-700" />}
+                    </div>
+                  </div>
+
+                  <div className="mt-4 space-y-3 text-sm">
+                    <div>
+                      <p className="text-xs text-slate-400">PIC Operasional</p>
+                      <PersonCell
+                        name={row.custodianName}
+                        subInfo={row.custodianSubInfo}
+                        badge={
+                          isMineHolder && isMineCustodian
+                            ? undefined
+                            : isMineCustodian
+                            ? "Tanggung Jawab Saya"
+                            : undefined
+                        }
+                      />
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-400">Pemegang Saat Ini</p>
+                      <PersonCell
+                        name={row.currentHolderName}
+                        subInfo={row.currentHolderSubInfo}
+                        badge={
+                          isMineHolder && isMineCustodian
+                            ? "PIC & Pemegang Saat Ini"
+                            : isMineHolder
+                            ? "Sedang Saya Pegang"
+                            : undefined
+                        }
+                      />
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-400">Lokasi</p>
+                      <p className="font-medium text-slate-700 break-words">{row.locationText || "-"}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-400">Estimasi Kembali</p>
+                      <p className="font-medium text-slate-700">
+                        {row.expectedReturnAt ? formatDate(row.expectedReturnAt) : "-"}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid grid-cols-1 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!row.assetId) {
+                          setToast({ type: "error", message: "ID aset tidak ditemukan." });
+                          return;
+                        }
+                        const found = allAssets.find((item) => item.id === row.assetId);
+                        if (!found) {
+                          setToast({ type: "error", message: "Data aset tidak ditemukan." });
+                          return;
+                        }
+                        setSelectedAsset(found);
+                        setAssetDetailModalOpen(true);
+                      }}
+                      className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 cursor-pointer hover:bg-slate-50"
+                    >
+                      Lihat Detail
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAsset(a);
+                        setReportIssueOpen(true);
+                      }}
+                      className="w-full rounded-xl border border-red-200 px-3 py-2 text-sm font-medium text-red-600 cursor-pointer hover:bg-red-50"
+                    >
+                      Laporkan Kendala
+                    </button>
+                    {mineBorrowed && (
+                      <button
+                        type="button"
+                        onClick={() => openReturnFor(a)}
+                        className="w-full rounded-xl border border-emerald-200 px-3 py-2 text-sm font-medium text-emerald-700 cursor-pointer hover:bg-emerald-50"
+                      >
+                        Kembalikan
+                      </button>
+                    )}
+                    {mineInUse && (
+                      <Link
+                        href="/my-borrowings"
+                        className="w-full text-center rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50"
+                      >
+                        Riwayat
+                      </Link>
+                    )}
+                    {isManager && (
+                      <>
+                        {a.assetStatus === "borrowed" && !mineBorrowed && (
+                          <button
+                            type="button"
+                            onClick={() => openReturnFor(a)}
+                            className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 cursor-pointer hover:bg-slate-50"
+                          >
+                            Paksa Kembalikan
+                          </button>
+                        )}
+                        <Link
+                          href={`/assets/${row.assetId}/edit`}
+                          className="w-full text-center rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50"
+                        >
+                          Ubah Status
+                        </Link>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          </>
         )}
       </div>
 
@@ -1415,8 +1608,9 @@ export default function ScanPage() {
         {scanHistory.length === 0 ? (
           <EmptyState icon={History} title="Belum ada riwayat scan" />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+          <>
+          <div className="hidden md:block overflow-x-auto">
+            <table className="w-full min-w-[640px] text-sm">
               <thead>
                 <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
                   <th className="px-4 py-3 font-semibold">Nama Aset</th>
@@ -1454,6 +1648,35 @@ export default function ScanPage() {
               </tbody>
             </table>
           </div>
+
+          <div className="block md:hidden space-y-3">
+            {scanHistory.map((h) => (
+              <div
+                key={`${h.assetId}-${h.scannedAt}`}
+                className="w-full max-w-full rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-slate-900 break-words">{h.assetName}</h3>
+                    <p className="mt-0.5 text-xs text-slate-500 break-all">{h.assetCode}</p>
+                  </div>
+                  <Badge label={ASSET_STATUS_LABEL[h.assetStatus]} colorClass={ASSET_STATUS_COLOR[h.assetStatus]} />
+                </div>
+                <p className="mt-3 inline-flex items-center gap-1.5 text-xs text-slate-500">
+                  <Clock size={13} className="text-slate-400" />
+                  {formatDateTime(new Date(h.scannedAt))}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => lookupAsset(h.assetCode)}
+                  className="mt-3 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 cursor-pointer hover:bg-slate-50"
+                >
+                  Lihat Detail
+                </button>
+              </div>
+            ))}
+          </div>
+          </>
         )}
       </div>
 
@@ -1572,6 +1795,7 @@ export default function ScanPage() {
       )}
 
       <Toast toast={toast} onClose={() => setToast(null)} />
+      </div>
     </ProtectedLayout>
   );
 }

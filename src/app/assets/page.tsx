@@ -30,6 +30,16 @@ import {
   formatCurrency,
 } from "@/lib/utils";
 import { writeAssetLog } from "@/lib/firestore-helpers";
+import {
+  formatRupiah,
+  getAssetPrice,
+  getFinanceStatus,
+  hasInvoice,
+  hasPrice,
+  isFinanceComplete,
+  FINANCE_STATUS_LABEL,
+  FINANCE_STATUS_COLOR,
+} from "@/lib/assetFinance";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
 import FilterCard from "@/components/FilterCard";
@@ -50,6 +60,9 @@ export default function AssetsPage() {
   const [companyFilter, setCompanyFilter] = useState("");
   const [divisionFilter, setDivisionFilter] = useState("");
   const [locationFilter, setLocationFilter] = useState("");
+  const [financeStatusFilter, setFinanceStatusFilter] = useState("");
+  const [vendorFilter, setVendorFilter] = useState("");
+  const [fundingSourceFilter, setFundingSourceFilter] = useState("");
   const [deactivateTarget, setDeactivateTarget] = useState<Asset | null>(null);
   const [processing, setProcessing] = useState(false);
   const [qrLabelTarget, setQrLabelTarget] = useState<Asset | null>(null);
@@ -58,10 +71,25 @@ export default function AssetsPage() {
   const [confirmSelectAllFiltered, setConfirmSelectAllFiltered] = useState(false);
 
   const canManage = role === "super_admin" || role === "asset_admin";
+  // Section C — PIC Lokasi boleh menambah/edit aset dasar (dikunci ke
+  // lokasinya sendiri di form create/edit), TAPI TIDAK boleh nonaktifkan/
+  // hapus aset atau pakai aksi bulk — itu tetap khusus canManage.
+  const canCreateOrEditAsset = canManage || role === "location_pic";
+  // Section E — kolom "Nilai Asset" (harga beli) HANYA untuk Super
+  // Admin/Asset Finance. Asset Admin/QHSE, Staff, Tim IT tidak boleh melihat
+  // nominal harga sama sekali.
+  const canViewFinance = role === "super_admin" || role === "asset_finance";
+
+  // Section A — Asset Finance dapat tampilan halaman Assets yang berbeda
+  // total: summary card, kolom table, filter, dan aksi semuanya berorientasi
+  // finance (harga/invoice/vendor), BUKAN data operasional (lokasi/kondisi/
+  // maintenance/PIC).
+  const isAssetFinanceRole = role === "asset_finance";
 
   // Section F — ringkasan aset tetap lokasi vs bergerak (AC/meja/CCTV
   // dipisah dari HP/laptop/kamera). Aset lama belum punya trackingMode
-  // tersimpan, diturunkan dari usageType lama supaya tetap terhitung.
+  // tersimpan, diturunkan dari usageType lama supaya tetap terhitung. HANYA
+  // dipakai untuk role selain Asset Finance (lihat financeSummary di bawah).
   const trackingSummary = useMemo(() => {
     let fixedLocation = 0;
     let moving = 0;
@@ -74,6 +102,72 @@ export default function AssetsPage() {
     });
     return { fixedLocation, moving, maintenance };
   }, [assets]);
+
+  // Section B/D/E — ringkasan finance untuk Asset Finance: total nilai
+  // aset, kelengkapan harga/invoice, dan pembelian bulan berjalan.
+  const financeSummary = useMemo(() => {
+    const pricedAssets = assets.filter(hasPrice);
+    const assetsWithoutPrice = assets.filter((a) => !hasPrice(a));
+    const assetsWithoutInvoice = assets.filter((a) => !hasInvoice(a));
+    const financeCompleteAssets = assets.filter(isFinanceComplete);
+
+    const totalAssetValue = assets.reduce((sum, a) => sum + getAssetPrice(a), 0);
+    const averageAssetValue = pricedAssets.length > 0 ? totalAssetValue / pricedAssets.length : 0;
+    const assetWithoutInvoiceValue = assetsWithoutInvoice.reduce(
+      (sum, a) => sum + getAssetPrice(a),
+      0
+    );
+
+    const now = new Date();
+    const thisMonthValue = assets.reduce((sum, a) => {
+      if (!a.purchaseDate) return sum;
+      const d = new Date(a.purchaseDate);
+      if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth()) {
+        return sum + getAssetPrice(a);
+      }
+      return sum;
+    }, 0);
+
+    let mostExpensive: Asset | null = null;
+    assets.forEach((a) => {
+      if (getAssetPrice(a) > (mostExpensive ? getAssetPrice(mostExpensive) : 0)) mostExpensive = a;
+    });
+
+    const vendorCounts = new Map<string, number>();
+    assets.forEach((a) => {
+      if (a.vendorName) vendorCounts.set(a.vendorName, (vendorCounts.get(a.vendorName) || 0) + 1);
+    });
+    let topVendor = "-";
+    let topVendorCount = 0;
+    vendorCounts.forEach((count, vendor) => {
+      if (count > topVendorCount) {
+        topVendor = vendor;
+        topVendorCount = count;
+      }
+    });
+
+    return {
+      totalAssetValue,
+      pricedCount: pricedAssets.length,
+      noPriceCount: assetsWithoutPrice.length,
+      noInvoiceCount: assetsWithoutInvoice.length,
+      completeCount: financeCompleteAssets.length,
+      thisMonthValue,
+      averageAssetValue,
+      mostExpensive: mostExpensive as Asset | null,
+      topVendor,
+      assetWithoutInvoiceValue,
+    };
+  }, [assets]);
+
+  const vendorOptions = useMemo(
+    () => Array.from(new Set(assets.map((a) => a.vendorName).filter(Boolean))) as string[],
+    [assets]
+  );
+  const fundingSourceOptions = useMemo(
+    () => Array.from(new Set(assets.map((a) => a.fundingSource).filter(Boolean))) as string[],
+    [assets]
+  );
 
   useEffect(() => {
     if (!authReady) return;
@@ -129,6 +223,11 @@ export default function AssetsPage() {
   );
 
   const filtered = assets.filter((a) => {
+    // Section H — PIC Lokasi cuma boleh lihat aset di lokasi yang dia
+    // pegang. areaPicUid sudah diisi otomatis via cascade Area/Ruangan/
+    // Lantai/Gedung (lihat resolveAreaPic di lib/locations.ts), jadi cukup
+    // dicocokkan langsung ke sini — sudah mencakup semua level assignment.
+    if (role === "location_pic" && a.areaPicUid !== assetUser?.uid) return false;
     if (
       search &&
       !`${a.assetName} ${a.assetCode}`
@@ -141,11 +240,22 @@ export default function AssetsPage() {
     if (companyFilter && a.companyOwnerName !== companyFilter) return false;
     if (divisionFilter && a.divisionOwnerName !== divisionFilter) return false;
     if (locationFilter && a.location !== locationFilter) return false;
+    if (financeStatusFilter && getFinanceStatus(a) !== financeStatusFilter) return false;
+    if (vendorFilter && a.vendorName !== vendorFilter) return false;
+    if (fundingSourceFilter && a.fundingSource !== fundingSourceFilter) return false;
     return true;
   });
 
   const hasFilters =
-    search || categoryFilter || statusFilter || companyFilter || divisionFilter || locationFilter;
+    search ||
+    categoryFilter ||
+    statusFilter ||
+    companyFilter ||
+    divisionFilter ||
+    locationFilter ||
+    financeStatusFilter ||
+    vendorFilter ||
+    fundingSourceFilter;
 
   const allVisibleSelected =
     filtered.length > 0 && filtered.every((a) => selectedIds.has(a.id));
@@ -235,7 +345,7 @@ export default function AssetsPage() {
                 Bulk QR Label
               </button>
             )}
-            {canManage && (
+            {canCreateOrEditAsset && (
               <Link
                 href="/assets/new"
                 className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-teal-500 text-white px-4 py-2.5 text-sm font-medium hover:brightness-105 shadow-md shadow-blue-900/20"
@@ -248,20 +358,81 @@ export default function AssetsPage() {
         }
       />
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-5">
-        <div className="rounded-2xl border border-slate-200 bg-white p-4">
-          <p className="text-xs text-slate-500">Total Aset Tetap Lokasi</p>
-          <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.fixedLocation}</p>
+      {isAssetFinanceRole ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-5">
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Total Nilai Aset</p>
+            <p className="text-xl font-semibold text-slate-900 mt-1">
+              {formatRupiah(financeSummary.totalAssetValue)}
+            </p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Aset Sudah Ada Harga</p>
+            <p className="text-2xl font-semibold text-emerald-600 mt-1">{financeSummary.pricedCount}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Aset Belum Ada Harga</p>
+            <p className="text-2xl font-semibold text-red-600 mt-1">{financeSummary.noPriceCount}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Aset Belum Ada Invoice</p>
+            <p className="text-2xl font-semibold text-amber-600 mt-1">{financeSummary.noInvoiceCount}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Data Finance Lengkap</p>
+            <p className="text-2xl font-semibold text-emerald-600 mt-1">{financeSummary.completeCount}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Pembelian Bulan Ini</p>
+            <p className="text-xl font-semibold text-slate-900 mt-1">
+              {formatRupiah(financeSummary.thisMonthValue)}
+            </p>
+          </div>
+
+          {/* Section C — opsional, ditambahkan karena datanya sudah dihitung
+              di financeSummary. */}
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Rata-rata Nilai Aset</p>
+            <p className="text-xl font-semibold text-slate-900 mt-1">
+              {formatRupiah(financeSummary.averageAssetValue)}
+            </p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Aset Termahal</p>
+            <p className="text-sm font-semibold text-slate-900 mt-1 truncate">
+              {financeSummary.mostExpensive?.assetName || "-"}
+            </p>
+            <p className="text-xs text-slate-500">
+              {financeSummary.mostExpensive ? formatRupiah(getAssetPrice(financeSummary.mostExpensive)) : ""}
+            </p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Vendor Terbanyak</p>
+            <p className="text-xl font-semibold text-slate-900 mt-1 truncate">{financeSummary.topVendor}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Total Nilai Tanpa Invoice</p>
+            <p className="text-xl font-semibold text-amber-600 mt-1">
+              {formatRupiah(financeSummary.assetWithoutInvoiceValue)}
+            </p>
+          </div>
         </div>
-        <div className="rounded-2xl border border-slate-200 bg-white p-4">
-          <p className="text-xs text-slate-500">Total Aset Bergerak</p>
-          <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.moving}</p>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-5">
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Total Aset Tetap Lokasi</p>
+            <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.fixedLocation}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Total Aset Bergerak</p>
+            <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.moving}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Total Aset Maintenance</p>
+            <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.maintenance}</p>
+          </div>
         </div>
-        <div className="rounded-2xl border border-slate-200 bg-white p-4">
-          <p className="text-xs text-slate-500">Total Aset Maintenance</p>
-          <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.maintenance}</p>
-        </div>
-      </div>
+      )}
 
       <FilterCard>
         <div className="relative lg:col-span-2">
@@ -324,18 +495,59 @@ export default function AssetsPage() {
             </option>
           ))}
         </select>
-        <select
-          value={locationFilter}
-          onChange={(e) => setLocationFilter(e.target.value)}
-          className="input"
-        >
-          <option value="">Semua Lokasi</option>
-          {locations.map((l) => (
-            <option key={l} value={l}>
-              {l}
-            </option>
-          ))}
-        </select>
+        {isAssetFinanceRole ? (
+          <>
+            <select
+              value={financeStatusFilter}
+              onChange={(e) => setFinanceStatusFilter(e.target.value)}
+              className="input"
+            >
+              <option value="">Semua Status Finance</option>
+              {Object.entries(FINANCE_STATUS_LABEL).map(([k, v]) => (
+                <option key={k} value={k}>
+                  {v}
+                </option>
+              ))}
+            </select>
+            <select
+              value={vendorFilter}
+              onChange={(e) => setVendorFilter(e.target.value)}
+              className="input"
+            >
+              <option value="">Semua Vendor</option>
+              {vendorOptions.map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+            <select
+              value={fundingSourceFilter}
+              onChange={(e) => setFundingSourceFilter(e.target.value)}
+              className="input"
+            >
+              <option value="">Semua Sumber Dana</option>
+              {fundingSourceOptions.map((f) => (
+                <option key={f} value={f}>
+                  {f}
+                </option>
+              ))}
+            </select>
+          </>
+        ) : (
+          <select
+            value={locationFilter}
+            onChange={(e) => setLocationFilter(e.target.value)}
+            className="input"
+          >
+            <option value="">Semua Lokasi</option>
+            {locations.map((l) => (
+              <option key={l} value={l}>
+                {l}
+              </option>
+            ))}
+          </select>
+        )}
       </FilterCard>
 
       {canManage && selectedIds.size > 0 && (
@@ -387,8 +599,13 @@ export default function AssetsPage() {
             }
           />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+          <>
+          {/* Desktop/tablet — table seperti sebelumnya, cuma dibungkus
+              "hidden md:block" supaya tidak ikut dipaksa render (dan
+              melebar) di mobile. min-w-[880px] SENGAJA cuma dipakai di
+              sini, di dalam wrapper overflow-x-auto khusus desktop. */}
+          <div className="hidden md:block overflow-x-auto">
+            <table className="w-full min-w-[880px] text-sm">
               <thead>
                 <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
                   {canManage && (
@@ -404,11 +621,23 @@ export default function AssetsPage() {
                   )}
                   <th className="px-4 py-3 font-semibold">Asset</th>
                   <th className="px-4 py-3 font-semibold">Kategori</th>
-                  <th className="px-4 py-3 font-semibold">Lokasi</th>
-                  <th className="px-4 py-3 font-semibold">Perusahaan / Divisi</th>
-                  <th className="px-4 py-3 font-semibold">Status</th>
-                  <th className="px-4 py-3 font-semibold">Kondisi</th>
-                  <th className="px-4 py-3 font-semibold">Nilai Asset</th>
+                  {isAssetFinanceRole ? (
+                    <>
+                      <th className="px-4 py-3 font-semibold">Perusahaan / Divisi</th>
+                      <th className="px-4 py-3 font-semibold">Harga Beli</th>
+                      <th className="px-4 py-3 font-semibold">Status Finance</th>
+                      <th className="px-4 py-3 font-semibold">Invoice</th>
+                      <th className="px-4 py-3 font-semibold">Vendor</th>
+                    </>
+                  ) : (
+                    <>
+                      <th className="px-4 py-3 font-semibold">Lokasi</th>
+                      <th className="px-4 py-3 font-semibold">Perusahaan / Divisi</th>
+                      <th className="px-4 py-3 font-semibold">Status</th>
+                      <th className="px-4 py-3 font-semibold">Kondisi</th>
+                      {canViewFinance && <th className="px-4 py-3 font-semibold">Nilai Asset</th>}
+                    </>
+                  )}
                   <th className="px-4 py-3 font-semibold text-right">Aksi</th>
                 </tr>
               </thead>
@@ -436,23 +665,58 @@ export default function AssetsPage() {
                       </Link>
                     </td>
                     <td className="px-4 py-3 text-slate-500">{a.categoryName}</td>
-                    <td className="px-4 py-3 text-slate-500">{a.location || "-"}</td>
-                    <td className="px-4 py-3 text-slate-500">
-                      <p>{a.companyOwnerName || "-"}</p>
-                      <p className="text-xs text-slate-400">{a.divisionOwnerName || ""}</p>
-                    </td>
-                    <td className="px-4 py-3">
-                      <Badge
-                        label={ASSET_STATUS_LABEL[a.assetStatus]}
-                        colorClass={ASSET_STATUS_COLOR[a.assetStatus]}
-                      />
-                    </td>
-                    <td className="px-4 py-3 text-slate-500">
-                      {CONDITION_LABEL[a.condition]}
-                    </td>
-                    <td className="px-4 py-3 text-slate-500">
-                      {formatCurrency(a.purchasePrice)}
-                    </td>
+                    {isAssetFinanceRole ? (
+                      <>
+                        <td className="px-4 py-3 text-slate-500">
+                          <p>{a.companyOwnerName || "-"}</p>
+                          <p className="text-xs text-slate-400">{a.divisionOwnerName || ""}</p>
+                        </td>
+                        <td className="px-4 py-3 text-slate-500">{formatRupiah(getAssetPrice(a))}</td>
+                        <td className="px-4 py-3">
+                          <Badge
+                            label={FINANCE_STATUS_LABEL[getFinanceStatus(a)]}
+                            colorClass={FINANCE_STATUS_COLOR[getFinanceStatus(a)]}
+                          />
+                        </td>
+                        <td className="px-4 py-3 text-slate-500">
+                          {a.invoiceFileUrl ? (
+                            <a
+                              href={a.invoiceFileUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-600 hover:underline"
+                            >
+                              {a.invoiceNumber || "Lihat file"}
+                            </a>
+                          ) : (
+                            a.invoiceNumber || "-"
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-slate-500">{a.vendorName || "-"}</td>
+                      </>
+                    ) : (
+                      <>
+                        <td className="px-4 py-3 text-slate-500">{a.location || "-"}</td>
+                        <td className="px-4 py-3 text-slate-500">
+                          <p>{a.companyOwnerName || "-"}</p>
+                          <p className="text-xs text-slate-400">{a.divisionOwnerName || ""}</p>
+                        </td>
+                        <td className="px-4 py-3">
+                          <Badge
+                            label={ASSET_STATUS_LABEL[a.assetStatus]}
+                            colorClass={ASSET_STATUS_COLOR[a.assetStatus]}
+                          />
+                        </td>
+                        <td className="px-4 py-3 text-slate-500">
+                          {CONDITION_LABEL[a.condition]}
+                        </td>
+                        {canViewFinance && (
+                          <td className="px-4 py-3 text-slate-500">
+                            {formatCurrency(a.purchasePrice)}
+                          </td>
+                        )}
+                      </>
+                    )}
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-1">
                         <Link
@@ -462,15 +726,26 @@ export default function AssetsPage() {
                         >
                           <Eye size={15} />
                         </Link>
+                        {isAssetFinanceRole && (
+                          <Link
+                            href={`/assets/${a.id}/edit?mode=finance`}
+                            title={isFinanceComplete(a) ? "Edit Finance" : "Lengkapi Finance"}
+                            className="p-1.5 rounded-lg cursor-pointer transition-colors hover:bg-slate-100 text-slate-500"
+                          >
+                            <Pencil size={15} />
+                          </Link>
+                        )}
+                        {canCreateOrEditAsset && (
+                          <Link
+                            href={`/assets/${a.id}/edit`}
+                            title="Edit Asset"
+                            className="p-1.5 rounded-lg cursor-pointer transition-colors hover:bg-slate-100 text-slate-500"
+                          >
+                            <Pencil size={15} />
+                          </Link>
+                        )}
                         {canManage && (
                           <>
-                            <Link
-                              href={`/assets/${a.id}/edit`}
-                              title="Edit Asset"
-                              className="p-1.5 rounded-lg cursor-pointer transition-colors hover:bg-slate-100 text-slate-500"
-                            >
-                              <Pencil size={15} />
-                            </Link>
                             <button
                               type="button"
                               onClick={() => setQrLabelTarget(a)}
@@ -496,6 +771,145 @@ export default function AssetsPage() {
               </tbody>
             </table>
           </div>
+
+          {/* Mobile — card list per aset menggantikan table (section A/B).
+              Field yang tampil beda per role, sama seperti kolom table di
+              atas: Asset Finance fokus harga/invoice/vendor, role lain
+              fokus data operasional dan TIDAK PERNAH lihat nominal harga
+              kecuali canViewFinance. */}
+          <div className="block md:hidden space-y-3 p-3">
+            {filtered.map((a) => (
+              <div
+                key={a.id}
+                className="w-full max-w-full rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <Link href={`/assets/${a.id}`} className="block">
+                      <h3 className="text-sm font-semibold text-slate-900 break-words">
+                        {a.assetName || "-"}
+                      </h3>
+                      <p className="mt-0.5 text-xs text-slate-500 break-all">{a.assetCode || "-"}</p>
+                    </Link>
+                  </div>
+                  <Badge
+                    label={
+                      isAssetFinanceRole
+                        ? FINANCE_STATUS_LABEL[getFinanceStatus(a)]
+                        : ASSET_STATUS_LABEL[a.assetStatus]
+                    }
+                    colorClass={
+                      isAssetFinanceRole
+                        ? FINANCE_STATUS_COLOR[getFinanceStatus(a)]
+                        : ASSET_STATUS_COLOR[a.assetStatus]
+                    }
+                  />
+                </div>
+
+                <div className="mt-4 grid grid-cols-1 gap-3 text-sm">
+                  <div>
+                    <p className="text-xs text-slate-400">Kategori</p>
+                    <p className="font-medium text-slate-700 break-words">{a.categoryName || "-"}</p>
+                  </div>
+
+                  {isAssetFinanceRole ? (
+                    <>
+                      <div>
+                        <p className="text-xs text-slate-400">Perusahaan / Divisi</p>
+                        <p className="font-medium text-slate-700 break-words">
+                          {a.companyOwnerName || "-"}
+                        </p>
+                        <p className="text-xs text-slate-500 break-words">{a.divisionOwnerName || ""}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-slate-400">Harga Beli</p>
+                        <p className="font-semibold text-slate-900">{formatRupiah(getAssetPrice(a))}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-slate-400">Invoice</p>
+                        <p className="font-medium text-slate-700 break-words">
+                          {a.invoiceFileUrl ? (
+                            <a
+                              href={a.invoiceFileUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-600 hover:underline"
+                            >
+                              {a.invoiceNumber || "Lihat file"}
+                            </a>
+                          ) : (
+                            a.invoiceNumber || "-"
+                          )}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-slate-400">Vendor</p>
+                        <p className="font-medium text-slate-700 break-words">{a.vendorName || "-"}</p>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div>
+                        <p className="text-xs text-slate-400">Lokasi</p>
+                        <p className="font-medium text-slate-700 break-words">
+                          {a.locationText || a.location || "-"}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-slate-400">Perusahaan / Divisi</p>
+                        <p className="font-medium text-slate-700 break-words">
+                          {a.companyOwnerName || "-"}
+                        </p>
+                        <p className="text-xs text-slate-500 break-words">{a.divisionOwnerName || ""}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-slate-400">Kondisi</p>
+                        <p className="font-medium text-slate-700">{CONDITION_LABEL[a.condition]}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-slate-400">PIC Operasional</p>
+                        <p className="font-medium text-slate-700 break-words">
+                          {a.custodianName || a.picName || a.responsiblePersonName || "-"}
+                        </p>
+                      </div>
+                      {canViewFinance && (
+                        <div>
+                          <p className="text-xs text-slate-400">Nilai Asset</p>
+                          <p className="font-semibold text-slate-900">{formatCurrency(a.purchasePrice)}</p>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+
+                <div className="mt-4 flex flex-wrap justify-end gap-2">
+                  <Link
+                    href={`/assets/${a.id}`}
+                    className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Lihat Detail
+                  </Link>
+                  {isAssetFinanceRole && (
+                    <Link
+                      href={`/assets/${a.id}/edit?mode=finance`}
+                      className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                    >
+                      {isFinanceComplete(a) ? "Edit Finance" : "Lengkapi Finance"}
+                    </Link>
+                  )}
+                  {canCreateOrEditAsset && (
+                    <Link
+                      href={`/assets/${a.id}/edit`}
+                      className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                    >
+                      Edit Asset
+                    </Link>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+          </>
         )}
       </div>
 

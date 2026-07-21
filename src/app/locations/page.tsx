@@ -17,17 +17,23 @@ import {
   RefreshCw,
   Search,
   Ticket,
+  User,
+  UserX,
   Wrench,
 } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { Asset, AssetIssueTicket, AssetLocationNode, LocationType, MaintenanceWorkOrder } from "@/lib/types";
 import { countAssetsAtLocation, getChildren, LOCATION_TYPE_LABEL } from "@/lib/locations";
+import { EmployeeOption, fetchActiveEmployeeOptions, writeLocationPicLog } from "@/lib/firestore-helpers";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
 import EmptyState from "@/components/EmptyState";
 import LocationFormModal from "@/components/LocationFormModal";
 import SyncAssetLocationModal from "@/components/SyncAssetLocationModal";
+import ConfirmModal from "@/components/ConfirmModal";
+import SearchableSelect, { SearchableSelectItem } from "@/components/SearchableSelect";
+import { Toast, ToastState } from "@/components/Toast";
 import Badge from "@/components/Badge";
 
 type LocationIcon = ComponentType<{ size?: number; className?: string }>;
@@ -103,6 +109,12 @@ export default function LocationsPage() {
   const [formDefaultParentId, setFormDefaultParentId] = useState<string | null>(null);
   const [editingNode, setEditingNode] = useState<AssetLocationNode | null>(null);
   const [syncOpen, setSyncOpen] = useState(false);
+  const [employeeOptions, setEmployeeOptions] = useState<EmployeeOption[]>([]);
+  const [picModalNode, setPicModalNode] = useState<AssetLocationNode | null>(null);
+  const [picSelectedUid, setPicSelectedUid] = useState("");
+  const [picSaving, setPicSaving] = useState(false);
+  const [removePicNode, setRemovePicNode] = useState<AssetLocationNode | null>(null);
+  const [toast, setToast] = useState<ToastState | null>(null);
 
   const canManage = role === "super_admin" || role === "asset_admin";
 
@@ -165,6 +177,105 @@ export default function LocationsPage() {
     );
     return () => unsub();
   }, [authReady]);
+
+  // Section A/B — daftar karyawan aktif untuk dropdown "Tetapkan PIC
+  // Lokasi", sumber tunggal sama seperti dropdown PIC/Custodian di
+  // create/edit asset.
+  useEffect(() => {
+    if (!authReady) return;
+    fetchActiveEmployeeOptions()
+      .then(setEmployeeOptions)
+      .catch((err) => console.error("[LocationsPage] gagal memuat daftar karyawan aktif", err));
+  }, [authReady]);
+
+  const employeeItems: SearchableSelectItem[] = employeeOptions.map((e) => ({
+    id: e.uid,
+    label: e.name,
+    sublabel: [e.divisionName, e.brandName, e.roleLabel].filter(Boolean).join(" — ") || undefined,
+    searchText: [e.name, e.email, e.divisionName, e.brandName, e.roleLabel].filter(Boolean).join(" "),
+  }));
+
+  const openAssignPicModal = (node: AssetLocationNode) => {
+    setPicSelectedUid(node.picUid || "");
+    setPicModalNode(node);
+  };
+
+  const handleAssignPic = async () => {
+    if (!picModalNode || !assetUser) return;
+    const selected = employeeOptions.find((e) => e.uid === picSelectedUid);
+    if (!selected) {
+      setToast({ type: "error", message: "Pilih karyawan untuk dijadikan PIC Lokasi." });
+      return;
+    }
+    setPicSaving(true);
+    try {
+      await updateDoc(doc(db, "asset_locations", picModalNode.id), {
+        picUid: selected.uid,
+        picName: selected.name,
+        picEmail: selected.email,
+        picRole: selected.roleLabel,
+        picDivision: selected.divisionName,
+        picAssignedAt: serverTimestamp(),
+        picAssignedByUid: assetUser.uid,
+        picAssignedByName: assetUser.name,
+        updatedAt: serverTimestamp(),
+      });
+      await writeLocationPicLog({
+        locationId: picModalNode.id,
+        locationName: picModalNode.locationLabel,
+        action: picModalNode.picUid ? "location_pic_changed" : "location_pic_assigned",
+        oldPicUid: picModalNode.picUid || null,
+        oldPicName: picModalNode.picName || null,
+        newPicUid: selected.uid,
+        newPicName: selected.name,
+        createdByUid: assetUser.uid,
+        createdByName: assetUser.name,
+      });
+      setToast({ type: "success", message: "PIC Lokasi berhasil ditetapkan." });
+      setPicModalNode(null);
+    } catch (err) {
+      console.error("[LocationsPage] gagal menetapkan PIC lokasi", err);
+      setToast({ type: "error", message: "Gagal menetapkan PIC lokasi." });
+    } finally {
+      setPicSaving(false);
+    }
+  };
+
+  const handleRemovePic = async () => {
+    if (!removePicNode || !assetUser) return;
+    setPicSaving(true);
+    try {
+      await updateDoc(doc(db, "asset_locations", removePicNode.id), {
+        picUid: null,
+        picName: null,
+        picEmail: null,
+        picRole: null,
+        picDivision: null,
+        picAssignedAt: null,
+        picAssignedByUid: null,
+        picAssignedByName: null,
+        updatedAt: serverTimestamp(),
+      });
+      await writeLocationPicLog({
+        locationId: removePicNode.id,
+        locationName: removePicNode.locationLabel,
+        action: "location_pic_removed",
+        oldPicUid: removePicNode.picUid || null,
+        oldPicName: removePicNode.picName || null,
+        newPicUid: null,
+        newPicName: null,
+        createdByUid: assetUser.uid,
+        createdByName: assetUser.name,
+      });
+      setToast({ type: "success", message: "PIC Lokasi berhasil dihapus." });
+      setRemovePicNode(null);
+    } catch (err) {
+      console.error("[LocationsPage] gagal menghapus PIC lokasi", err);
+      setToast({ type: "error", message: "Gagal menghapus PIC lokasi." });
+    } finally {
+      setPicSaving(false);
+    }
+  };
 
   const selectedNode = locations.find((n) => n.id === selectedId) || null;
   const selectedBuilding = locations.find((n) => n.id === selectedBuildingId) || null;
@@ -284,7 +395,7 @@ export default function LocationsPage() {
   const nodeAssetCount = (node: AssetLocationNode) => countAssetsAtLocation(assets, node);
   const nodeTicketCount = (node: AssetLocationNode) => {
     const ids = new Set(assets.filter((a) => matchesNodeAsset(a, node)).map((a) => a.id));
-    return tickets.filter((t) => ids.has(t.assetId)).length;
+    return tickets.filter((t) => !!t.assetId && ids.has(t.assetId)).length;
   };
   const nodeActiveWorkOrders = (node: AssetLocationNode) => {
     const ids = new Set(assets.filter((a) => matchesNodeAsset(a, node)).map((a) => a.id));
@@ -531,6 +642,8 @@ export default function LocationsPage() {
           onEdit={() => selectedNode && openEditForm(selectedNode)}
           onAddSub={() => selectedNode && openAddSubLocation(selectedNode)}
           onToggleStatus={() => selectedNode && handleToggleStatus(selectedNode)}
+          onAssignPic={() => selectedNode && openAssignPicModal(selectedNode)}
+          onRemovePic={() => selectedNode && setRemovePicNode(selectedNode)}
         />
       </div>
 
@@ -549,6 +662,36 @@ export default function LocationsPage() {
         assets={assets}
         locations={locations}
       />
+
+      <ConfirmModal
+        open={!!picModalNode}
+        title={picModalNode?.picUid ? "Ubah PIC Lokasi" : "Tetapkan PIC Lokasi"}
+        description={`Pilih karyawan yang bertanggung jawab mendata/mengawasi aset di "${picModalNode?.locationLabel || ""}".`}
+        confirmLabel={picSaving ? "Menyimpan..." : "Simpan"}
+        onConfirm={handleAssignPic}
+        onCancel={() => setPicModalNode(null)}
+      >
+        <SearchableSelect
+          items={employeeItems}
+          value={picSelectedUid}
+          onChange={setPicSelectedUid}
+          placeholder="Pilih karyawan"
+          searchPlaceholder="Cari nama karyawan..."
+          emptyText="Karyawan tidak ditemukan"
+        />
+      </ConfirmModal>
+
+      <ConfirmModal
+        open={!!removePicNode}
+        title="Hapus PIC Lokasi"
+        description={`PIC Lokasi untuk "${removePicNode?.locationLabel || ""}" akan dihapus. Lokasi ini akan tampil "Belum ada PIC lokasi".`}
+        confirmLabel={picSaving ? "Menghapus..." : "Hapus"}
+        danger
+        onConfirm={handleRemovePic}
+        onCancel={() => setRemovePicNode(null)}
+      />
+
+      <Toast toast={toast} onClose={() => setToast(null)} />
     </ProtectedLayout>
   );
 }
@@ -681,6 +824,8 @@ function DetailPanel({
   onEdit,
   onAddSub,
   onToggleStatus,
+  onAssignPic,
+  onRemovePic,
 }: {
   selectedNode: AssetLocationNode | null;
   selectedChildType: LocationType | null;
@@ -691,6 +836,8 @@ function DetailPanel({
   onEdit: () => void;
   onAddSub: () => void;
   onToggleStatus: () => void;
+  onAssignPic: () => void;
+  onRemovePic: () => void;
 }) {
   return (
     <aside className="flex min-h-[420px] flex-col rounded-2xl border border-slate-200 bg-white shadow-sm md:h-[640px]">
@@ -747,6 +894,47 @@ function DetailPanel({
               <p className="text-sm font-medium leading-6 text-slate-700">
                 {selectedNode.fullPath || selectedNode.locationLabel}
               </p>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+              <div className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase text-slate-400">
+                <User size={14} />
+                PIC Lokasi
+              </div>
+              {selectedNode.picUid ? (
+                <>
+                  <p className="text-sm font-semibold text-slate-800">{selectedNode.picName}</p>
+                  {(selectedNode.picDivision || selectedNode.picRole) && (
+                    <p className="text-xs text-slate-500">
+                      {[selectedNode.picDivision, selectedNode.picRole].filter(Boolean).join(" — ")}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <p className="text-sm text-slate-400">Belum ada PIC lokasi</p>
+              )}
+              {canManage && (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={onAssignPic}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-blue-100 bg-blue-50 px-2.5 text-xs font-semibold text-blue-700 transition-colors hover:bg-blue-100"
+                  >
+                    <User size={13} />
+                    {selectedNode.picUid ? "Ubah PIC Lokasi" : "Tetapkan PIC"}
+                  </button>
+                  {selectedNode.picUid && (
+                    <button
+                      type="button"
+                      onClick={onRemovePic}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-red-100 bg-red-50 px-2.5 text-xs font-semibold text-red-700 transition-colors hover:bg-red-100"
+                    >
+                      <UserX size={13} />
+                      Hapus PIC Lokasi
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-1 2xl:grid-cols-3">

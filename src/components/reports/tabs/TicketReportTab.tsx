@@ -10,15 +10,14 @@ import {
 import { exportToExcel, resolutionTimeLabel, todayStamp, toDateSafe } from "@/lib/reports";
 import SummaryCard from "@/components/reports/SummaryCard";
 import { ChartCard, SimpleBarChart, SimpleLineChart } from "@/components/reports/charts";
+import ResponsiveTable from "@/components/reports/ResponsiveTable";
 
 export default function TicketReportTab({ tickets }: { tickets: AssetIssueTicket[] }) {
   const total = tickets.length;
-  const open = tickets.filter((t) => t.status === "open").length;
-  const checking = tickets.filter((t) => t.status === "checking").length;
-  const followUp = tickets.filter((t) =>
-    ["needs_follow_up", "waiting_sparepart", "waiting_vendor"].includes(t.status)
-  ).length;
-  const done = tickets.filter((t) => ["resolved", "closed"].includes(t.status)).length;
+  const open = tickets.filter((t) => t.status === "reported").length;
+  const checking = tickets.filter((t) => t.status === "in_progress").length;
+  const followUp = tickets.filter((t) => t.status === "needs_follow_up").length;
+  const done = tickets.filter((t) => t.status === "completed").length;
 
   const avgResolutionHours = useMemo(() => {
     const resolved = tickets.filter((t) => t.resolvedAt && t.reportedAt);
@@ -64,7 +63,10 @@ export default function TicketReportTab({ tickets }: { tickets: AssetIssueTicket
 
   const topAssets = useMemo(() => {
     const counts = new Map<string, number>();
-    tickets.forEach((t) => counts.set(t.assetName, (counts.get(t.assetName) || 0) + 1));
+    tickets.forEach((t) => {
+      const name = t.assetName || "Tanpa asset";
+      counts.set(name, (counts.get(name) || 0) + 1);
+    });
     return Array.from(counts.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 10)
@@ -123,7 +125,7 @@ export default function TicketReportTab({ tickets }: { tickets: AssetIssueTicket
         <SummaryCard label="Rata-rata Selesai (jam)" value={avgResolutionHours} color="bg-slate-100 text-slate-600" />
       </div>
 
-      <div className="grid md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <ChartCard title="Ticket per Bulan">
           <SimpleLineChart data={perMonth} />
         </ChartCard>
@@ -158,36 +160,20 @@ export default function TicketReportTab({ tickets }: { tickets: AssetIssueTicket
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
-                <th className="px-4 py-3 font-semibold">Nomor Ticket</th>
-                <th className="px-4 py-3 font-semibold">Asset</th>
-                <th className="px-4 py-3 font-semibold">Pelapor</th>
-                <th className="px-4 py-3 font-semibold">Gejala</th>
-                <th className="px-4 py-3 font-semibold">Priority</th>
-                <th className="px-4 py-3 font-semibold">Status</th>
-                <th className="px-4 py-3 font-semibold">Created At</th>
-                <th className="px-4 py-3 font-semibold">Resolution Time</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tickets.slice(0, 50).map((t) => (
-                <tr key={t.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50/70">
-                  <td className="px-4 py-3 font-medium text-slate-800">{t.ticketNumber}</td>
-                  <td className="px-4 py-3 text-slate-600">{t.assetName}</td>
-                  <td className="px-4 py-3 text-slate-600">{t.reportedByName}</td>
-                  <td className="px-4 py-3 text-slate-600">{t.symptomType}</td>
-                  <td className="px-4 py-3 text-slate-600">{ISSUE_PRIORITY_LABEL[t.priority]}</td>
-                  <td className="px-4 py-3 text-slate-600">{ISSUE_STATUS_LABEL[t.status]}</td>
-                  <td className="px-4 py-3 text-slate-500">{formatDateTime(t.reportedAt)}</td>
-                  <td className="px-4 py-3 text-slate-500">{resolutionTimeLabel(t)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <ResponsiveTable
+          rows={tickets.slice(0, 50)}
+          keyFn={(t) => t.id}
+          columns={[
+            { label: "Nomor Ticket", primary: true, render: (t) => t.ticketNumber },
+            { label: "Asset", render: (t) => t.assetName },
+            { label: "Pelapor", render: (t) => t.reportedByName },
+            { label: "Gejala", render: (t) => t.symptomType },
+            { label: "Priority", render: (t) => ISSUE_PRIORITY_LABEL[t.priority] },
+            { label: "Status", render: (t) => ISSUE_STATUS_LABEL[t.status] },
+            { label: "Created At", render: (t) => formatDateTime(t.reportedAt) },
+            { label: "Resolution Time", render: (t) => resolutionTimeLabel(t) },
+          ]}
+        />
       </div>
     </div>
   );

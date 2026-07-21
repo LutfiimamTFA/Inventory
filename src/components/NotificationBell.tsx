@@ -63,6 +63,11 @@ export default function NotificationBell() {
 
   useEffect(() => {
     if (!authReady || !assetUser?.uid) return;
+    console.log("[NotificationBell Current User]", {
+      uid: firebaseUser?.uid,
+      email: firebaseUser?.email,
+      role: assetUser?.role,
+    });
     const q = query(
       collection(db, "asset_notifications"),
       where("recipientUid", "==", assetUser.uid),
@@ -80,7 +85,7 @@ export default function NotificationBell() {
       }
     );
     return () => unsub();
-  }, [authReady, assetUser?.uid]);
+  }, [authReady, assetUser?.uid, assetUser?.role, firebaseUser?.uid, firebaseUser?.email]);
 
   useEffect(() => {
     if (!open) return;

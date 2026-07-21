@@ -30,7 +30,7 @@ export default function OverviewTab({
   );
 
   const unresolvedTickets = tickets.filter(
-    (t) => !["resolved", "closed", "rejected"].includes(t.status)
+    (t) => !["completed", "cancelled", "rejected", "duplicate"].includes(t.status)
   );
 
   const activeWorkOrders = workOrders.filter((w) =>
@@ -145,7 +145,7 @@ export default function OverviewTab({
         ))}
       </div>
 
-      <div className="grid md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <ChartCard title="Asset by Status">
           <SimplePieChart data={assetByStatus} />
         </ChartCard>

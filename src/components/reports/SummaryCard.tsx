@@ -8,9 +8,11 @@ export default function SummaryCard({
   color?: string;
 }) {
   return (
-    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
-      <p className="text-xl font-semibold text-slate-900">{value}</p>
-      <p className={`text-xs mt-1 inline-block rounded-full px-2 py-0.5 ${color}`}>{label}</p>
+    <div className="min-w-0 w-full max-w-full rounded-2xl border border-slate-200 bg-white p-3 shadow-sm md:p-4">
+      <p className="text-xl font-bold text-slate-900 break-words">{value}</p>
+      <p className={`text-[11px] mt-1 inline-flex max-w-full rounded-full px-2 py-1 font-semibold break-words ${color}`}>
+        {label}
+      </p>
     </div>
   );
 }

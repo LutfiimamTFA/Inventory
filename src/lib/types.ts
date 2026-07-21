@@ -1,4 +1,10 @@
-export type AppRole = "super_admin" | "asset_admin" | "asset_finance" | "it_team" | "staff";
+export type AppRole =
+  | "super_admin"
+  | "asset_admin"
+  | "asset_finance"
+  | "location_pic"
+  | "it_team"
+  | "staff";
 
 export type AssetStatus =
   | "available"
@@ -80,6 +86,16 @@ export interface Asset {
   responsiblePersonJobTitle?: string;
   ownershipStatus: OwnershipStatus;
 
+  // PIC Lokasi — diisi OTOMATIS dari asset_locations saat aset dibuat/lokasi
+  // diubah (lihat resolveAreaPic di lib/locations.ts), BUKAN dipilih manual
+  // di form. Beda dengan custodian/currentHolder (lihat blok di bawah) yang
+  // menunjuk orang yang bertanggung jawab atas BARANG, bukan TEMPAT.
+  areaPicUid?: string | null;
+  areaPicName?: string | null;
+  areaPicEmail?: string | null;
+  areaPicLocationId?: string | null;
+  areaPicLocationName?: string | null;
+
   maintenanceEnabled?: boolean;
   maintenanceIntervalMonths?: number;
   lastMaintenanceAt?: unknown;
@@ -99,6 +115,10 @@ export interface Asset {
   purchaseMethod?: string;
   estimatedUsefulLife?: string;
   financeNotes?: string;
+  financeStatus?: "complete" | "pending_finance";
+  financeUpdatedAt?: unknown;
+  financeUpdatedByUid?: string;
+  financeUpdatedByName?: string;
 
   assetStatus: AssetStatus;
   condition: AssetCondition;
@@ -320,19 +340,86 @@ export type IssueImpactLevel =
 
 export type IssuePriority = "low" | "medium" | "high" | "urgent";
 
+export type IssueSeverity = "low" | "medium" | "high" | "critical";
+
+// Section B perbaikan modal laporan kendala — DUA hal yang beda, jangan
+// dicampur: "Tingkat Dampak dari Pelapor" (fieldImpact, pakai skala
+// IssueSeverity yang sama) diisi staff saat lapor berdasarkan kondisi di
+// lapangan, sedangkan "Prioritas Penanganan QHSE" (handlingPriority) HANYA
+// boleh diisi QHSE setelah review, dengan skala kata yang berbeda supaya
+// jelas ini keputusan penanganan, bukan penilaian tingkat kerusakan.
+export type HandlingPriority = "normal" | "soon" | "urgent" | "emergency";
+
+export type IssueReportType =
+  | "asset_issue"
+  | "facility_issue"
+  | "it_network"
+  | "safety_hazard"
+  | "environment_issue"
+  | "emergency"
+  | "other";
+
+// Section G perbaikan alur assignment — tim penanganan laporan kendala
+// staff. HANYA "it_team", "qhse", dan "finance" yang punya sumber data
+// akun AssetView asli (asset_users role it_team/asset_admin/asset_finance);
+// "facility", "security", "vendor", "other" TIDAK punya role/collection
+// pendukung di app ini, jadi penanggung jawabnya diisi manual (nama+kontak)
+// lewat AssignIssueTicketModal, bukan dropdown user asli.
+export type IssueAssignedTeam =
+  | "it_team"
+  | "facility"
+  | "qhse"
+  | "security"
+  | "vendor"
+  | "finance"
+  | "other"
+  | "external_vendor";
+
+// Alur laporan kendala staff PUNYA status sendiri, TERPISAH dari
+// WorkOrderStatus (maintenance rutin) — jangan campur lagi dua alur ini.
+// Nilai lama (open/review_by_asset_admin/waiting_diagnosis/checking/
+// minor_fix/waiting_sparepart/waiting_vendor/resolved/closed/scheduled)
+// SENGAJA dihapus dari union ini; dokumen lama yang masih pakai nilai itu
+// akan terbaca sebagai string biasa lewat fallback label di utils.ts.
+// "waiting_qhse_review" (versi lama) DIHAPUS dari union ini — diganti
+// alur konfirmasi pelapor (waiting_reporter_confirmation/reporter_confirmed)
+// karena QHSE TIDAK BOLEH langsung close tanpa hasil penanganan tim DAN
+// konfirmasi pelapor di lapangan (lihat lib/issueTicketActions.ts).
 export type IssueTicketStatus =
-  | "open"
-  | "review_by_asset_admin"
+  | "reported"
+  | "under_review"
   | "need_more_info"
-  | "waiting_diagnosis"
-  | "checking"
-  | "minor_fix"
+  | "assigned"
+  | "in_progress"
+  | "external_coordination"
+  | "waiting_reporter_confirmation"
+  | "reporter_confirmed"
   | "needs_follow_up"
-  | "waiting_sparepart"
-  | "waiting_vendor"
-  | "resolved"
-  | "closed"
-  | "rejected";
+  | "completed"
+  | "cancelled"
+  | "rejected"
+  | "duplicate";
+
+// Penanganan oleh teknisi/vendor eksternal (tidak login ke AssetView) —
+// laporan yang butuh orang luar (teknisi AC/WiFi/listrik/plumbing/tukang
+// bangunan/vendor lain) TIDAK dipaksa masuk status "assigned" internal biasa,
+// karena tidak ada "Mulai Tangani" dari vendor. QHSE HANYA berperan sebagai
+// penghubung/koordinator — bukan pihak yang mengerjakan — jadi statusnya
+// sengaja dipersempit jadi 3 saja (lihat ExternalCoordinationStatus):
+// QHSE tidak selalu tahu detail teknisi "sedang mengerjakan" di lapangan,
+// yang pasti diketahui cuma "sudah dipanggil", "belum datang", "sudah datang".
+export type ExternalHandlerType = "wifi_network" | "ac" | "electrical" | "plumbing" | "building" | "other";
+
+export type ExternalCoordinationStatus =
+  | "calling_external_technician"
+  | "waiting_external_technician"
+  | "external_technician_arrived";
+
+// Vendor/pembelian pada laporan kendala staff BUKAN status terpisah —
+// hanya sub-penanda di dalam status "needs_follow_up" (lihat Section C
+// perbaikan alur laporan kendala: "Teruskan ke Vendor"/"Ajukan Pembelian"
+// TETAP needs_follow_up, cuma followUpType yang berubah).
+export type IssueFollowUpType = "recheck" | "vendor" | "purchase";
 
 export type IssueCauseCategory =
   | "Software"
@@ -359,28 +446,72 @@ export interface AssetIssueTicket {
   ticketNumber: string;
   queueNumber: string;
 
-  assetId: string;
-  assetName: string;
-  assetCode: string;
+  reportType?: IssueReportType;
+  source?: "manual_web" | "staff_report" | "maintenance_work_order" | "maintenance_finding";
+  title?: string;
+  severity?: IssueSeverity;
+  statusLabel?: string;
+  staffStatusLabel?: string;
+
+  // "Tingkat Dampak dari Pelapor" — diisi staff saat lapor, read-only untuk
+  // QHSE kecuali lewat alur "Koreksi Dampak" yang wajib alasan. fieldImpact
+  // pakai skala IssueSeverity yang sama dengan `severity` (severity tetap
+  // disimpan untuk kompatibilitas kode lama yang belum dimigrasikan).
+  fieldImpact?: IssueSeverity;
+  fieldImpactLabel?: string;
+  impactDescription?: string;
+  fieldImpactCorrectedByUid?: string;
+  fieldImpactCorrectedByName?: string;
+  fieldImpactCorrectedAt?: unknown;
+  fieldImpactCorrectionReason?: string;
+
+  // "Prioritas Penanganan QHSE" — HANYA QHSE yang mengisi, setelah review.
+  // TERPISAH dari fieldImpact/severity (lihat HandlingPriority di atas).
+  handlingPriority?: HandlingPriority;
+  handlingPriorityLabel?: string;
+  handlingPriorityReason?: string;
+  handlingPriorityByUid?: string;
+  handlingPriorityByName?: string;
+  handlingPriorityAt?: unknown;
+
+  // Laporan non-asset (fasilitas/IT-jaringan/K3/lingkungan/darurat/lainnya)
+  // TIDAK PERNAH terkait satu asset tertentu — assetId/Name/Code null itu
+  // valid, bukan data cacat. locationId/locationText tetap wajib diisi di
+  // level form (lihat staff-reports/new/page.tsx) karena laporan non-asset
+  // tetap harus punya lokasi.
+  assetId?: string | null;
+  assetName?: string | null;
+  assetCode?: string | null;
   assetCategory?: string;
   assetLocation?: string;
   locationId?: string;
+  buildingId?: string | null;
   buildingName?: string;
   floorName?: string;
   roomName?: string;
   areaName?: string;
   locationText?: string;
+  floorId?: string | null;
+  roomId?: string | null;
+  areaId?: string | null;
+  detailArea?: string | null;
 
   reportedByUid: string;
   reportedByName: string;
   reportedByEmail: string;
   reportedAt: unknown;
+  createdByUid?: string;
+  createdByName?: string;
+  createdByEmail?: string;
+  updatedByUid?: string;
+  updatedByName?: string;
 
   symptomType: IssueSymptomType;
   impactLevel: IssueImpactLevel;
   description: string;
   attachmentUrls?: string[];
   attachmentFiles?: string[];
+  photoUrls?: string[];
 
   priority: IssuePriority;
   status: IssueTicketStatus;
@@ -390,9 +521,45 @@ export interface AssetIssueTicket {
   reviewedAt?: unknown;
   reviewNote?: string;
 
-  assignedToUid?: string;
-  assignedToName?: string;
+  // Section G/I perbaikan alur — "Teruskan ke Tim Terkait" TIDAK LAGI cuma
+  // ubah status, wajib pilih tim + penanggung jawab lewat AssignIssueTicketModal.
+  assignedToUid?: string | null;
+  assignedToName?: string | null;
+  assignedToEmail?: string | null;
+  assignedToRole?: string | null;
+  assignedTeam?: IssueAssignedTeam | null;
+  assignedTeamLabel?: string | null;
   assignedAt?: unknown;
+  assignedByUid?: string;
+  assignedByName?: string;
+
+  // Vendor eksternal — dipakai kalau assignedTeam == "vendor" dan tidak ada
+  // akun AssetView untuk penanggung jawabnya.
+  vendorName?: string | null;
+  vendorContact?: string | null;
+
+  assignmentInstruction?: string;
+  targetResolutionAt?: unknown;
+  targetResolutionLabel?: string;
+
+  reassignedAt?: unknown;
+  reassignedByUid?: string;
+  reassignedByName?: string;
+  reassignmentReason?: string;
+
+  // Penanganan teknisi/vendor eksternal — vendor TIDAK login ke AssetView,
+  // jadi tidak ada assignedToUid; QHSE hanya mencatat proses memanggilkan
+  // teknisi + estimasi kedatangan (bukan progres pengerjaan detail, karena
+  // QHSE bukan yang mengerjakan dan belum tentu tahu detailnya).
+  externalHandling?: boolean;
+  externalHandlerType?: ExternalHandlerType;
+  externalHandlerLabel?: string;
+  externalCoordinationStatus?: ExternalCoordinationStatus;
+  externalCoordinationStatusLabel?: string;
+  externalEstimatedArrivalAt?: unknown;
+  externalEstimatedArrivalLabel?: string;
+  coordinationNote?: string;
+  noteForReporter?: string;
 
   diagnosis?: string;
   causeCategory?: IssueCauseCategory;
@@ -404,15 +571,104 @@ export interface AssetIssueTicket {
   resolvedAt?: unknown;
   closedAt?: unknown;
 
+  // Section G — field alur laporan kendala staff yang TERKONTROL lewat
+  // tombol aksi (bukan dropdown status bebas), lihat lib/issueTicketActions.ts.
+  startedAt?: unknown;
+  startedByUid?: string;
+  startedByName?: string;
+
+  resolutionPhotoUrls?: string[];
+  handledAt?: unknown;
+  handledByUid?: string;
+  handledByName?: string;
+  waitingReporterConfirmationAt?: unknown;
+
+  reporterConfirmedAt?: unknown;
+  reporterConfirmedByUid?: string;
+  reporterConfirmedByName?: string;
+  reporterConfirmationNote?: string;
+
+  // Pelapor menyatakan "Masih Bermasalah" saat waiting_reporter_confirmation
+  // — field TERPISAH dari reopenReason (itu milik aksi QHSE "Buka Kembali"
+  // laporan yang sudah closed, alur berbeda sama sekali).
+  reporterRejectedResolutionAt?: unknown;
+  reporterRejectedResolutionByUid?: string;
+  reporterRejectedResolutionByName?: string;
+  reporterRejectedResolutionNote?: string;
+  reporterRejectedResolutionPhotoUrls?: string[];
+
+  followUpType?: IssueFollowUpType;
+
+  completedAt?: unknown;
+  completedByUid?: string;
+  completedByName?: string;
+  completionNote?: string;
+
+  cancelReason?: string;
+  rejectReason?: string;
+  duplicateNote?: string;
+  reopenReason?: string;
+
+  lastActivityAt?: unknown;
+  lastActivityByUid?: string;
+  lastActivityByName?: string;
+  lastActivityMessage?: string;
+
   // Diisi kalau ticket dibuat otomatis dari temuan Work Order Maintenance,
-  // bukan dari laporan staff via Scan QR.
-  source?: "staff_report" | "maintenance_work_order";
+  // bukan dari laporan staff via Scan QR/manual web.
   workOrderId?: string;
   workOrderNumber?: string;
   workOrderItemId?: string;
 
   createdAt: unknown;
   updatedAt: unknown;
+}
+
+// Log alur laporan kendala staff — collection asset_issue_ticket_logs,
+// TERPISAH dari AssetIssueLog/asset_issue_logs (log lama, masih dipakai
+// jalur lain yang belum dimigrasikan). Setiap tombol aksi di
+// IssueTicketDetailModal menulis satu entri ke sini.
+export type IssueTicketLogAction =
+  | "created"
+  | "review"
+  | "request_info"
+  | "complete_info"
+  | "forward"
+  | "reassign"
+  | "start"
+  | "send_result"
+  | "mark_follow_up"
+  | "request_vendor"
+  | "request_purchase"
+  | "confirm_done"
+  | "still_problem"
+  | "close"
+  | "reject"
+  | "duplicate"
+  | "cancel"
+  | "reopen"
+  | "status_moved"
+  | "correct_impact"
+  | "set_handling_priority"
+  | "assign_external"
+  | "external_coordination_updated"
+  | "mark_technician_arrived";
+
+export interface AssetIssueTicketLog {
+  id: string;
+  ticketId: string;
+  ticketNumber?: string;
+  action: IssueTicketLogAction | string;
+  actionLabel: string;
+  fromStatus?: IssueTicketStatus | string | null;
+  toStatus?: IssueTicketStatus | string | null;
+  message: string;
+  note?: string | null;
+  actorRole?: string;
+  createdAt: unknown;
+  createdByUid: string;
+  createdByName: string;
+  reporterUid?: string;
 }
 
 export type AssetIssueLogAction =
@@ -685,6 +941,9 @@ export interface MaintenanceWorkOrder {
   lastFindingAt?: unknown;
   lastFindingByUid?: string;
   lastFindingByName?: string;
+  lastActivityAt?: unknown;
+  lastActivityByUid?: string;
+  lastActivityByName?: string;
   lastActivityMessage?: string;
 }
 
@@ -983,8 +1242,40 @@ export interface AssetLocationNode {
   notes?: string;
   status: "active" | "inactive";
 
+  // PIC Lokasi — orang yang bertanggung jawab mendata/mengawasi aset di
+  // level lokasi ini (Gedung/Lantai/Ruangan/Area). BEDA dengan
+  // custodian/currentHolder aset (lihat Asset.custodianUid/currentHolderUid)
+  // — PIC Lokasi bertanggung jawab atas TEMPATNYA, bukan barang tertentu.
+  picUid?: string | null;
+  picName?: string | null;
+  picEmail?: string | null;
+  picRole?: string | null;
+  picDivision?: string | null;
+  picAssignedAt?: unknown;
+  picAssignedByUid?: string | null;
+  picAssignedByName?: string | null;
+
   createdByUid: string;
   createdByName: string;
   createdAt: unknown;
   updatedAt: unknown;
+}
+
+export type LocationPicLogAction =
+  | "location_pic_assigned"
+  | "location_pic_changed"
+  | "location_pic_removed";
+
+export interface AssetLocationLog {
+  id: string;
+  locationId: string;
+  locationName: string;
+  action: LocationPicLogAction;
+  oldPicUid?: string | null;
+  oldPicName?: string | null;
+  newPicUid?: string | null;
+  newPicName?: string | null;
+  createdAt: unknown;
+  createdByUid: string;
+  createdByName: string;
 }

@@ -6,7 +6,12 @@ import {
   AssetUsageType,
   TrackingMode,
   BorrowingStatus,
+  ExternalCoordinationStatus,
+  ExternalHandlerType,
+  HandlingPriority,
   IssuePriority,
+  IssueReportType,
+  IssueSeverity,
   IssueTicketStatus,
   MaintenanceConditionLabel,
   MaintenanceType,
@@ -184,34 +189,91 @@ export function formatDateTimeSeconds(value: unknown) {
   }).format(d);
 }
 
+// Section B/K — status laporan kendala staff, TERPISAH dari status
+// maintenance rutin (WORK_ORDER_STATUS_LABEL/WorkOrderStatus). Label ini
+// untuk sisi QHSE; sisi staff pakai ISSUE_STATUS_STAFF_LABEL (section F).
 export const ISSUE_STATUS_LABEL: Record<IssueTicketStatus, string> = {
-  open: "Laporan Diterima",
-  review_by_asset_admin: "Sedang Direview",
+  reported: "Laporan Masuk",
+  under_review: "Ditinjau QHSE",
   need_more_info: "Butuh Info Tambahan",
-  waiting_diagnosis: "Menunggu Teknisi",
-  checking: "Sedang Dicek",
-  minor_fix: "Perbaikan Ringan",
+  assigned: "Menunggu Tim Terkait",
+  in_progress: "Sedang Ditangani",
+  external_coordination: "Teknisi Eksternal Dipanggilkan",
+  waiting_reporter_confirmation: "Menunggu Konfirmasi Pelapor",
+  reporter_confirmed: "Dikonfirmasi Pelapor",
   needs_follow_up: "Butuh Tindakan Lanjutan",
-  waiting_sparepart: "Menunggu Sparepart",
-  waiting_vendor: "Menunggu Vendor",
-  resolved: "Selesai",
-  closed: "Ditutup",
+  completed: "Selesai",
+  cancelled: "Dibatalkan",
   rejected: "Ditolak",
+  duplicate: "Duplikat",
 };
 
 export const ISSUE_STATUS_COLOR: Record<IssueTicketStatus, string> = {
-  open: "bg-blue-50 text-blue-700 border-blue-200",
-  review_by_asset_admin: "bg-amber-50 text-amber-700 border-amber-200",
+  reported: "bg-blue-50 text-blue-700 border-blue-200",
+  under_review: "bg-indigo-50 text-indigo-700 border-indigo-200",
   need_more_info: "bg-orange-50 text-orange-700 border-orange-200",
-  waiting_diagnosis: "bg-purple-50 text-purple-700 border-purple-200",
-  checking: "bg-indigo-50 text-indigo-700 border-indigo-200",
-  minor_fix: "bg-teal-50 text-teal-700 border-teal-200",
+  assigned: "bg-amber-50 text-amber-700 border-amber-200",
+  in_progress: "bg-purple-50 text-purple-700 border-purple-200",
+  external_coordination: "bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200",
+  waiting_reporter_confirmation: "bg-cyan-50 text-cyan-700 border-cyan-200",
+  reporter_confirmed: "bg-emerald-50 text-emerald-700 border-emerald-200",
   needs_follow_up: "bg-red-50 text-red-700 border-red-200",
-  waiting_sparepart: "bg-rose-50 text-rose-700 border-rose-200",
-  waiting_vendor: "bg-rose-50 text-rose-700 border-rose-200",
-  resolved: "bg-emerald-50 text-emerald-700 border-emerald-200",
-  closed: "bg-slate-100 text-slate-500 border-slate-200",
+  completed: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  cancelled: "bg-slate-100 text-slate-500 border-slate-200",
   rejected: "bg-slate-800 text-slate-100 border-slate-800",
+  duplicate: "bg-slate-100 text-slate-500 border-slate-200",
+};
+
+// Section D/F/J — label yang staff lihat di My Reports, lebih sederhana
+// daripada label QHSE (mis. "Ditinjau QHSE" -> "Sedang Ditinjau").
+// external_coordination TIDAK PERNAH menunjukkan detail vendor ke staff
+// lewat label ini — detailnya ada di EXTERNAL_COORDINATION_STAFF_MESSAGE.
+export const ISSUE_STATUS_STAFF_LABEL: Record<IssueTicketStatus, string> = {
+  reported: "Laporan Terkirim",
+  under_review: "Sedang Ditinjau",
+  need_more_info: "Butuh Info Tambahan",
+  assigned: "Ditugaskan ke Tim Terkait",
+  in_progress: "Sedang Ditangani",
+  external_coordination: "Sedang Dipanggilkan",
+  waiting_reporter_confirmation: "Menunggu Konfirmasi Anda",
+  reporter_confirmed: "Sudah Anda Konfirmasi",
+  needs_follow_up: "Butuh Tindakan Lanjutan",
+  completed: "Selesai",
+  cancelled: "Tidak Dilanjutkan",
+  rejected: "Tidak Dilanjutkan",
+  duplicate: "Sudah Ada Laporan Serupa",
+};
+
+// Section A/C — jenis teknisi/vendor eksternal (tidak login ke AssetView).
+export const EXTERNAL_HANDLER_TYPE_LABEL: Record<ExternalHandlerType, string> = {
+  wifi_network: "Teknisi WiFi / Jaringan",
+  ac: "Teknisi AC",
+  electrical: "Teknisi Listrik",
+  plumbing: "Teknisi Plumbing",
+  building: "Tukang Bangunan",
+  other: "Lainnya",
+};
+
+// Section A — HANYA 3 status koordinasi. QHSE cuma penghubung, bukan yang
+// mengerjakan, jadi sistem tidak berpura-pura tahu detail progres vendor.
+export const EXTERNAL_COORDINATION_STATUS_LABEL: Record<ExternalCoordinationStatus, string> = {
+  calling_external_technician: "Sedang Dipanggilkan",
+  waiting_external_technician: "Menunggu Kedatangan Teknisi",
+  external_technician_arrived: "Teknisi Sudah Datang",
+};
+
+// Section B/J — kalimat yang staff baca (tanpa nama/kontak vendor mentah).
+export const EXTERNAL_COORDINATION_STAFF_MESSAGE: Record<ExternalCoordinationStatus, string> = {
+  calling_external_technician: "QHSE sedang memanggilkan teknisi eksternal.",
+  waiting_external_technician: "Menunggu kedatangan teknisi eksternal.",
+  external_technician_arrived: "Teknisi eksternal sudah datang. Mohon konfirmasi jika kendala sudah selesai.",
+};
+
+// Section J — label RINGKAS untuk badge status staff.
+export const EXTERNAL_COORDINATION_STAFF_LABEL: Record<ExternalCoordinationStatus, string> = {
+  calling_external_technician: "Sedang Dipanggilkan",
+  waiting_external_technician: "Menunggu Kedatangan",
+  external_technician_arrived: "Mohon Konfirmasi",
 };
 
 export const ISSUE_PRIORITY_LABEL: Record<IssuePriority, string> = {
@@ -226,6 +288,70 @@ export const ISSUE_PRIORITY_COLOR: Record<IssuePriority, string> = {
   medium: "bg-amber-50 text-amber-700 border-amber-200",
   high: "bg-orange-50 text-orange-700 border-orange-200",
   urgent: "bg-red-50 text-red-700 border-red-200",
+};
+
+export const ISSUE_SEVERITY_LABEL: Record<IssueSeverity, string> = {
+  low: "Rendah",
+  medium: "Sedang",
+  high: "Tinggi",
+  critical: "Kritis",
+};
+
+export const ISSUE_SEVERITY_COLOR: Record<IssueSeverity, string> = {
+  low: "bg-slate-100 text-slate-600 border-slate-200",
+  medium: "bg-amber-50 text-amber-700 border-amber-200",
+  high: "bg-orange-50 text-orange-700 border-orange-200",
+  critical: "bg-red-50 text-red-700 border-red-200",
+};
+
+// Section B/I perbaikan modal laporan kendala — "Tingkat Dampak dari
+// Pelapor", TERPISAH istilahnya dari ISSUE_SEVERITY_LABEL (yang masih
+// dipakai di tempat lain seperti tabel/badge ringkas) supaya di modal detail
+// jelas ini penilaian pelapor, bukan keputusan penanganan QHSE.
+export const FIELD_IMPACT_LABEL: Record<IssueSeverity, string> = {
+  low: "Ringan",
+  medium: "Sedang",
+  high: "Berat",
+  critical: "Darurat",
+};
+
+export const FIELD_IMPACT_COLOR: Record<IssueSeverity, string> = ISSUE_SEVERITY_COLOR;
+
+// "Prioritas Penanganan QHSE" — HANYA diisi QHSE setelah review, skala kata
+// beda dari FIELD_IMPACT_LABEL supaya tidak tertukar dengan penilaian
+// pelapor (lihat HandlingPriority di lib/types.ts).
+export const HANDLING_PRIORITY_LABEL: Record<HandlingPriority, string> = {
+  normal: "Normal",
+  soon: "Perlu Ditangani Segera",
+  urgent: "Mendesak",
+  emergency: "Darurat",
+};
+
+export const HANDLING_PRIORITY_COLOR: Record<HandlingPriority, string> = {
+  normal: "bg-slate-100 text-slate-600 border-slate-200",
+  soon: "bg-amber-50 text-amber-700 border-amber-200",
+  urgent: "bg-orange-50 text-orange-700 border-orange-200",
+  emergency: "bg-red-50 text-red-700 border-red-200",
+};
+
+export const ISSUE_REPORT_TYPE_LABEL: Record<IssueReportType, string> = {
+  asset_issue: "Asset / Barang Rusak",
+  facility_issue: "Fasilitas Gedung",
+  it_network: "IT / Jaringan",
+  safety_hazard: "K3 / Keselamatan",
+  environment_issue: "Lingkungan / Kebersihan",
+  emergency: "Kejadian Darurat",
+  other: "Lainnya",
+};
+
+export const ISSUE_REPORT_TYPE_COLOR: Record<IssueReportType, string> = {
+  asset_issue: "bg-amber-50 text-amber-700 border-amber-200",
+  facility_issue: "bg-blue-50 text-blue-700 border-blue-200",
+  it_network: "bg-indigo-50 text-indigo-700 border-indigo-200",
+  safety_hazard: "bg-red-50 text-red-700 border-red-200",
+  environment_issue: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  emergency: "bg-rose-50 text-rose-700 border-rose-200",
+  other: "bg-slate-100 text-slate-600 border-slate-200",
 };
 
 export const ISSUE_PRIORITY_RANK: Record<IssuePriority, number> = {
@@ -610,7 +736,7 @@ export const NOTIFICATION_TYPE_LABEL: Record<NotificationType, string> = {
   asset_created: "Asset Baru",
   asset_updated: "Asset Diperbarui",
   asset_status_changed: "Status Asset Berubah",
-  ticket_created: "Ticket Baru",
+  ticket_created: "Laporan Staff",
   ticket_assigned: "Ticket Ditugaskan",
   ticket_status_updated: "Status Ticket",
   ticket_need_info: "Butuh Info Tambahan",

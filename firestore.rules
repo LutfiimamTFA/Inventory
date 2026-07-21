@@ -102,10 +102,48 @@ service cloud.firestore {
         changed.hasOnly([
           "purchaseDate", "purchasePrice", "vendorName", "invoiceNumber",
           "fundingSource", "purchaseMethod", "estimatedUsefulLife", "financeNotes",
+          "financeStatus", "financeUpdatedAt", "financeUpdatedByUid", "financeUpdatedByName",
           "invoiceFileId", "invoiceDriveFileId", "invoiceFileUrl", "invoiceFileName",
           "invoiceMimeType", "invoiceSize", "invoiceUploadedAt",
           "updatedAt", "updatedByUid", "updatedByName"
         ]);
+    }
+
+    // PIC Lokasi — orang yang bertanggung jawab mendata/mengawasi aset di
+    // suatu lokasi (Gedung/Lantai/Ruangan/Area), BEDA dengan
+    // custodian/currentHolder yang menunjuk pemegang BARANG tertentu. PIC
+    // Lokasi ditugaskan lewat asset_locations (picUid) oleh Super
+    // Admin/Asset Admin — role ini sendiri cuma dikelola lewat User Access.
+    function isLocationPic() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/asset_users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/asset_users/$(request.auth.uid)).data.role == "location_pic"
+        && get(/databases/$(database)/documents/asset_users/$(request.auth.uid)).data.status == "active";
+    }
+
+    // Scope aset PIC Lokasi ditentukan dari areaPicUid, yang diisi OTOMATIS
+    // di client (resolveAreaPic di lib/locations.ts) lewat cascade Area >
+    // Ruangan > Lantai > Gedung saat aset dibuat/diedit — jadi cukup
+    // dicocokkan langsung ke sini tanpa perlu get() berlapis ke
+    // asset_locations. PIC Lokasi TIDAK boleh sentuh field finance (lihat
+    // isAssetFinanceUpdate) lewat rule ini.
+    function isLocationPicCreate() {
+      return isLocationPic() && request.resource.data.areaPicUid == request.auth.uid;
+    }
+
+    function isLocationPicUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      let financeFields = [
+        "purchaseDate", "purchasePrice", "vendorName", "invoiceNumber",
+        "fundingSource", "purchaseMethod", "estimatedUsefulLife", "financeNotes",
+        "financeStatus", "financeUpdatedAt", "financeUpdatedByUid", "financeUpdatedByName",
+        "invoiceFileId", "invoiceDriveFileId", "invoiceFileUrl", "invoiceFileName",
+        "invoiceMimeType", "invoiceSize", "invoiceUploadedAt"
+      ];
+      return isLocationPic()
+        && resource.data.areaPicUid == request.auth.uid
+        && request.resource.data.areaPicUid == request.auth.uid
+        && !changed.hasAny(financeFields);
     }
 
     function canViewAssetMaintenance() {
@@ -126,8 +164,46 @@ service cloud.firestore {
         && isAssetViewItTeam()
         && (
           data.get("assignedToUid", "") == request.auth.uid ||
-          data.get("technicianUid", "") == request.auth.uid
+          data.get("technicianUid", "") == request.auth.uid ||
+          data.get("assignedTechnicianUid", "") == request.auth.uid
         );
+    }
+
+    // Section K — validasi transisi status Maintenance Rutin per role, supaya
+    // QHSE tidak bisa lompat langsung ke status kerja Tim IT (atau sebaliknya)
+    // hanya karena canEditMaintenanceSchedule()/isTechnicianMaintenanceUpdate()
+    // mengizinkan field "status" diubah. Field lain (bukan status) tetap ikut
+    // aturan lama masing-masing.
+    function routineStatusTransition() {
+      return resource.data.get("status", "") + "->" + request.resource.data.get("status", "");
+    }
+
+    function isQhseRoutineStatusUpdate() {
+      return canEditMaintenanceSchedule()
+        && routineStatusTransition() in [
+          "created->cancelled",
+          "report_submitted->waiting_qhse_review",
+          "waiting_qhse_review->completed",
+          "waiting_qhse_review->revision_requested",
+          "waiting_qhse_review->needs_follow_up",
+          "waiting_qhse_review->cancelled",
+          "needs_follow_up->completed",
+          "needs_follow_up->cancelled",
+          "needs_follow_up->revision_requested",
+          "revision_requested->cancelled"
+        ];
+    }
+
+    function isItRoutineStatusUpdate() {
+      return isAssignedMaintenanceTechnician(resource.data)
+        && routineStatusTransition() in [
+          "created->accepted",
+          "accepted->scheduled_by_it",
+          "scheduled_by_it->in_progress",
+          "in_progress->report_submitted",
+          "revision_requested->in_progress",
+          "revision_requested->report_submitted"
+        ];
     }
 
     function isTechnicianMaintenanceUpdate() {
@@ -136,6 +212,11 @@ service cloud.firestore {
       return isAssignedMaintenanceTechnician(resource.data)
         && changed.hasOnly([
           "status",
+          "statusLabel",
+          "boardColumn",
+          "movedAt",
+          "movedByUid",
+          "movedByName",
 
           "acceptedAt",
           "acceptedByUid",
@@ -231,13 +312,27 @@ service cloud.firestore {
       allow write: if isManager();
     }
 
-    // asset_locations: Master Lokasi (Gedung/Lantai/Ruangan/Area). Super
-    // Admin & Asset Admin/QHSE boleh create/update; hanya Super Admin boleh
-    // hapus (UI sendiri tidak menyediakan hard delete, hanya nonaktifkan).
+    // asset_locations: Master Lokasi (Gedung/Lantai/Ruangan/Area). READ
+    // dibuka untuk SIAPA SAJA yang sudah login (isSignedIn()), termasuk
+    // staff HRP fallback yang belum punya dokumen asset_users sama sekali
+    // (lihat isActiveAssetUser()) — mereka tetap butuh baca daftar lokasi
+    // untuk memilih "lokasi masalah" di halaman Buat Laporan. Super Admin &
+    // Asset Admin/QHSE tetap satu-satunya yang boleh create/update; hanya
+    // Super Admin boleh hapus (UI sendiri tidak menyediakan hard delete,
+    // hanya nonaktifkan).
     match /asset_locations/{locationId} {
-      allow read: if isActiveAssetUser();
+      allow get, list: if isSignedIn();
       allow create, update: if isManager();
       allow delete: if isSuperAdmin();
+    }
+
+    // asset_location_logs: riwayat penugasan/perubahan/penghapusan PIC
+    // Lokasi (section I) — cuma ditulis oleh Super Admin/Asset Admin lewat
+    // Master Lokasi, sama seperti yang boleh mengubah asset_locations.
+    match /asset_location_logs/{logId} {
+      allow read: if isActiveAssetUser();
+      allow create: if isManager();
+      allow update, delete: if false;
     }
 
     // Custodian/currentHolder boleh menyerahkan-sementara & mengembalikan
@@ -262,9 +357,11 @@ service cloud.firestore {
 
     match /assets/{assetId} {
       allow read: if isActiveAssetUser();
-      allow create, update: if isManager() ||
+      allow create: if isManager() || isLocationPicCreate();
+      allow update: if isManager() ||
         isCustodianOrHolderUsageUpdate() ||
         isAssetFinanceUpdate() ||
+        isLocationPicUpdate() ||
         (isActiveAssetUser() &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(["assetStatus", "condition", "currentBorrowingId",
@@ -288,26 +385,123 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
-    // asset_issue_tickets: laporan kendala dari Scan QR (staff) sampai ditangani
+    function isManualWebIssueCreate() {
+      return isSignedIn()
+        && request.resource.data.source == "manual_web"
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.reportedByUid == request.auth.uid
+        && request.resource.data.reportType is string
+        && request.resource.data.title is string
+        && request.resource.data.description is string
+        && request.resource.data.locationId is string
+        && request.resource.data.locationText is string
+        && request.resource.data.status == "reported";
+    }
+
+    // Section D/G perbaikan alur laporan kendala staff — 3 transisi status
+    // yang boleh staff pelapor lakukan SENDIRI (bukan lewat dropdown bebas,
+    // tapi lewat tombol aksi khusus di modal). Field yang boleh diubah
+    // dibatasi ketat per transisi supaya staff tidak bisa menyelipkan field
+    // lain (mis. langsung set completed atau ganti assignedToUid).
+    // Kepemilikan dicek lewat beberapa kemungkinan nama field (aplikasi ini
+    // konsisten pakai reportedByUid, field lain + email sebagai jaring
+    // pengaman kalau ada data/alur lain yang beda nama field).
+    function isIssueTicketReporter(data) {
+      return isSignedIn() && (
+        data.get("reportedByUid", "") == request.auth.uid ||
+        data.get("createdByUid", "") == request.auth.uid ||
+        data.get("reporterUid", "") == request.auth.uid ||
+        data.get("createdByEmail", "") == request.auth.token.email ||
+        data.get("reporterEmail", "") == request.auth.token.email
+      );
+    }
+
+    function isReporterAllowedIssueUpdate() {
+      let isOwner = isIssueTicketReporter(resource.data);
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      let commonKeys = ["status", "statusLabel", "staffStatusLabel",
+        "lastActivityAt", "lastActivityByUid", "lastActivityByName", "lastActivityMessage",
+        "updatedAt", "updatedByUid", "updatedByName"];
+
+      let completingInfo = resource.data.status == "need_more_info" &&
+        request.resource.data.status == "under_review" &&
+        changed.hasOnly(commonKeys.concat(["description", "photoUrls", "attachmentUrls", "attachmentFiles"]));
+
+      // Section C — pelapor konfirmasi kendala selesai.
+      let confirmingDone = resource.data.status == "waiting_reporter_confirmation" &&
+        request.resource.data.status == "reporter_confirmed" &&
+        changed.hasOnly(commonKeys.concat(["reporterConfirmedAt", "reporterConfirmedByUid",
+          "reporterConfirmedByName", "reporterConfirmationNote"]));
+
+      // Section D — pelapor menyatakan masih bermasalah (field TERPISAH
+      // dari reopenNote/reopenedAt milik aksi QHSE "Buka Kembali").
+      let stillProblem = resource.data.status == "waiting_reporter_confirmation" &&
+        request.resource.data.status == "needs_follow_up" &&
+        changed.hasOnly(commonKeys.concat(["reporterRejectedResolutionAt", "reporterRejectedResolutionByUid",
+          "reporterRejectedResolutionByName", "reporterRejectedResolutionNote", "reporterRejectedResolutionPhotoUrls"]));
+
+      return isOwner && (completingInfo || confirmingDone || stillProblem);
+    }
+
+    // asset_issue_tickets: laporan kendala dari Scan QR/manual web (staff) sampai ditangani
     // Tim IT. Staff hanya boleh membuat tiket miliknya sendiri
     // dan membaca semua tiket (dibatasi query "reportedByUid == uid" di client
     // untuk /my-reports); status/diagnosa hanya boleh diubah oleh manager.
     match /asset_issue_tickets/{ticketId} {
-      allow read: if isActiveAssetUser();
+      // READ dibuka untuk siapa saja yang login (isSignedIn()), TERMASUK
+      // staff HRP fallback yang belum punya dokumen asset_users sama sekali
+      // (lihat isActiveAssetUser()) — mereka tetap harus bisa buka /my-reports
+      // untuk lihat laporan yang mereka buat sendiri. QHSE/Admin/IT tetap
+      // bisa baca semua laporan.
+      allow get, list: if isSignedIn()
+        && (
+          canViewAssetMaintenance()
+          || resource.data.createdByUid == request.auth.uid
+          || resource.data.reportedByUid == request.auth.uid
+        );
       // QHSE/Super Admin boleh membuat ticket "tugas lanjutan" dari temuan
       // maintenance dengan reportedByUid = Tim IT yang menemukan (bukan
       // dirinya sendiri) — dibedakan lewat source == "maintenance_finding".
-      allow create: if isActiveAssetUser() &&
-        (request.resource.data.reportedByUid == request.auth.uid ||
-          (isManager() && request.resource.data.source == "maintenance_finding"));
-      allow update: if isManager() || isAssetViewItTeam();
-      allow delete: if false;
+      // isManualWebIssueCreate() sengaja HANYA butuh isSignedIn() (bukan
+      // isActiveAssetUser()) supaya staff HRP fallback tetap bisa submit
+      // Buat Laporan walau belum punya dokumen asset_users.
+      allow create: if isManualWebIssueCreate() ||
+        (isActiveAssetUser() &&
+          (request.resource.data.reportedByUid == request.auth.uid ||
+            (isManager() && request.resource.data.source == "maintenance_finding")));
+      // Section D/G — staff pelapor (termasuk HRP fallback) HANYA boleh
+      // mengubah statusnya sendiri lewat 3 transisi yang tombolnya ada di
+      // IssueTicketDetailModal (lib/issueTicketActions.ts): melengkapi info,
+      // konfirmasi selesai, atau menyatakan masih bermasalah. TIDAK BOLEH
+      // langsung set status "completed" atau field lain milik QHSE/tim.
+      allow update: if isManager() || isAssetViewItTeam() || isReporterAllowedIssueUpdate();
+      allow delete: if isSuperAdmin();
     }
 
     match /asset_issue_logs/{logId} {
       allow read: if isActiveAssetUser();
       allow create: if isActiveAssetUser();
       allow update, delete: if false;
+    }
+
+    // Log laporan kendala staff — ditulis SAAT laporan dibuat/diubah, jadi
+    // create HARUS bisa dipakai staff HRP fallback juga (bukan cuma
+    // canViewAssetMaintenance()), selama createdByUid cocok dengan dirinya.
+    match /asset_issue_ticket_logs/{logId} {
+      allow get, list: if isSignedIn()
+        && (
+          canViewAssetMaintenance()
+          || resource.data.createdByUid == request.auth.uid
+          || resource.data.reporterUid == request.auth.uid
+        );
+      allow create: if isSignedIn() && request.resource.data.createdByUid == request.auth.uid;
+      allow update, delete: if isSuperAdmin();
+    }
+
+    match /asset_activity_logs/{logId} {
+      allow get, list: if canViewAssetMaintenance();
+      allow create: if canViewAssetMaintenance();
+      allow update, delete: if isSuperAdmin();
     }
 
     // asset_maintenance_work_orders: jadwal dibuat oleh Asset Admin/QHSE,
@@ -317,8 +511,18 @@ service cloud.firestore {
 
       allow create: if canEditMaintenanceSchedule();
 
-      allow update: if canEditMaintenanceSchedule()
-        || isTechnicianMaintenanceUpdate();
+      // Section K — status hanya boleh berubah lewat transisi yang valid
+      // untuk role tersebut (isQhseRoutineStatusUpdate/isItRoutineStatusUpdate);
+      // edit field lain (bukan status) tetap mengikuti aturan lama supaya alur
+      // edit jadwal QHSE dan update lapangan Tim IT tidak ikut terkunci.
+      allow update: if isAssetViewSuperAdmin()
+        || isAssetBootstrapSuperAdminEmail()
+        || isQhseRoutineStatusUpdate()
+        || (isTechnicianMaintenanceUpdate() && (
+          request.resource.data.get("status", "") == resource.data.get("status", "")
+          || isItRoutineStatusUpdate()
+        ))
+        || (canEditMaintenanceSchedule() && request.resource.data.get("status", "") == resource.data.get("status", ""));
 
       allow delete: if canEditMaintenanceSchedule();
 
@@ -347,18 +551,35 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
+    // asset_maintenance_activity_logs: log lintas-sumber (work order ATAU
+    // ticket) untuk perpindahan status di Kanban Board Maintenance &
+    // Kendala — dibaca oleh Timeline Global. Sengaja pakai izin yang sama
+    // dengan canViewAssetMaintenance(), BUKAN dibuka untuk staff umum.
+    match /asset_maintenance_activity_logs/{logId} {
+      allow get, list: if canViewAssetMaintenance();
+      allow create: if canViewAssetMaintenance();
+      allow update, delete: if isSuperAdmin();
+    }
+
     // asset_notifications: siapa saja yang aktif boleh membuat notifikasi
     // (staff lapor kendala men-trigger notifikasi ke QHSE, dst). Recipient
     // hanya boleh membaca/menandai-dibaca notifikasi miliknya sendiri.
+    // READ/CREATE sengaja pakai isSignedIn() (bukan isActiveAssetUser())
+    // supaya staff HRP fallback yang belum punya dokumen asset_users tetap
+    // bisa memicu notifikasi ke QHSE saat submit Buat Laporan, dan tetap
+    // bisa baca notifikasi miliknya sendiri.
     match /asset_notifications/{notificationId} {
-      allow get, list: if isActiveAssetUser() && (
+      allow get, list: if isSignedIn() && (
+        isSuperAdmin() ||
         resource.data.recipientUid == request.auth.uid ||
         (canViewAssetMaintenance() && resource.data.keys().hasAny(["dedupeKey"]))
       );
-      allow create: if isActiveAssetUser();
-      allow update: if isActiveAssetUser() &&
-        resource.data.recipientUid == request.auth.uid &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["isRead", "readAt"]);
+      allow create: if isSignedIn();
+      allow update: if isSuperAdmin() ||
+        (isSignedIn() &&
+          resource.data.recipientUid == request.auth.uid &&
+          request.resource.data.recipientUid == resource.data.recipientUid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["isRead", "status", "readAt", "updatedAt"]));
       allow delete: if isSuperAdmin();
     }
 

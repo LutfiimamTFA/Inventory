@@ -13,6 +13,16 @@
   --font-mono: var(--font-geist-mono);
 }
 
+html,
+body {
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+* {
+  box-sizing: border-box;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
@@ -77,4 +87,84 @@ button:disabled {
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+.kanban-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 #f1f5f9;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
+}
+
+.kanban-scroll::-webkit-scrollbar {
+  height: 10px;
+}
+
+.kanban-scroll::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 999px;
+}
+
+.kanban-scroll::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 999px;
+}
+
+.kanban-scroll::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+@media (max-width: 767px) {
+  html,
+  body {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  .scan-page,
+  .scan-page * {
+    box-sizing: border-box;
+  }
+
+  .scan-page {
+    width: 100%;
+    max-width: 100vw;
+    overflow-x: hidden;
+  }
+
+  .scan-page section,
+  .scan-page div,
+  .scan-page form {
+    max-width: 100%;
+  }
+
+  .scan-page table {
+    width: 100%;
+  }
+
+  .scan-page input,
+  .scan-page button,
+  .scan-page select,
+  .scan-page textarea {
+    max-width: 100%;
+  }
+
+  .reports-page,
+  .reports-page * {
+    box-sizing: border-box;
+  }
+
+  .reports-page {
+    width: 100%;
+    max-width: 100vw;
+    overflow-x: hidden;
+  }
+
+  .reports-page section,
+  .reports-page div,
+  .reports-page svg {
+    max-width: 100%;
+  }
 }
