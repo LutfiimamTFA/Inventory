@@ -12,7 +12,8 @@ import { getAdminAuth, getAdminFirestore } from "@/lib/firebase-admin";
 export const PASSKEY_CREDENTIALS_COLLECTION = "passkey_credentials";
 export const PASSKEY_CHALLENGES_COLLECTION = "passkey_challenges";
 export const PASSKEY_CHALLENGE_TTL_MS = 5 * 60 * 1000;
-export const PASSKEY_RP_NAME = "QHSE Care";
+export const PASSKEY_RP_NAME =
+  process.env.PASSKEY_RP_NAME || process.env.NEXT_PUBLIC_PASSKEY_RP_NAME || "QHSE Care";
 
 export interface PasskeyChallengeData {
   challenge: string;
@@ -104,7 +105,10 @@ export function resolveWebAuthnConfig(req: NextRequest) {
   const proto = forwardedProto || req.nextUrl.protocol.replace(":", "") || "https";
   const fallbackOrigin = `${proto}://${host}`;
   const origin = normalizeOrigin(configuredOrigin || fallbackOrigin);
-  const rpID = process.env.PASSKEY_RP_ID || new URL(origin).hostname;
+  const rpID =
+    process.env.PASSKEY_RP_ID ||
+    process.env.NEXT_PUBLIC_PASSKEY_RP_ID ||
+    new URL(origin).hostname;
 
   return { origin, rpID };
 }
