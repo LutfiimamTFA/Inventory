@@ -7,7 +7,7 @@ import type {
   RegistrationResponseJSON,
   WebAuthnCredential,
 } from "@simplewebauthn/server";
-import { getAdminAuth, getAdminFirestore } from "@/lib/firebase-admin";
+import { getAdminAuth, getAdminFirestore, getFirebaseAdminStatus } from "@/lib/firebase-admin";
 
 export const PASSKEY_CREDENTIALS_COLLECTION = "passkey_credentials";
 export const PASSKEY_CHALLENGES_COLLECTION = "passkey_challenges";
@@ -53,43 +53,51 @@ export function passkeyJsonError(message: string, status = 400) {
   return NextResponse.json({ success: false, message }, { status });
 }
 
-export function getMissingPasskeyServerEnv() {
-  const required = [
-    "FIREBASE_PROJECT_ID",
-    "FIREBASE_CLIENT_EMAIL",
-    "FIREBASE_PRIVATE_KEY",
-  ];
-
-  return required.filter((key) => !process.env[key]);
-}
-
-export function getPasskeyAdminUnavailableMessage() {
-  const missing = getMissingPasskeyServerEnv();
-  if (missing.length > 0) {
-    return `Firebase Admin belum lengkap di Vercel. Missing env: ${missing.join(", ")}`;
-  }
-
-  return "Firebase Admin gagal initialize. Periksa format FIREBASE_PRIVATE_KEY di Vercel.";
-}
-
-export function passkeyAdminUnavailableError() {
-  return passkeyJsonError(getPasskeyAdminUnavailableMessage(), 500);
-}
-
 export function normalizeEmail(email?: string | null) {
   return (email || "").trim().toLowerCase();
 }
 
-export function getAdminServices() {
-  if (getMissingPasskeyServerEnv().length > 0) return null;
+export interface PasskeyAdminServices {
+  firestore: Firestore | null;
+  auth: ReturnType<typeof getAdminAuth>;
+  error: string | null;
+}
+
+// Section A/B perbaikan produksi — SEBELUMNYA getAdminServices() cuma
+// return null kalau Admin belum siap, jadi route tidak tahu APA yang
+// kurang (env belum di-set vs private key salah format vs initialize
+// error lain) dan hanya bisa balas pesan generik. Sekarang selalu return
+// object dengan `error` yang menjelaskan alasan spesifik dari
+// getFirebaseAdminStatus(), supaya response ke frontend punya pesan yang
+// bisa langsung dipakai untuk debugging (bukan cuma "Request passkey
+// gagal.").
+export function getAdminServices(): PasskeyAdminServices {
+  const status = getFirebaseAdminStatus();
+
+  if (!status.ok) {
+    console.error("[Passkey Admin Services] Firebase Admin belum siap:", status);
+    return {
+      firestore: null,
+      auth: null,
+      error:
+        status.missing.length > 0
+          ? `Firebase Admin env belum lengkap di Vercel: ${status.missing.join(", ")}`
+          : `Firebase Admin gagal initialize: ${status.error}`,
+    };
+  }
 
   const firestore = getAdminFirestore();
-  if (!firestore) return null;
-
   const auth = getAdminAuth();
-  if (!auth) return null;
 
-  return { firestore, auth };
+  if (!firestore || !auth) {
+    return {
+      firestore: null,
+      auth: null,
+      error: "Firebase Admin service tidak tersedia.",
+    };
+  }
+
+  return { firestore, auth, error: null };
 }
 
 export async function requireFirebaseUser(req: NextRequest): Promise<
@@ -97,9 +105,13 @@ export async function requireFirebaseUser(req: NextRequest): Promise<
   | { decoded?: never; response: NextResponse }
 > {
   const services = getAdminServices();
-  if (!services) {
+
+  if (!services.auth) {
     return {
-      response: passkeyAdminUnavailableError(),
+      response: passkeyJsonError(
+        services.error || "Firebase Admin belum dikonfigurasi untuk passkey.",
+        500
+      ),
     };
   }
 

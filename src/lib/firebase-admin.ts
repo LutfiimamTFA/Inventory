@@ -6,22 +6,53 @@ import { getFirestore } from "firebase-admin/firestore";
 // Firebase Admin SDK — HANYA boleh diimpor dari server (API routes / route.ts).
 // Jangan pernah import file ini dari komponen "use client".
 let adminApp: App | undefined;
+let adminInitError: string | null = null;
+
+function normalizePrivateKey(raw?: string) {
+  if (!raw) return "";
+
+  return raw
+    .replace(/^"|"$/g, "")
+    .replace(/\\n/g, "\n")
+    .trim();
+}
+
+export function getFirebaseAdminStatus() {
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+  const missing: string[] = [];
+
+  if (!projectId) missing.push("FIREBASE_PROJECT_ID");
+  if (!clientEmail) missing.push("FIREBASE_CLIENT_EMAIL");
+  if (!privateKey) missing.push("FIREBASE_PRIVATE_KEY");
+
+  return {
+    ok: missing.length === 0 && !adminInitError,
+    missing,
+    error: adminInitError,
+    hasProjectId: !!projectId,
+    hasClientEmail: !!clientEmail,
+    hasPrivateKey: !!privateKey,
+  };
+}
 
 function getAdminApp(): App | undefined {
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
+  const privateKey = normalizePrivateKey(process.env.FIREBASE_PRIVATE_KEY);
 
-  if (!projectId || !clientEmail || !rawPrivateKey) {
-    console.error("[Firebase Admin] Env belum lengkap:", {
-      hasProjectId: !!projectId,
-      hasClientEmail: !!clientEmail,
-      hasPrivateKey: !!rawPrivateKey,
-    });
+  const missing: string[] = [];
+  if (!projectId) missing.push("FIREBASE_PROJECT_ID");
+  if (!clientEmail) missing.push("FIREBASE_CLIENT_EMAIL");
+  if (!privateKey) missing.push("FIREBASE_PRIVATE_KEY");
+
+  if (missing.length > 0) {
+    adminInitError = `Firebase Admin env belum lengkap: ${missing.join(", ")}`;
+    console.error("[Firebase Admin]", adminInitError);
     return undefined;
   }
-
-  const privateKey = rawPrivateKey.replace(/\\n/g, "\n");
 
   try {
     if (getApps().length > 0) {
@@ -30,10 +61,21 @@ function getAdminApp(): App | undefined {
     }
 
     adminApp = initializeApp({
-      credential: cert({ projectId, clientEmail, privateKey }),
+      credential: cert({
+        projectId,
+        clientEmail,
+        privateKey,
+      }),
     });
+
+    adminInitError = null;
     return adminApp;
   } catch (error) {
+    adminInitError =
+      error instanceof Error
+        ? error.message
+        : "Firebase Admin gagal initialize.";
+
     console.error("[Firebase Admin] gagal initialize:", error);
     return undefined;
   }

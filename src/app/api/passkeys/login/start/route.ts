@@ -4,7 +4,6 @@ import {
   PASSKEY_CREDENTIALS_COLLECTION,
   getAdminServices,
   normalizeEmail,
-  passkeyAdminUnavailableError,
   passkeyJsonError,
   resolveWebAuthnConfig,
   storeChallenge,
@@ -19,8 +18,11 @@ interface LoginStartBody {
 
 export async function POST(req: NextRequest) {
   const services = getAdminServices();
-  if (!services) {
-    return passkeyAdminUnavailableError();
+  if (!services.firestore || !services.auth) {
+    return passkeyJsonError(
+      services.error || "Firebase Admin belum dikonfigurasi untuk passkey.",
+      500
+    );
   }
 
   let body: LoginStartBody;
