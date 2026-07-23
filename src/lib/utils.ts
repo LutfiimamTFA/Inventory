@@ -1,5 +1,7 @@
 import {
+  Asset,
   AssetCondition,
+  AssetIssueTicket,
   AssetSelectionMode,
   AssetStatus,
   AssetUsageStatus,
@@ -45,7 +47,7 @@ export function parseDateKey(dateKey: string): Date | null {
   return new Date(Number(y), Number(m) - 1, Number(d));
 }
 
-function toDisplayDate(value: unknown): Date | null {
+export function toDisplayDate(value: unknown): Date | null {
   if (!value) return null;
   if (typeof value === "object" && value !== null && "toDate" in value) {
     return (value as { toDate: () => Date }).toDate();
@@ -149,10 +151,67 @@ export const CONDITION_LABEL: Record<AssetCondition, string> = {
   heavy_damage: "Rusak Berat",
 };
 
+export const CONDITION_COLOR: Record<AssetCondition, string> = {
+  new: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  good: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  fair: "bg-amber-50 text-amber-700 border-amber-200",
+  minor_damage: "bg-orange-50 text-orange-700 border-orange-200",
+  heavy_damage: "bg-red-50 text-red-700 border-red-200",
+};
+
+// Section A/B — "Kondisi Aset" TIDAK BOLEH menampilkan status pemakaian
+// (Tersedia/Dipinjam) sebagai status utama menu Assets — itu konsep beda
+// (lihat Scan QR/Status Pemakaian). assetStatus SEBENARNYA mencampur dua
+// hal: sebagian nilainya murni pemakaian (available/borrowed/in_use),
+// sebagian lagi murni kondisi/siklus-hidup barang (maintenance/broken/
+// lost/inactive/disposed/incomplete). Daripada migrasi data (spec eksplisit
+// minta "data backend lama tetap aman"), functions di bawah cuma
+// MEMILAH TAMPILAN: kalau assetStatus salah satu nilai kondisi/siklus,
+// itu yang ditampilkan sebagai Kondisi Aset (assetStatus lebih parah/
+// spesifik daripada condition biasa); selain itu baru pakai field
+// `condition` (Baik/Cukup/Rusak Ringan/Rusak Berat).
+const ASSET_STATUS_AS_CONDITION: AssetStatus[] = [
+  "maintenance",
+  "broken",
+  "incomplete",
+  "lost",
+  "inactive",
+  "disposed",
+];
+const ASSET_STATUS_AS_USAGE: AssetStatus[] = ["available", "borrowed", "in_use"];
+
+export function getAssetConditionLabel(asset: Pick<Asset, "assetStatus" | "condition">): string {
+  if (ASSET_STATUS_AS_CONDITION.includes(asset.assetStatus)) {
+    return ASSET_STATUS_LABEL[asset.assetStatus];
+  }
+  return CONDITION_LABEL[asset.condition] || "Baik";
+}
+
+export function getAssetConditionColor(asset: Pick<Asset, "assetStatus" | "condition">): string {
+  if (ASSET_STATUS_AS_CONDITION.includes(asset.assetStatus)) {
+    return ASSET_STATUS_COLOR[asset.assetStatus];
+  }
+  return CONDITION_COLOR[asset.condition] || CONDITION_COLOR.good;
+}
+
+// Section C — badge "Pemakaian" kecil/sekunder, HANYA muncul kalau
+// assetStatus memang murni status pemakaian (bukan kondisi barang) — kalau
+// assetStatus sudah dipakai sebagai Kondisi Aset di atas (mis. "maintenance"),
+// tidak perlu diulang lagi di sini supaya tidak duplikat/rancu.
+export function getAssetUsageBadge(
+  asset: Pick<Asset, "assetStatus" | "condition">
+): { label: string; colorClass: string } | null {
+  if (!ASSET_STATUS_AS_USAGE.includes(asset.assetStatus)) return null;
+  return {
+    label: ASSET_STATUS_LABEL[asset.assetStatus],
+    colorClass: ASSET_STATUS_COLOR[asset.assetStatus],
+  };
+}
+
 export const BORROWING_STATUS_LABEL: Record<BorrowingStatus, string> = {
-  borrowed: "Dipinjam",
-  returned: "Dikembalikan",
-  overdue: "Terlambat",
+  borrowed: "Sedang Dipinjam",
+  returned: "Sudah Dikembalikan",
+  overdue: "Terlambat Dikembalikan",
 };
 
 export const BORROWING_STATUS_COLOR: Record<BorrowingStatus, string> = {
@@ -171,6 +230,27 @@ export function formatDateTime(value: unknown) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(d);
+}
+
+// Section A — format tanggal PANJANG dengan nama bulan lengkap dan jam
+// pakai titik (bukan titik dua), dipakai halaman Peminjaman Saya — mis.
+// "23 Juli 2026, 09.20".
+export function formatDateTimeLong(value: unknown) {
+  const d = toDisplayDate(value);
+  if (!d) return "-";
+  const datePart = new Intl.DateTimeFormat("id-ID", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  }).format(d);
+  const timePart = new Intl.DateTimeFormat("id-ID", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+    .format(d)
+    .replace(":", ".");
+  return `${datePart}, ${timePart}`;
 }
 
 // Format lengkap dengan detik, dipakai di timeline Work Order — mis.
@@ -275,6 +355,37 @@ export const EXTERNAL_COORDINATION_STAFF_LABEL: Record<ExternalCoordinationStatu
   waiting_external_technician: "Menunggu Kedatangan",
   external_technician_arrived: "Mohon Konfirmasi",
 };
+
+// Deteksi tiket yang ditangani teknisi/vendor eksternal — dipakai untuk
+// MENGECUALIKAN tiket ini dari Antrian Tim IT / Tugas Kendala Saya Tim IT
+// (bukan tugas mereka), TANPA menyembunyikannya dari QHSE/Admin/pelapor.
+// Dicek dari beberapa field sekaligus supaya tetap kena walau data lama
+// hanya mengisi sebagian field (mis. assignedTeam tanpa externalHandling).
+export function isExternalHandlingTicket(
+  ticket: Partial<
+    Pick<
+      AssetIssueTicket,
+      | "externalHandling"
+      | "assignedTeam"
+      | "assignedTeamLabel"
+      | "assignedToName"
+      | "externalCoordinationStatus"
+      | "externalHandlerType"
+      | "vendorName"
+    >
+  >
+): boolean {
+  return !!(
+    ticket.externalHandling === true ||
+    ticket.assignedTeam === "vendor" ||
+    ticket.assignedTeam === "external_vendor" ||
+    String(ticket.assignedTeamLabel || "").toLowerCase().includes("eksternal") ||
+    String(ticket.assignedToName || "").toLowerCase().includes("teknisi eksternal") ||
+    ticket.externalCoordinationStatus ||
+    ticket.externalHandlerType ||
+    ticket.vendorName
+  );
+}
 
 export const ISSUE_PRIORITY_LABEL: Record<IssuePriority, string> = {
   low: "Rendah",
@@ -876,4 +987,270 @@ export function formatRelativeTime(value: unknown) {
   const diffDay = Math.floor(diffHour / 24);
   if (diffDay < 7) return `${diffDay} hari lalu`;
   return formatDate(value);
+}
+
+// Section A — normalisasi status pinjam/kembalikan. Aset di app ini punya
+// DUA skema status peminjaman yang sempat berjalan paralel dan tidak
+// sinkron satu sama lain:
+// 1. Skema lama ("shared_pool"): assetStatus/currentBorrowingId/
+//    currentBorrowerUid/currentBorrowerName (lib/borrow-actions.ts).
+// 2. Skema custodian/holder yang dipakai di tempat lain (assets list,
+//    /asset-action, firestore.rules): currentUsageStatus/currentHolderUid.
+// Helper ini SENGAJA membaca kedua skema sekaligus (bukan cuma salah satu)
+// supaya asset lama yang datanya campuran tetap terbaca benar, sambil
+// borrowAsset/returnAsset yang baru menulis KEDUANYA sekaligus supaya ke
+// depan tidak ada lagi dua sumber kebenaran yang bisa berbeda.
+type BorrowStatusAsset = Pick<
+  Asset,
+  | "currentUsageStatus"
+  | "assetStatus"
+  | "currentHolderUid"
+  | "currentHolderName"
+  | "currentBorrowerUid"
+  | "currentBorrowerName"
+>;
+
+export type NormalizedBorrowStatus = "available" | "borrowed" | "maintenance";
+
+export function normalizeAssetUsageStatus(asset: BorrowStatusAsset): NormalizedBorrowStatus {
+  const rawStatus = String(asset.currentUsageStatus || asset.assetStatus || "").toLowerCase();
+
+  const borrowedKeywords = ["borrowed", "dipinjam", "sedang_dipinjam", "in_use", "used", "temporary_used_by_other"];
+  const maintenanceKeywords = ["maintenance", "perbaikan", "rusak", "broken"];
+  const availableKeywords = ["available", "tersedia", "ready", "aktif"];
+
+  if (borrowedKeywords.includes(rawStatus)) return "borrowed";
+  if (maintenanceKeywords.includes(rawStatus)) return "maintenance";
+  if (availableKeywords.includes(rawStatus)) return "available";
+
+  // Status mentah tidak dikenali (data lama/kosong) — tapi ada penanda
+  // pemegang aset, jadi tetap dianggap dipinjam daripada salah tampil
+  // "tersedia" padahal sedang dipegang orang.
+  if (asset.currentHolderUid || asset.currentHolderName || asset.currentBorrowerUid || asset.currentBorrowerName) {
+    return "borrowed";
+  }
+
+  return "available";
+}
+
+export function isAssetBorrowed(asset: BorrowStatusAsset): boolean {
+  return normalizeAssetUsageStatus(asset) === "borrowed";
+}
+
+export function isBorrowedByMe(
+  asset: Pick<BorrowStatusAsset, "currentHolderUid" | "currentBorrowerUid">,
+  user?: { uid?: string | null } | null
+): boolean {
+  if (!asset || !user?.uid) return false;
+  return asset.currentHolderUid === user.uid || asset.currentBorrowerUid === user.uid;
+}
+
+export function isBorrowedByOther(
+  asset: BorrowStatusAsset,
+  user?: { uid?: string | null } | null
+): boolean {
+  if (!isAssetBorrowed(asset)) return false;
+  if (!user?.uid) return true;
+  return !isBorrowedByMe(asset, user);
+}
+
+// Estimasi kembali yang cuma tanggal (date picker `type="date"`, tanpa jam)
+// TIDAK BOLEH dianggap jatuh tempo jam 00:00 dini hari — itu bikin aset
+// dianggap "Terlambat Dikembalikan" padahal tanggalnya sendiri belum lewat.
+// Value date-only dianggap berlaku sampai AKHIR hari itu (23:59:59.999).
+export function isDateOnlyValue(value: unknown): boolean {
+  return typeof value === "string" && DATE_KEY_PATTERN.test(value.trim());
+}
+
+// Timestamp/Date yang kebetulan jatuh persis jam 00:00:00 (mis. data lama
+// yang disimpan dari date-only string lewat `new Date(string)`) diperlakukan
+// sama seperti date-only murni — kalau user memang sengaja pilih jam 00:00,
+// ini satu-satunya kasus yang "salah dianggap" akhir hari, tapi risikonya
+// jauh lebih kecil daripada semua estimasi tanpa jam otomatis dianggap telat.
+function normalizeExpectedReturnDateInfo(rawValue: unknown): { date: Date; isDateOnly: boolean } | null {
+  if (!rawValue) return null;
+  if (isDateOnlyValue(rawValue)) {
+    const parsed = parseDateKey((rawValue as string).trim());
+    if (!parsed) return null;
+    parsed.setHours(23, 59, 59, 999);
+    return { date: parsed, isDateOnly: true };
+  }
+  const date = toDisplayDate(rawValue);
+  if (!date) return null;
+  const isMidnight = date.getHours() === 0 && date.getMinutes() === 0 && date.getSeconds() === 0;
+  if (isMidnight) {
+    const endOfDay = new Date(date);
+    endOfDay.setHours(23, 59, 59, 999);
+    return { date: endOfDay, isDateOnly: true };
+  }
+  return { date, isDateOnly: false };
+}
+
+export function normalizeExpectedReturnDate(rawValue: unknown): Date | null {
+  return normalizeExpectedReturnDateInfo(rawValue)?.date || null;
+}
+
+// Section B/G — status bilang "Dipinjam" tapi tidak ada satu pun penanda
+// siapa pemegangnya (dari alur mana pun) — data tidak sinkron, jangan
+// biarkan user coba pinjam/kembalikan di atas data yang rusak ini.
+// Section F — telat HANYA soal tampilan (badge "Terlambat Dikembalikan"),
+// TIDAK PERNAH otomatis mengubah status field asset/borrowing — itu tetap
+// "borrowed" sampai user benar-benar klik Kembalikan Aset.
+export function isBorrowingLate(entry: {
+  estimatedReturnAt?: string | null;
+  currentUsageExpectedReturnAt?: string | null;
+  dueAt?: string | null;
+  expectedReturnAt?: string | null;
+}): boolean {
+  const rawExpectedReturn =
+    entry.expectedReturnAt || entry.dueAt || entry.currentUsageExpectedReturnAt || entry.estimatedReturnAt;
+  const expectedDate = normalizeExpectedReturnDate(rawExpectedReturn);
+  if (!expectedDate) return false;
+  return Date.now() > expectedDate.getTime();
+}
+
+// Section D — tampilan manusiawi: date-only tampil "23 Juli 2026, akhir
+// hari" (BUKAN "23 Juli 2026, 00.00"); kalau memang ada jam spesifik, tetap
+// tampilkan jamnya seperti biasa.
+export function formatExpectedReturn(rawValue: unknown): string {
+  const info = normalizeExpectedReturnDateInfo(rawValue);
+  if (!info) return "-";
+  const datePart = new Intl.DateTimeFormat("id-ID", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  }).format(info.date);
+  if (info.isDateOnly) return `${datePart}, akhir hari`;
+  const timePart = new Intl.DateTimeFormat("id-ID", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+    .format(info.date)
+    .replace(":", ".");
+  return `${datePart}, ${timePart}`;
+}
+
+// Section H — jangan pernah tampilkan email sebagai "nama" kalau field
+// name-nya kebetulan justru berisi email (data lama). Pure function, TIDAK
+// bergantung ke employee directory — dipakai sebagai lapis pertama
+// sebelum fallback ke directory (lihat lib/employeeDirectory.ts).
+export function looksLikeEmail(value: string | null | undefined): boolean {
+  return !!value && value.includes("@");
+}
+
+export function getPersonDisplayName(
+  name: string | null | undefined,
+  email: string | null | undefined,
+  resolvedFromDirectory?: string | null
+): string {
+  if (name && !looksLikeEmail(name)) return name;
+  if (resolvedFromDirectory && !looksLikeEmail(resolvedFromDirectory)) return resolvedFromDirectory;
+  if (email) return email;
+  if (name) return name;
+  return "-";
+}
+
+export function hasBrokenBorrowState(asset: BorrowStatusAsset): boolean {
+  return (
+    isAssetBorrowed(asset) &&
+    !asset.currentHolderUid &&
+    !asset.currentHolderName &&
+    !asset.currentBorrowerUid &&
+    !asset.currentBorrowerName
+  );
+}
+
+// ── Badge notifikasi tab Maintenance & Kendala ────────────────────────────
+// Badge angka tab TIDAK BOLEH menghitung total data (staffReports.length,
+// dst) — itu bikin badge menyala terus walau semua sudah dibaca/tidak butuh
+// aksi. Dua helper di bawah menentukan APAKAH satu tiket/work order layak
+// dihitung ke badge: belum dibaca user login, atau memang butuh aksi dari
+// role user login saat ini.
+interface BadgeReadableItem {
+  unreadByUids?: string[] | null;
+  readByUids?: string[] | null;
+  createdByUid?: string | null;
+  status?: string | null;
+}
+
+export function isUnreadForCurrentUser(
+  item: BadgeReadableItem,
+  firebaseUser?: { uid?: string | null } | null
+): boolean {
+  if (!firebaseUser?.uid) return false;
+  const unreadByUids = item.unreadByUids || [];
+  const readByUids = item.readByUids || [];
+
+  if (unreadByUids.includes(firebaseUser.uid)) return true;
+
+  // Fallback data lama (belum pernah diisi unreadByUids sama sekali) —
+  // anggap belum dibaca kalau statusnya masih "reported" (laporan baru) dan
+  // bukan dibuat oleh user itu sendiri.
+  if (
+    !readByUids.includes(firebaseUser.uid) &&
+    item.createdByUid !== firebaseUser.uid &&
+    item.status === "reported"
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+interface BadgeActionableItem {
+  status?: string | null;
+  assignedToUid?: string | null;
+  technicianUid?: string | null;
+  assignedTechnicianUid?: string | null;
+  assignedToEmail?: string | null;
+  technicianEmail?: string | null;
+  assignedTechnicianEmail?: string | null;
+}
+
+const QHSE_ACTIONABLE_STATUSES = ["reported", "under_review", "reporter_confirmed", "needs_follow_up"];
+const IT_ACTIONABLE_STATUSES = [
+  "created",
+  "assigned",
+  "accepted",
+  "scheduled_by_it",
+  "in_progress",
+  "revision_requested",
+  "needs_follow_up",
+];
+
+export function needsActionForCurrentUser(
+  item: BadgeActionableItem,
+  firebaseUser?: { uid?: string | null; email?: string | null } | null,
+  currentRole?: string | null
+): boolean {
+  if (!firebaseUser?.uid) return false;
+  const role = currentRole || "";
+
+  if (role === "asset_admin" || role === "super_admin") {
+    return QHSE_ACTIONABLE_STATUSES.includes(item.status || "");
+  }
+
+  if (role === "it_team") {
+    const assignedToMe =
+      item.assignedToUid === firebaseUser.uid ||
+      item.technicianUid === firebaseUser.uid ||
+      item.assignedTechnicianUid === firebaseUser.uid ||
+      (!!firebaseUser.email && item.assignedToEmail === firebaseUser.email) ||
+      (!!firebaseUser.email && item.technicianEmail === firebaseUser.email) ||
+      (!!firebaseUser.email && item.assignedTechnicianEmail === firebaseUser.email);
+    return assignedToMe && IT_ACTIONABLE_STATUSES.includes(item.status || "");
+  }
+
+  return false;
+}
+
+export function needsBadgeForCurrentUser(
+  item: BadgeReadableItem & BadgeActionableItem,
+  firebaseUser?: { uid?: string | null; email?: string | null } | null,
+  currentRole?: string | null
+): boolean {
+  return (
+    isUnreadForCurrentUser(item, firebaseUser) || needsActionForCurrentUser(item, firebaseUser, currentRole)
+  );
 }

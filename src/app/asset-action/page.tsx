@@ -10,17 +10,22 @@ import {
   Eye,
   Pencil,
   QrCode,
+  RotateCw,
   Undo2,
 } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { Asset } from "@/lib/types";
 import { isAssetInMyPicLocation } from "@/lib/locations";
+import { repairBrokenBorrowState } from "@/lib/borrow-actions";
 import {
   ASSET_STATUS_COLOR,
   ASSET_STATUS_LABEL,
   CONDITION_LABEL,
   TRACKING_MODE_LABEL,
+  hasBrokenBorrowState,
+  isBorrowedByMe,
+  isBorrowedByOther,
 } from "@/lib/utils";
 import Badge from "@/components/Badge";
 import ReportIssueModal from "@/components/ReportIssueModal";
@@ -168,14 +173,17 @@ function AssetActionContent() {
     );
   }
 
-  const usageStatus = asset.currentUsageStatus || asset.assetStatus;
+  // Section A — status dibaca lewat helper normalisasi (lib/utils.ts),
+  // BUKAN dibaca mentah dari satu field saja — asset ini bisa punya data
+  // dari skema lama (assetStatus/currentBorrower*) maupun skema baru
+  // (currentUsageStatus/currentHolder*), dan keduanya harus dianggap sah.
   const isFixedLocation = asset.trackingMode === "fixed_location";
-  const isHeldByMe =
-    !!assetUser?.uid &&
-    (asset.currentHolderUid === assetUser.uid || asset.custodianUid === assetUser.uid);
-  const isAvailableToBorrow = asset.isBorrowable && usageStatus === "available" && !isHeldByMe;
-  const usedBySomeoneElse =
-    !isFixedLocation && !isHeldByMe && !isAvailableToBorrow && usageStatus !== "available";
+  const borrowedByMe = isBorrowedByMe(asset, { uid: assetUser?.uid || firebaseUser.uid });
+  const borrowedByOther = isBorrowedByOther(asset, { uid: assetUser?.uid || firebaseUser.uid });
+  const brokenBorrowState = hasBrokenBorrowState(asset);
+  const isAvailableToBorrow =
+    asset.isBorrowable && !isFixedLocation && !borrowedByMe && !borrowedByOther && !brokenBorrowState;
+  const holderName = asset.currentHolderName || asset.currentBorrowerName || asset.custodianName;
 
   const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
   const isLocationPicOwner = isLocationPicScoped && isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid);
@@ -186,10 +194,12 @@ function AssetActionContent() {
   // boleh navigasi ke sana, cukup buka ringkasan tambahan di halaman ini.
   const canOpenFullDetailPage =
     role === "super_admin" || role === "asset_admin" || role === "asset_finance" || role === "it_team" || isLocationPicOwner;
+  const canRepairBrokenState = role === "super_admin" || role === "asset_admin";
 
-  // Section L — validasi sebelum buka modal Pinjam, SESUAI logic yang sudah
-  // ada di BorrowModal/borrowAsset, cuma dicek lebih awal di sini supaya
-  // pesan penolakannya spesifik (bukan modal kebuka lalu gagal submit).
+  // Section C — validasi lengkap sebelum buka modal Pinjam. borrowedByMe
+  // dicek lebih dulu supaya klik "Pinjam Asset" yang ternyata sudah jadi
+  // "Kembalikan Asset" (data baru saja berubah) tetap membuka modal yang
+  // benar, bukan menolak diam-diam.
   const handleBorrowClick = () => {
     if (!asset.isBorrowable) {
       setToast({ type: "error", message: "Asset ini tidak dapat dipinjam." });
@@ -199,14 +209,41 @@ function AssetActionContent() {
       setToast({ type: "error", message: "Asset tetap lokasi tidak dapat dipinjam." });
       return;
     }
-    if (asset.currentHolderUid && asset.currentHolderUid !== firebaseUser.uid) {
+    if (borrowedByMe) {
+      setReturnOpen(true);
+      return;
+    }
+    if (borrowedByOther) {
       setToast({
         type: "error",
-        message: `Asset sedang digunakan oleh ${asset.currentHolderName || "user lain"}.`,
+        message: `Asset sedang dipinjam oleh ${holderName || "user lain"}.`,
       });
       return;
     }
+    if (brokenBorrowState) {
+      setToast({ type: "error", message: "Data peminjaman asset tidak sinkron. Hubungi Asset Admin." });
+      return;
+    }
     setBorrowOpen(true);
+  };
+
+  const handleRepairStatus = async () => {
+    if (!assetUser?.uid) return;
+    try {
+      await repairBrokenBorrowState({
+        asset,
+        performedBy: { uid: assetUser.uid, name: assetUser.name || firebaseUser.email || "" },
+      });
+      setToast({ type: "success", message: "Status asset berhasil diperbaiki menjadi Tersedia." });
+      refreshAsset();
+    } catch (error) {
+      console.error("[Asset Action] gagal memperbaiki status asset", {
+        assetId: asset.id,
+        assetCode: asset.assetCode,
+        error,
+      });
+      setToast({ type: "error", message: "Gagal memperbaiki status asset." });
+    }
   };
 
   return (
@@ -225,8 +262,8 @@ function AssetActionContent() {
             <Row label="Lokasi" value={asset.location || asset.locationText || "-"} />
             <Row label="Kondisi" value={CONDITION_LABEL[asset.condition]} />
             {asset.areaPicName && <Row label="PIC Operasional" value={asset.areaPicName} />}
-            {(asset.currentHolderName || asset.custodianName) && (
-              <Row label="Pemegang Saat Ini" value={asset.currentHolderName || asset.custodianName || "-"} />
+            {!isFixedLocation && (
+              <Row label="Pemegang Saat Ini" value={holderName || "Belum tercatat"} />
             )}
           </div>
 
@@ -244,12 +281,28 @@ function AssetActionContent() {
             </div>
           )}
 
-          {usedBySomeoneElse && (
+          {/* Section B/G — data tidak sinkron: status bilang Dipinjam tapi
+              tidak ada penanda pemegangnya sama sekali. */}
+          {brokenBorrowState && (
             <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
               <AlertTriangle size={14} className="mt-0.5 shrink-0" />
               <span>
-                Asset sedang digunakan oleh {asset.currentHolderName || asset.custodianName || asset.responsiblePersonName || "pengguna lain"}.
+                Data peminjaman asset ini tidak sinkron. Status asset Dipinjam, tetapi pemegang asset belum tercatat.
               </span>
+            </div>
+          )}
+
+          {!brokenBorrowState && borrowedByOther && (
+            <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+              <span>Asset sedang dipinjam oleh {holderName || "user lain"}.</span>
+            </div>
+          )}
+
+          {borrowedByMe && (
+            <div className="mt-4 flex items-start gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+              <span>Asset ini sedang Anda pinjam.</span>
             </div>
           )}
 
@@ -274,7 +327,11 @@ function AssetActionContent() {
               />
             )}
 
-            {!isFixedLocation && isHeldByMe && (
+            {brokenBorrowState && canRepairBrokenState && (
+              <ActionButton icon={RotateCw} label="Perbaiki Status Asset" onClick={handleRepairStatus} />
+            )}
+
+            {!isFixedLocation && !brokenBorrowState && borrowedByMe && (
               <ActionButton icon={Undo2} label="Kembalikan Asset" onClick={() => setReturnOpen(true)} />
             )}
 

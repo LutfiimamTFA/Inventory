@@ -36,19 +36,20 @@ import {
 } from "@/lib/reports";
 import ConfirmModal from "@/components/ConfirmModal";
 import { useAuth } from "@/lib/auth-context";
+import { getResolvedPersonDisplay, useEmployeeDirectory } from "@/lib/employeeDirectory";
 import { isAssetInMyPicLocation } from "@/lib/locations";
 import { Asset, AssetBorrowing, AssetIssueTicket, AssetLog } from "@/lib/types";
 import {
-  ASSET_STATUS_COLOR,
-  ASSET_STATUS_LABEL,
   ASSET_USAGE_STATUS_COLOR,
   ASSET_USAGE_STATUS_LABEL,
   ASSET_USAGE_TYPE_LABEL,
   BORROWING_STATUS_COLOR,
   BORROWING_STATUS_LABEL,
-  CONDITION_LABEL,
   formatCurrency,
   formatDate,
+  getAssetConditionColor,
+  getAssetConditionLabel,
+  getAssetUsageBadge,
   getQrImageSettings,
 } from "@/lib/utils";
 import ProtectedLayout from "@/components/ProtectedLayout";
@@ -62,6 +63,7 @@ export default function AssetDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const { firebaseUser, assetUser, role, loading, isLocationPicRole, assignedPicLocations } = useAuth();
+  const employeeDirectory = useEmployeeDirectory();
   // Section C — staff yang ditunjuk PIC di Master Lokasi diperlakukan sama
   // seperti role "location_pic" literal untuk halaman ini.
   const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
@@ -302,19 +304,36 @@ export default function AssetDetailPage() {
   const isFixedLocationAsset =
     (asset.trackingMode || (asset.usageType === "assigned_daily" ? "assigned_pic" : "shared_borrowable")) ===
     "fixed_location";
-  const custodianDisplayName =
-    asset.custodianName ||
-    asset.responsiblePersonName ||
-    asset.picName ||
-    asset.custodianEmail ||
-    asset.responsiblePersonEmail ||
-    "-";
+  // Section H/I — nama diprioritaskan dari field asset SENDIRI, baru kalau
+  // kosong/berisi email dicoba resolve dari direktori karyawan (HRP); email
+  // mentah cuma tampil kalau BENAR-BENAR tidak ada nama di mana pun.
+  const custodianResolved = getResolvedPersonDisplay(
+    {
+      name: asset.custodianName || asset.responsiblePersonName || asset.picName,
+      email: asset.custodianEmail || asset.responsiblePersonEmail || asset.picEmail,
+      uid: asset.custodianUid || asset.responsiblePersonUid || asset.picUid,
+    },
+    employeeDirectory
+  );
+  const custodianDisplayName = custodianResolved.name;
+  const custodianDisplaySub = asset.custodianDivision || custodianResolved.sub;
+
+  const currentHolderResolved = getResolvedPersonDisplay(
+    {
+      name: asset.currentHolderName || asset.currentBorrowerName,
+      email: asset.currentHolderEmail,
+      uid: asset.currentHolderUid || asset.currentBorrowerUid,
+    },
+    employeeDirectory
+  );
   const currentHolderDisplayName =
-    asset.currentHolderName ||
-    asset.currentBorrowerName ||
-    (asset.usageType === "assigned_daily" || asset.currentUsageStatus === "with_custodian"
+    currentHolderResolved.name !== "-"
+      ? currentHolderResolved.name
+      : asset.usageType === "assigned_daily" || asset.currentUsageStatus === "with_custodian"
       ? custodianDisplayName
-      : "-");
+      : "-";
+  const currentHolderDisplaySub =
+    currentHolderResolved.name !== "-" ? asset.currentHolderDivision || currentHolderResolved.sub : custodianDisplaySub;
   const needsCustodianSync =
     asset.usageType === "assigned_daily" &&
     !asset.custodianName &&
@@ -556,10 +575,11 @@ export default function AssetDetailPage() {
               <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">
                 {asset.assetName}
               </h1>
-              <Badge
-                label={ASSET_STATUS_LABEL[asset.assetStatus]}
-                colorClass={ASSET_STATUS_COLOR[asset.assetStatus]}
-              />
+              <Badge label={getAssetConditionLabel(asset)} colorClass={getAssetConditionColor(asset)} />
+              {(() => {
+                const usage = getAssetUsageBadge(asset);
+                return usage ? <Badge label={usage.label} colorClass={usage.colorClass} /> : null;
+              })()}
             </div>
             <p className="text-sm text-slate-500 mt-0.5">{asset.assetCode}</p>
           </div>
@@ -703,17 +723,15 @@ export default function AssetDetailPage() {
         </div>
 
         <div className="space-y-5">
-          <Section title="Status">
+          <Section title="Kondisi Aset">
             <div className="flex flex-col gap-2.5">
-              <div>
-                <Badge
-                  label={ASSET_STATUS_LABEL[asset.assetStatus]}
-                  colorClass={ASSET_STATUS_COLOR[asset.assetStatus]}
-                />
+              <div className="flex flex-wrap gap-2">
+                <Badge label={getAssetConditionLabel(asset)} colorClass={getAssetConditionColor(asset)} />
+                {(() => {
+                  const usage = getAssetUsageBadge(asset);
+                  return usage ? <Badge label={usage.label} colorClass={usage.colorClass} /> : null;
+                })()}
               </div>
-              <p className="text-sm text-slate-500">
-                Kondisi: <span className="text-slate-800 font-medium">{CONDITION_LABEL[asset.condition]}</span>
-              </p>
               {asset.currentBorrowerName && (
                 <p className="text-sm text-slate-500">
                   Dipinjam oleh: <span className="text-slate-800 font-medium">{asset.currentBorrowerName}</span>
@@ -745,9 +763,9 @@ export default function AssetDetailPage() {
                   <Badge label="Aset Tetap Lokasi" colorClass="bg-slate-100 text-slate-600" />
                 </div>
                 <Info label="Lokasi" value={asset.locationText || asset.location} />
-                <Info label="PIC Lokasi" value={asset.custodianName || asset.responsiblePersonName} />
-                <Info label="Status" value="Tetap di Lokasi" />
-                <Info label="Kondisi" value={CONDITION_LABEL[asset.condition]} />
+                <Info label="PIC Lokasi" value={custodianDisplayName} sub={custodianDisplaySub} />
+                <Info label="Pemakaian" value="Tetap di Lokasi" />
+                <Info label="Kondisi Aset" value={getAssetConditionLabel(asset)} />
                 <Info label="Maintenance Terakhir" value={formatDate(asset.lastMaintenanceAt)} />
                 <div className="flex flex-col gap-2 pt-2 border-t border-slate-100 mt-1">
                   <a
@@ -781,11 +799,11 @@ export default function AssetDetailPage() {
                 <Info label="PIC Lokasi" value={asset.areaPicName} />
               )}
               {custodianIsCurrentHolder ? (
-                <Info label="Pemegang Harian / Saat Ini" value={custodianDisplayName} />
+                <Info label="Pemegang Harian / Saat Ini" value={custodianDisplayName} sub={custodianDisplaySub} />
               ) : (
                 <>
-                  <Info label="Custodian / Pemegang Harian" value={custodianDisplayName} />
-                  <Info label="Pemegang Saat Ini" value={currentHolderDisplayName} />
+                  <Info label="Custodian / Pemegang Harian" value={custodianDisplayName} sub={custodianDisplaySub} />
+                  <Info label="Pemegang Saat Ini" value={currentHolderDisplayName} sub={currentHolderDisplaySub} />
                   <p className="text-xs text-amber-600 font-medium">Sedang dipakai sementara</p>
                 </>
               )}
@@ -1132,11 +1150,22 @@ function Section({
   );
 }
 
-function Info({ label, value, full }: { label: string; value?: string; full?: boolean }) {
+function Info({
+  label,
+  value,
+  full,
+  sub,
+}: {
+  label: string;
+  value?: string;
+  full?: boolean;
+  sub?: string;
+}) {
   return (
     <div className={full ? "sm:col-span-2" : ""}>
       <p className="text-xs text-slate-400 mb-0.5">{label}</p>
       <p className="text-slate-800 font-medium">{value || "-"}</p>
+      {sub && <p className="text-xs text-slate-500">{sub}</p>}
     </div>
   );
 }

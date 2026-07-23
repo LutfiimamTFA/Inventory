@@ -90,10 +90,12 @@ const FUNDING_OPTIONS: FundingSource[] = [
   "Lainnya",
 ];
 
+// Section G — "borrowed"/"in_use" SENGAJA tidak masuk pilihan di form
+// tambah/edit aset. Dua nilai itu status PEMAKAIAN, bukan kondisi/siklus-
+// hidup barang, dan HARUS otomatis dari proses pinjam/kembali atau
+// assignCustodian — bukan dipilih manual saat membuat/mengedit data aset.
 const ASSET_STATUS_OPTIONS: AssetStatus[] = [
   "available",
-  "borrowed",
-  "in_use",
   "maintenance",
   "broken",
   "incomplete",
@@ -1008,11 +1010,11 @@ export default function NewAssetPage() {
 
               <FormSection
                 step={4}
-                title="Tracking & QR"
-                description="QR Code akan digenerate otomatis dari kode aset."
+                title="Kondisi & Status Aset"
+                description="Kondisi fisik dan status operasional barang — TERPISAH dari status pemakaian (Dipinjam/Tersedia diatur otomatis lewat proses pinjam/kembali)."
               >
                 <Field
-                  label="Status Asset"
+                  label="Status Operasional Aset"
                   required
                   error={fieldErrors.assetStatus}
                   hint={ASSET_STATUS_HELPER[assetStatus]}
@@ -1029,7 +1031,7 @@ export default function NewAssetPage() {
                     ))}
                   </select>
                 </Field>
-                <Field label="Kondisi Asset" required error={fieldErrors.condition}>
+                <Field label="Kondisi Aset" required error={fieldErrors.condition}>
                   <select
                     value={condition}
                     onChange={(e) => setCondition(e.target.value as AssetCondition)}
@@ -1042,6 +1044,13 @@ export default function NewAssetPage() {
                     ))}
                   </select>
                 </Field>
+              </FormSection>
+
+              <FormSection
+                step={5}
+                title="Pengaturan Pemakaian Aset"
+                description="QR Code akan digenerate otomatis dari kode aset."
+              >
                 <div className="md:col-span-2 grid md:grid-cols-2 gap-4">
                   <Toggle
                     checked={isBorrowable}

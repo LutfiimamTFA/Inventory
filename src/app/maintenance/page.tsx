@@ -1,8 +1,10 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
+  arrayRemove,
+  arrayUnion,
   collection,
   collectionGroup,
   doc,
@@ -53,7 +55,9 @@ import {
   formatDateTime,
   getDisplayStatus,
   getDueDateKey,
+  isExternalHandlingTicket,
   isWorkOrderOverdue,
+  needsBadgeForCurrentUser,
   WORK_ORDER_STATUS_LABEL,
 } from "@/lib/utils";
 import { getMaintenanceSummaryCounts, toDateSafe, workOrderProgress } from "@/lib/reports";
@@ -586,6 +590,81 @@ function MaintenancePageContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Section G/H — badge angka tab TIDAK menghitung total data, hanya item
+  // yang belum dibaca/butuh aksi user login (isUnreadForCurrentUser/
+  // needsActionForCurrentUser di lib/utils.ts). Dua fungsi ini "menandai
+  // sudah dibaca" — dipanggil saat tab dibuka (semua item di tab itu) atau
+  // saat modal detail satu item dibuka. Kalau kena permission-denied (mis.
+  // rules belum diupdate di server), JANGAN gagalkan aksi utamanya (buka
+  // tab/modal tetap jalan) — cukup console.warn.
+  const markTicketAsRead = useCallback(
+    async (ticketId: string) => {
+      if (!firebaseUser?.uid) return;
+      try {
+        await updateDoc(doc(db, "asset_issue_tickets", ticketId), {
+          readByUids: arrayUnion(firebaseUser.uid),
+          unreadByUids: arrayRemove(firebaseUser.uid),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        console.warn("[Maintenance Mark Read] gagal menandai tiket sudah dibaca", ticketId, err);
+      }
+    },
+    [firebaseUser]
+  );
+
+  const markWorkOrderAsRead = useCallback(
+    async (workOrderId: string) => {
+      if (!firebaseUser?.uid) return;
+      try {
+        await updateDoc(doc(db, "asset_maintenance_work_orders", workOrderId), {
+          readByUids: arrayUnion(firebaseUser.uid),
+          unreadByUids: arrayRemove(firebaseUser.uid),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        console.warn("[Maintenance Mark Read] gagal menandai work order sudah dibaca", workOrderId, err);
+      }
+    },
+    [firebaseUser]
+  );
+
+  const openTicketDetail = useCallback(
+    (ticket: AssetIssueTicket) => {
+      setDetailTarget(ticket);
+      void markTicketAsRead(ticket.id);
+    },
+    [markTicketAsRead]
+  );
+
+  const openWorkOrderDetail = useCallback(
+    (wo: MaintenanceWorkOrder) => {
+      setWoDetailTarget(wo);
+      void markWorkOrderAsRead(wo.id);
+    },
+    [markWorkOrderAsRead]
+  );
+
+  const markItemsAsRead = async (
+    items: { id: string; unreadByUids?: string[] | null }[],
+    collectionName: "asset_issue_tickets" | "asset_maintenance_work_orders"
+  ) => {
+    if (!firebaseUser?.uid) return;
+    const uid = firebaseUser.uid;
+    const unreadItems = items.filter((item) => (item.unreadByUids || []).includes(uid));
+    await Promise.allSettled(
+      unreadItems.map((item) =>
+        updateDoc(doc(db, collectionName, item.id), {
+          readByUids: arrayUnion(uid),
+          unreadByUids: arrayRemove(uid),
+          updatedAt: serverTimestamp(),
+        }).catch((err) => {
+          console.warn("[Maintenance Mark Read] gagal menandai item sudah dibaca", item.id, err);
+        })
+      )
+    );
+  };
+
   const handleTabClick = (key: TabKey) => {
     setActiveTab(key);
     router.replace(`/maintenance?tab=${TAB_QUERY_PARAM[key]}`, { scroll: false });
@@ -699,20 +778,28 @@ function MaintenancePageContent() {
       if (ticketIdParam) {
         const ticket = tickets.find((t) => t.id === ticketIdParam);
         if (ticket) {
-          setDetailTarget(ticket);
+          openTicketDetail(ticket);
           setHighlightId(ticketIdParam);
           setConsumedDeepLink(true);
         }
       } else if (workOrderIdParam) {
         const wo = workOrders.find((w) => w.id === workOrderIdParam);
         if (wo) {
-          setWoDetailTarget(wo);
+          openWorkOrderDetail(wo);
           setHighlightId(workOrderIdParam);
           setConsumedDeepLink(true);
         }
       }
     });
-  }, [ticketIdParam, workOrderIdParam, tickets, workOrders, consumedDeepLink]);
+  }, [
+    ticketIdParam,
+    workOrderIdParam,
+    tickets,
+    workOrders,
+    consumedDeepLink,
+    openTicketDetail,
+    openWorkOrderDetail,
+  ]);
 
   useEffect(() => {
     if (!highlightId) return;
@@ -749,13 +836,22 @@ function MaintenancePageContent() {
       const subStatuses = INCOMING_SUB_FILTERS.find((f) => f.key === incomingSubFilter)?.statuses || [];
       filtered = filtered.filter((t) => subStatuses.includes(t.status));
     }
+    // Tiket Penanganan Eksternal BUKAN tugas Tim IT internal — "Antrian Tim
+    // IT" tidak pernah menampilkannya sama sekali (siapapun yang login),
+    // sedangkan "Butuh Tindakan Lanjutan"/"Riwayat" tetap menampilkannya
+    // untuk QHSE/Admin, hanya disembunyikan saat yang login adalah Tim IT.
+    if (activeTab === "technician") {
+      filtered = filtered.filter((t) => !isExternalHandlingTicket(t));
+    } else if ((activeTab === "follow_up" || activeTab === "history") && role === "it_team") {
+      filtered = filtered.filter((t) => !isExternalHandlingTicket(t));
+    }
     if (activeTab === "incoming" || activeTab === "technician") {
       return [...filtered].sort(
         (a, b) => ISSUE_PRIORITY_RANK[a.priority] - ISSUE_PRIORITY_RANK[b.priority]
       );
     }
     return filtered;
-  }, [tickets, activeTab, incomingSubFilter]);
+  }, [tickets, activeTab, incomingSubFilter, role]);
 
   // Jadwal Maintenance Rutin: HANYA taskCategory "routine" — tugas korektif
   // (taskCategory "corrective") tidak boleh muncul di sini.
@@ -805,6 +901,20 @@ function MaintenancePageContent() {
     const source = role === "it_team" ? myRoutineTasks : routineTasks;
     return [...source].sort(sortWorkOrdersNewestFirst);
   }, [role, myRoutineTasks, routineTasks]);
+
+  // Section G — buka tab Laporan Kendala Staff/Maintenance Rutin = anggap
+  // semua item YANG TAMPIL di tab itu sudah dibaca (bukan cuma badge
+  // disembunyikan tanpa mengubah data). Dipisah jadi effect (bukan di dalam
+  // handleTabClick) supaya juga jalan saat tab aktif berubah lewat deep-link
+  // (?tab=...), tidak cuma klik manual.
+  useEffect(() => {
+    if (activeTab === "incoming") {
+      void markItemsAsRead(tickets.filter((t) => ACTIVE_ISSUE_STATUSES.includes(t.status)), "asset_issue_tickets");
+    } else if (activeTab === "schedule") {
+      void markItemsAsRead(scheduleWorkOrders, "asset_maintenance_work_orders");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
 
   // Summary card Maintenance Rutin HARUS pakai sumber yang sama-sama
   // di-scope per role dengan tabel (scheduleWorkOrders) — sebelumnya summary
@@ -1124,23 +1234,60 @@ function MaintenancePageContent() {
     );
   }, [tickets, workOrders, summaryCounts]);
 
-  // Badge angka tab — dihitung dari data realtime yang sama dengan isi tab
-  // itu sendiri, bukan angka hardcode, supaya selalu sinkron. Rutin dan
-  // korektif TIDAK boleh saling menghitung data yang sama.
-  const scheduleBadgeCount = scheduleWorkOrders.length;
+  // Section A/B/E — badge angka tab BUKAN total data (scheduleWorkOrders.
+  // length dst) — itu bikin badge "menyala" terus walau semua item sudah
+  // dibuka/tidak butuh aksi. Hitung dari item yang BELUM DIBACA user login
+  // atau BUTUH AKSI dari role user login (lihat needsBadgeForCurrentUser di
+  // lib/utils.ts).
+  const scheduleBadgeCount = scheduleWorkOrders.filter((w) =>
+    needsBadgeForCurrentUser(w, firebaseUser, role)
+  ).length;
   const myTasksBadgeCount = myCorrectiveTasks.length;
   const myTasksHasOverdue = myCorrectiveTasks.some(
     (w) => w.status !== "completed" && isWorkOrderOverdue(w)
   );
 
+  // Section G — badge Antrian Tim IT HANYA menghitung tiket internal (tidak
+  // pernah tiket eksternal, siapapun yang login); badge Butuh Tindakan
+  // Lanjutan ikut aturan yang sama dengan isi tabnya (external disembunyikan
+  // dari Tim IT saja). Section H — badge Riwayat DIHILANGKAN (selalu 0)
+  // karena angka total riwayat membingungkan, bukan actionable.
   const tabBadgeCount: Record<TabKey, number> = {
-    incoming: tickets.filter((t) => TICKET_TAB_STATUS.incoming!.includes(t.status)).length,
-    technician: tickets.filter((t) => TICKET_TAB_STATUS.technician!.includes(t.status)).length,
-    follow_up: tickets.filter((t) => TICKET_TAB_STATUS.follow_up!.includes(t.status)).length,
+    incoming: tickets.filter(
+      (t) => TICKET_TAB_STATUS.incoming!.includes(t.status) && needsBadgeForCurrentUser(t, firebaseUser, role)
+    ).length,
+    technician: tickets.filter(
+      (t) => TICKET_TAB_STATUS.technician!.includes(t.status) && !isExternalHandlingTicket(t)
+    ).length,
+    follow_up: tickets.filter(
+      (t) =>
+        TICKET_TAB_STATUS.follow_up!.includes(t.status) &&
+        (role !== "it_team" || !isExternalHandlingTicket(t))
+    ).length,
     schedule: scheduleBadgeCount,
     my_tasks: myTasksBadgeCount,
-    history: historyItems.length,
+    history: 0,
   };
+
+  useEffect(() => {
+    if (role !== "it_team") return;
+    console.log("[Tim IT Queue Filter Debug]", {
+      allTickets: tickets.length,
+      technicianQueueTickets: tabBadgeCount.technician,
+      sample: tickets.map((t) => ({
+        id: t.id,
+        ticketNo: t.ticketNumber,
+        status: t.status,
+        assignedTeam: t.assignedTeam,
+        assignedTeamLabel: t.assignedTeamLabel,
+        assignedToRole: t.assignedToRole,
+        externalHandling: t.externalHandling,
+        externalCoordinationStatus: t.externalCoordinationStatus,
+        isExternal: isExternalHandlingTicket(t),
+      })),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [role, tickets]);
   const tabBadgeColor: Record<TabKey, string> = {
     ...TAB_BADGE_COLOR,
     schedule: overdueWorkOrders.length > 0 ? "bg-red-100 text-red-700" : TAB_BADGE_COLOR.schedule,
@@ -1486,7 +1633,7 @@ function MaintenancePageContent() {
                                   <button
                                     type="button"
                                     onClick={() => {
-                                      setWoDetailTarget(w);
+                                      openWorkOrderDetail(w);
                                       setOpenActionMenuId(null);
                                     }}
                                     className="flex w-full items-center gap-2 rounded-lg px-3 h-9 text-left text-[13px] text-slate-700 cursor-pointer hover:bg-slate-50"
@@ -1537,7 +1684,7 @@ function MaintenancePageContent() {
                                     <button
                                       type="button"
                                       onClick={() => {
-                                        setWoDetailTarget(w);
+                                        openWorkOrderDetail(w);
                                         setOpenActionMenuId(null);
                                       }}
                                       className="flex w-full items-center gap-2 rounded-lg px-3 h-9 text-left text-[13px] text-red-600 cursor-pointer hover:bg-red-50"
@@ -1602,7 +1749,7 @@ function MaintenancePageContent() {
                           <td className="px-4 py-3 text-right">
                             <button
                               type="button"
-                              onClick={() => setWoDetailTarget(w)}
+                              onClick={() => openWorkOrderDetail(w)}
                               className="text-sm font-medium text-blue-600 cursor-pointer hover:underline"
                             >
                               Lihat Detail
@@ -1739,9 +1886,9 @@ function MaintenancePageContent() {
                                   disabled={!canOpenDetail}
                                   onClick={() => {
                                     if (targetWorkOrder) {
-                                      setWoDetailTarget(targetWorkOrder);
+                                      openWorkOrderDetail(targetWorkOrder);
                                     } else if (targetTicket) {
-                                      setDetailTarget(targetTicket);
+                                      openTicketDetail(targetTicket);
                                     }
                                   }}
                                   className={`text-sm font-medium ${
@@ -1852,7 +1999,7 @@ function MaintenancePageContent() {
                       <td className="px-4 py-3 text-right">
                         <button
                           type="button"
-                          onClick={() => setDetailTarget(t)}
+                          onClick={() => openTicketDetail(t)}
                           className="text-sm font-medium text-blue-600 cursor-pointer hover:underline"
                         >
                           Kelola

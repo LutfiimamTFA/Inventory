@@ -90,10 +90,15 @@ const FUNDING_OPTIONS: FundingSource[] = [
   "Lainnya",
 ];
 
+// Section G — "borrowed"/"in_use" SENGAJA tidak masuk pilihan dasar. Dua
+// nilai itu status PEMAKAIAN, bukan kondisi/siklus-hidup barang, dan HARUS
+// otomatis dari proses pinjam/kembali atau assignCustodian — bukan dipilih
+// manual di form edit. Kalau asetnya KEBETULAN sudah "borrowed"/"in_use"
+// (data lama), nilainya tetap disisipkan di render supaya dropdown tidak
+// diam-diam mengubah status pemakaian asset saat admin cuma mau edit field
+// lain — lihat assetStatusOptionsWithCurrent di bawah.
 const ASSET_STATUS_OPTIONS: AssetStatus[] = [
   "available",
-  "borrowed",
-  "in_use",
   "maintenance",
   "broken",
   "incomplete",
@@ -1204,9 +1209,13 @@ export default function EditAssetPage() {
               )}
 
               <fieldset disabled={isFinanceOnlyRole} className="space-y-5 disabled:opacity-60">
-              <FormSection step={4} title="Tracking & QR">
+              <FormSection
+                step={4}
+                title="Kondisi & Status Aset"
+                description="Kondisi fisik dan status operasional barang — TERPISAH dari status pemakaian (Dipinjam/Tersedia diatur otomatis lewat proses pinjam/kembali)."
+              >
                 <Field
-                  label="Status Asset"
+                  label="Status Operasional Aset"
                   required
                   error={fieldErrors.assetStatus}
                   hint={
@@ -1218,14 +1227,17 @@ export default function EditAssetPage() {
                     onChange={(e) => set("assetStatus", e.target.value as AssetStatus)}
                     className="input"
                   >
-                    {ASSET_STATUS_OPTIONS.map((s) => (
+                    {(ASSET_STATUS_OPTIONS.includes(form.assetStatus as AssetStatus) || !form.assetStatus
+                      ? ASSET_STATUS_OPTIONS
+                      : [form.assetStatus as AssetStatus, ...ASSET_STATUS_OPTIONS]
+                    ).map((s) => (
                       <option key={s} value={s}>
                         {ASSET_STATUS_LABEL[s]}
                       </option>
                     ))}
                   </select>
                 </Field>
-                <Field label="Kondisi Asset" required error={fieldErrors.condition}>
+                <Field label="Kondisi Aset" required error={fieldErrors.condition}>
                   <select
                     value={form.condition || "good"}
                     onChange={(e) => set("condition", e.target.value as AssetCondition)}
@@ -1238,6 +1250,9 @@ export default function EditAssetPage() {
                     ))}
                   </select>
                 </Field>
+              </FormSection>
+
+              <FormSection step={5} title="Pengaturan Pemakaian Aset">
                 <div className="md:col-span-2 grid md:grid-cols-2 gap-4">
                   <Toggle
                     checked={!!form.isBorrowable}

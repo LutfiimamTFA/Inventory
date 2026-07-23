@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { addDoc, collection, onSnapshot, serverTimestamp } from "firebase/firestore";
+import { addDoc, collection, doc, onSnapshot, serverTimestamp, updateDoc } from "firebase/firestore";
 import { ArrowLeft, CheckCircle2, ClipboardPlus, Send, UploadCloud } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
@@ -288,6 +288,14 @@ export default function NewStaffReportPage() {
       // Section B — penerima notifikasi laporan staff HANYA asset_admin dan
       // super_admin (QHSE). Jangan asset_finance, jangan staff lain.
       const qhseUsers = await fetchActiveUsersByRoles(["asset_admin", "super_admin"]);
+
+      // Section I — badge notifikasi tab Laporan Kendala Staff: tandai
+      // BELUM DIBACA untuk semua QHSE/Admin aktif. Best-effort (bukan
+      // syarat laporan berhasil) — needsActionForCurrentUser tetap jadi
+      // fallback utama badge kalau update ini gagal.
+      updateDoc(doc(db, "asset_issue_tickets", ticketRef.id), {
+        unreadByUids: qhseUsers.map((u) => u.uid),
+      }).catch((err) => console.warn("[NewStaffReportPage] gagal set unreadByUids", err));
 
       console.log("[Issue Ticket Notification Debug]", {
         ticketId: ticketRef.id,

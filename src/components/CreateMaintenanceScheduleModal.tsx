@@ -441,6 +441,9 @@ export default function CreateMaintenanceScheduleModal({
         assignedTechnicianUid: asDraft ? "" : assignedToUid,
         assignedTechnicianName: asDraft ? "" : technician?.name || technician?.email || "",
         assignedTechnicianEmail: asDraft ? "" : technician?.email || "",
+        // Section I — badge notifikasi Maintenance Rutin: tandai BELUM
+        // DIBACA untuk Tim IT yang baru ditugaskan.
+        unreadByUids: !asDraft && assignedToUid ? [assignedToUid] : [],
         assignedAt: asDraft ? null : serverTimestamp(),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),

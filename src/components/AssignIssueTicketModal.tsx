@@ -312,6 +312,11 @@ export default function AssignIssueTicketModal({
         assignedToEmail,
         assignedToRole,
 
+        // Section I — badge notifikasi Antrian Tim IT: tandai BELUM DIBACA
+        // untuk petugas yang baru ditugaskan (kosong kalau assignedToUid
+        // null, mis. tim tanpa akun/manual).
+        unreadByUids: assignedToUid ? [assignedToUid] : [],
+
         vendorName: null,
         vendorContact: null,
 

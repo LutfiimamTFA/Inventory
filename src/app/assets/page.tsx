@@ -25,13 +25,13 @@ import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { Asset, AssetCategory } from "@/lib/types";
 import {
-  ASSET_STATUS_COLOR,
-  ASSET_STATUS_LABEL,
-  CONDITION_LABEL,
   formatCurrency,
+  getAssetConditionColor,
+  getAssetConditionLabel,
 } from "@/lib/utils";
 import { writeAssetLog } from "@/lib/firestore-helpers";
 import { isAssetInMyPicLocation } from "@/lib/locations";
+import { getResolvedPersonDisplay, useEmployeeDirectory } from "@/lib/employeeDirectory";
 import {
   formatRupiah,
   getAssetPrice,
@@ -58,6 +58,14 @@ export default function AssetsPage() {
   // dari auth-context) diperlakukan SAMA seperti role "location_pic"
   // literal untuk seluruh halaman ini, tanpa mengubah role backend-nya.
   const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
+  // Section H/I — resolve nama asli PIC/custodian dari direktori karyawan
+  // kalau custodianName asset kebetulan cuma email/kosong (data lama).
+  const employeeDirectory = useEmployeeDirectory();
+  const custodianDisplay = (a: Asset) =>
+    getResolvedPersonDisplay(
+      { name: a.custodianName || a.picName || a.responsiblePersonName, email: a.custodianEmail || a.picEmail, uid: a.custodianUid || a.picUid },
+      employeeDirectory
+    );
   const [assets, setAssets] = useState<Asset[]>([]);
   const [categories, setCategories] = useState<AssetCategory[]>([]);
   const [search, setSearch] = useState("");
@@ -241,6 +249,14 @@ export default function AssetsPage() {
       ) as string[],
     [assets]
   );
+  // Section E — opsi filter "Kondisi Aset" diturunkan dari label gabungan
+  // yang SAMA dipakai badge tabel (getAssetConditionLabel), bukan enum
+  // assetStatus mentah — supaya pilihan filter konsisten dengan apa yang
+  // sebenarnya user lihat di kolom Kondisi Aset.
+  const conditionOptions = useMemo(
+    () => Array.from(new Set(assets.map((a) => getAssetConditionLabel(a)))),
+    [assets]
+  );
   const divisions = useMemo(
     () =>
       Array.from(
@@ -264,7 +280,7 @@ export default function AssetsPage() {
     )
       return false;
     if (categoryFilter && a.categoryId !== categoryFilter) return false;
-    if (statusFilter && a.assetStatus !== statusFilter) return false;
+    if (statusFilter && getAssetConditionLabel(a) !== statusFilter) return false;
     if (companyFilter && a.companyOwnerName !== companyFilter) return false;
     if (divisionFilter && a.divisionOwnerName !== divisionFilter) return false;
     if (locationFilter && a.location !== locationFilter) return false;
@@ -356,7 +372,7 @@ export default function AssetsPage() {
         subtitle={
           isLocationPicScoped
             ? "Anda hanya melihat asset pada lokasi yang menjadi tanggung jawab Anda."
-            : "Kelola seluruh aset perusahaan dalam satu tempat."
+            : "Kelola data master, lokasi, kondisi, dan identitas aset perusahaan."
         }
         actions={
           <>
@@ -512,10 +528,10 @@ export default function AssetsPage() {
           onChange={(e) => setStatusFilter(e.target.value)}
           className="input"
         >
-          <option value="">Semua Status</option>
-          {Object.entries(ASSET_STATUS_LABEL).map(([k, v]) => (
-            <option key={k} value={k}>
-              {v}
+          <option value="">Semua Kondisi</option>
+          {conditionOptions.map((label) => (
+            <option key={label} value={label}>
+              {label}
             </option>
           ))}
         </select>
@@ -681,8 +697,7 @@ export default function AssetsPage() {
                     <>
                       <th className="px-4 py-3 font-semibold">Lokasi</th>
                       <th className="px-4 py-3 font-semibold">Perusahaan / Divisi</th>
-                      <th className="px-4 py-3 font-semibold">Status</th>
-                      <th className="px-4 py-3 font-semibold">Kondisi</th>
+                      <th className="px-4 py-3 font-semibold">Kondisi Aset</th>
                       {canViewFinance && <th className="px-4 py-3 font-semibold">Nilai Asset</th>}
                     </>
                   )}
@@ -751,12 +766,9 @@ export default function AssetsPage() {
                         </td>
                         <td className="px-4 py-3">
                           <Badge
-                            label={ASSET_STATUS_LABEL[a.assetStatus]}
-                            colorClass={ASSET_STATUS_COLOR[a.assetStatus]}
+                            label={getAssetConditionLabel(a)}
+                            colorClass={getAssetConditionColor(a)}
                           />
-                        </td>
-                        <td className="px-4 py-3 text-slate-500">
-                          {CONDITION_LABEL[a.condition]}
                         </td>
                         {canViewFinance && (
                           <td className="px-4 py-3 text-slate-500">
@@ -844,12 +856,12 @@ export default function AssetsPage() {
                     label={
                       isAssetFinanceRole
                         ? FINANCE_STATUS_LABEL[getFinanceStatus(a)]
-                        : ASSET_STATUS_LABEL[a.assetStatus]
+                        : getAssetConditionLabel(a)
                     }
                     colorClass={
                       isAssetFinanceRole
                         ? FINANCE_STATUS_COLOR[getFinanceStatus(a)]
-                        : ASSET_STATUS_COLOR[a.assetStatus]
+                        : getAssetConditionColor(a)
                     }
                   />
                 </div>
@@ -911,14 +923,13 @@ export default function AssetsPage() {
                         <p className="text-xs text-slate-500 break-words">{a.divisionOwnerName || ""}</p>
                       </div>
                       <div>
-                        <p className="text-xs text-slate-400">Kondisi</p>
-                        <p className="font-medium text-slate-700">{CONDITION_LABEL[a.condition]}</p>
-                      </div>
-                      <div>
                         <p className="text-xs text-slate-400">PIC Operasional</p>
                         <p className="font-medium text-slate-700 break-words">
-                          {a.custodianName || a.picName || a.responsiblePersonName || "-"}
+                          {custodianDisplay(a).name}
                         </p>
+                        {custodianDisplay(a).sub && (
+                          <p className="text-xs text-slate-500 break-words">{custodianDisplay(a).sub}</p>
+                        )}
                       </div>
                       {canViewFinance && (
                         <div>

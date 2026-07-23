@@ -268,6 +268,12 @@ service cloud.firestore {
           "lastActivityByName",
           "lastActivityMessage",
 
+          // Badge notifikasi tab Maintenance & Kendala (mark-as-read) —
+          // status TIDAK berubah untuk update ini, cuma readByUids/
+          // unreadByUids miliknya sendiri.
+          "readByUids",
+          "unreadByUids",
+
           "updatedAt",
           "updatedByUid",
           "updatedByName"
@@ -411,6 +417,47 @@ service cloud.firestore {
         ]);
     }
 
+    // Section I/K — pengganti catch-all lama yang TERLALU LONGGAR (siapa pun
+    // active user bisa ubah assetStatus/currentBorrower* ke apa saja tanpa
+    // syarat kepemilikan). borrowAsset/returnAsset (lib/borrow-actions.ts)
+    // sekarang menulis skema lama DAN baru (currentUsageStatus/
+    // currentHolder*, plus lastHolder* jejak pemegang terakhir saat
+    // dikembalikan) sekaligus dalam satu updateDoc — rule ini mengizinkan
+    // gabungan field itu, TAPI cuma untuk transisi yang sah: pinjam aset
+    // yang sedang tersedia untuk diri sendiri, atau kembalikan aset yang
+    // sedang dipegang diri sendiri. Dipakai untuk KEDUA arah (pinjam DAN
+    // kembalikan) — sengaja tidak dipecah jadi isAssetReturnAction()
+    // terpisah supaya tidak ada dua function dengan field list yang bisa
+    // saling tidak sinkron.
+    function isAssetBorrowAction() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      let prevStatus = resource.data.get("currentUsageStatus", resource.data.get("assetStatus", "available"));
+      let nextStatus = request.resource.data.get("currentUsageStatus", "");
+      let nextHolderUid = request.resource.data.get("currentHolderUid", "");
+      let prevHolderUid = resource.data.get("currentHolderUid", "");
+
+      return isActiveAssetUser()
+        && changed.hasOnly([
+          "assetStatus", "condition", "currentBorrowingId", "currentBorrowerUid", "currentBorrowerName",
+          "currentUsageStatus", "currentUsageStatusLabel",
+          "currentUsageStartedAt", "currentUsageExpectedReturnAt",
+          "currentHolderUid", "currentHolderName", "currentHolderEmail", "currentHolderDivision",
+          "lastHolderUid", "lastHolderName", "lastHolderEmail", "lastHeldAt", "lastReturnedAt",
+          "borrowedByUid", "borrowedByName", "borrowedByEmail", "borrowedAt",
+          "returnedAt", "returnedByUid", "returnedByName",
+          "lastMaintenanceAt", "nextMaintenanceAt",
+          "updatedAt", "updatedByUid", "updatedByName"
+        ])
+        && (
+          // Pinjam: aset sebelumnya tersedia, sekarang dipegang diri sendiri.
+          (prevStatus in ["available", "tersedia"] && nextStatus == "borrowed" && nextHolderUid == request.auth.uid)
+          ||
+          // Kembalikan: aset sebelumnya dipegang diri sendiri, sekarang
+          // tersedia (atau masuk maintenance kalau dikembalikan rusak).
+          (prevHolderUid == request.auth.uid && nextStatus in ["available", "tersedia", "maintenance"])
+        );
+    }
+
     match /assets/{assetId} {
       allow read: if isActiveAssetUser() || isLocationPicForAsset(resource.data);
       allow create: if isManager() || isLocationPicCreate() || isLocationPicCreateAsset();
@@ -419,11 +466,7 @@ service cloud.firestore {
         isAssetFinanceUpdate() ||
         isLocationPicUpdate() ||
         isLocationPicAllowedAssetUpdate() ||
-        (isActiveAssetUser() &&
-          request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(["assetStatus", "condition", "currentBorrowingId",
-                      "currentBorrowerUid", "currentBorrowerName",
-                      "lastMaintenanceAt", "nextMaintenanceAt", "updatedAt"]));
+        isAssetBorrowAction();
       allow delete: if isSuperAdmin();
     }
 

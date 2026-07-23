@@ -5,11 +5,14 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   collection,
+  DocumentData,
   getDocs,
   limit,
   onSnapshot,
   orderBy,
   query,
+  Query,
+  QueryDocumentSnapshot,
   where,
 } from "firebase/firestore";
 import AssetQrScanner from "@/components/asset/AssetQrScanner";
@@ -44,6 +47,8 @@ import {
   isVCardOrContactQr,
   formatDate,
   formatDateTime,
+  formatExpectedReturn,
+  isBorrowingLate,
 } from "@/lib/utils";
 import { handoverTemporary, returnToCustodian } from "@/lib/custodian-actions";
 import { EmployeeOption, fetchActiveEmployeeOptions } from "@/lib/firestore-helpers";
@@ -185,26 +190,37 @@ interface PersonRef {
   responsiblePersonDivision?: string | null;
 }
 
+// Section M — beberapa asset lama menyimpan EMAIL di field *Name (bukan di
+// field *Email), jadi selain uid/email biasa, coba juga resolve pakai nama
+// itu SENDIRI sebagai email kalau bentuknya memang email — supaya data lama
+// begini tetap ketemu di direktori karyawan alih-alih nyangkut jadi "nama".
 function resolveEmployee(ref: PersonRef, employeeMap?: EmployeeMap): EmployeeOption | undefined {
   const uid = ref.uid || undefined;
   const email = ref.email ? ref.email.toLowerCase() : undefined;
-  return (uid && employeeMap?.byUid[uid]) || (email && employeeMap?.byEmail[email]) || undefined;
+  const nameAsEmail = [ref.currentHolderName, ref.custodianName, ref.responsiblePersonName, ref.picName]
+    .find((n) => n && n.includes("@"))
+    ?.toLowerCase();
+  return (
+    (uid && employeeMap?.byUid[uid]) ||
+    (email && employeeMap?.byEmail[email]) ||
+    (nameAsEmail && employeeMap?.byEmail[nameAsEmail]) ||
+    undefined
+  );
 }
 
-// Nama karyawan dulu (dari employeeMap ATAU field name yang sudah tersimpan
-// di aset), baru kalau benar-benar tidak ada nama sama sekali, fallback ke
-// email — TIDAK PERNAH email duluan.
+// Section H — nama karyawan dulu (dari employeeMap ATAU field name yang
+// sudah tersimpan di aset), baru kalau benar-benar tidak ada nama sama
+// sekali, fallback ke email — TIDAK PERNAH email duluan. Field name yang
+// isinya kebetulan email (data lama) DIABAIKAN sebagai "nama", bukan
+// ditampilkan apa adanya.
 function getPersonDisplayName(ref: PersonRef, employeeMap?: EmployeeMap): string {
   const employee = resolveEmployee(ref, employeeMap);
-  return (
-    employee?.name ||
-    ref.currentHolderName ||
-    ref.custodianName ||
-    ref.responsiblePersonName ||
-    ref.picName ||
-    ref.email ||
-    "-"
+  if (employee?.name) return employee.name;
+  const storedName = [ref.currentHolderName, ref.custodianName, ref.responsiblePersonName, ref.picName].find(
+    (n) => n && !n.includes("@")
   );
+  if (storedName) return storedName;
+  return ref.email || "-";
 }
 
 function getPersonSubInfo(ref: PersonRef, employeeMap?: EmployeeMap): string {
@@ -334,13 +350,52 @@ const USAGE_STATUS_GROUP_LABEL: Record<AssetUsageStatusGroup, string> = {
   available: "Tersedia",
 };
 
+// Section G — pakai normalisasi yang SAMA dengan Peminjaman Saya/Assets
+// (lib/utils.ts normalizeExpectedReturnDate): estimasi tanggal-saja
+// dianggap berlaku sampai akhir hari, bukan langsung telat jam 00:00.
 function isOverdue(expectedReturnAt: string | null | undefined): boolean {
-  if (!expectedReturnAt) return false;
-  const due = new Date(expectedReturnAt);
-  if (Number.isNaN(due.getTime())) return false;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return due < today;
+  return isBorrowingLate({ expectedReturnAt });
+}
+
+// ── Modal Detail Ringkas: fetch riwayat per collection, TERPISAH ────────────
+// Sebelumnya semua query riwayat dibungkus satu Promise.all + satu catch —
+// kalau SATU collection permission-denied, seluruh modal dianggap gagal
+// (padahal data utama asset sudah ada di tangan). safeFetchAssetHistoryCollection
+// membuat setiap collection gagal/berhasil SENDIRI-SENDIRI, dan errornya
+// selalu menyebut nama collection-nya, bukan cuma "gagal memuat riwayat".
+interface SafeFetchResult<T> {
+  ok: boolean;
+  collectionName: string;
+  data: T[];
+}
+
+async function safeFetchAssetHistoryCollection<T>(params: {
+  collectionName: string;
+  queryRef: Query<DocumentData>;
+  mapper: (docSnap: QueryDocumentSnapshot<DocumentData>) => T;
+}): Promise<SafeFetchResult<T>> {
+  const { collectionName, queryRef, mapper } = params;
+  try {
+    const snap = await getDocs(queryRef);
+    console.log("[ScanPage Asset History] SUCCESS", {
+      collectionName,
+      count: snap.size,
+    });
+    return { ok: true, collectionName, data: snap.docs.map(mapper) };
+  } catch (error) {
+    const err = error as { code?: string; message?: string; name?: string } | null;
+    console.error("[ScanPage Asset History] FAILED", {
+      collectionName,
+      errorCode: err?.code,
+      errorMessage: err?.message,
+      errorName: err?.name,
+      rawError:
+        error instanceof Error
+          ? { name: error.name, message: error.message, stack: error.stack }
+          : error,
+    });
+    return { ok: false, collectionName, data: [] };
+  }
 }
 
 type UsageFilter =
@@ -385,6 +440,11 @@ function ScanPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const isManager = role === "asset_admin" || role === "super_admin";
+  // Section A — QHSE/Admin/Tim IT boleh baca semua asset_issue_tickets milik
+  // aset (rules mengizinkan); staff/PIC biasa cuma boleh baca laporan
+  // miliknya sendiri, jadi query "semua tiket milik aset ini" di modal detail
+  // MEMANG akan permission-denied untuk mereka — bukan bug rules.
+  const canReadAssetIssueTickets = isManager || role === "it_team";
   const [toast, setToast] = useState<ToastState | null>(null);
   const [manualCode, setManualCode] = useState("");
   const [asset, setAsset] = useState<Asset | null>(null);
@@ -412,6 +472,7 @@ function ScanPageContent() {
   const [modalLogs, setModalLogs] = useState<AssetLog[]>([]);
   const [modalTickets, setModalTickets] = useState<AssetIssueTicket[]>([]);
   const [modalHistoryLoading, setModalHistoryLoading] = useState(false);
+  const [modalHistoryFailedCollections, setModalHistoryFailedCollections] = useState<string[]>([]);
 
   // Debug SEMENTARA (hapus setelah overflow mobile terkonfirmasi beres) —
   // cari elemen mana persis di dalam .scan-page yang scrollWidth-nya lebih
@@ -488,41 +549,93 @@ function ScanPageContent() {
       Promise.resolve().then(() => {
         setModalLogs([]);
         setModalTickets([]);
+        setModalHistoryFailedCollections([]);
       });
       return;
     }
     let cancelled = false;
     Promise.resolve().then(() => setModalHistoryLoading(true));
+
+    // Section G — tanpa orderBy (hindari butuh composite index), diurutkan
+    // client-side sesudah fetch, sama seperti tickets di bawah.
     const logsQuery = query(
       collection(db, "asset_logs"),
       where("assetId", "==", selectedAsset.id),
-      orderBy("timestamp", "desc"),
-      limit(3)
+      limit(20)
     );
-    const ticketsQuery = query(
-      collection(db, "asset_issue_tickets"),
-      where("assetId", "==", selectedAsset.id)
-    );
-    Promise.all([getDocs(logsQuery), getDocs(ticketsQuery)])
-      .then(([logsSnap, ticketsSnap]) => {
+
+    const logsFetch = safeFetchAssetHistoryCollection<AssetLog>({
+      collectionName: "asset_logs",
+      queryRef: logsQuery,
+      mapper: (d) => ({ id: d.id, ...d.data() } as AssetLog),
+    });
+
+    const ticketsFetch: Promise<SafeFetchResult<AssetIssueTicket>> = canReadAssetIssueTickets
+      ? safeFetchAssetHistoryCollection<AssetIssueTicket>({
+          collectionName: "asset_issue_tickets",
+          queryRef: query(collection(db, "asset_issue_tickets"), where("assetId", "==", selectedAsset.id)),
+          mapper: (d) => ({ id: d.id, ...d.data() } as AssetIssueTicket),
+        })
+      : Promise.resolve({ ok: true, collectionName: "asset_issue_tickets", data: [] });
+
+    // Section C — SETIAP collection di-fetch TERPISAH lewat
+    // safeFetchAssetHistoryCollection, supaya satu collection permission-
+    // denied TIDAK menggagalkan collection lain ATAU menutup modalnya.
+    Promise.all([logsFetch, ticketsFetch])
+      .then(([logsResult, ticketsResult]) => {
         if (cancelled) return;
-        setModalLogs(logsSnap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetLog)));
-        const tickets = ticketsSnap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket));
-        tickets.sort((a, b) => {
+
+        const sortedLogs = [...logsResult.data].sort((a, b) => {
+          const at = (a.timestamp as { toMillis?: () => number })?.toMillis?.() || 0;
+          const bt = (b.timestamp as { toMillis?: () => number })?.toMillis?.() || 0;
+          return bt - at;
+        });
+        setModalLogs(sortedLogs.slice(0, 3));
+
+        const sortedTickets = [...ticketsResult.data].sort((a, b) => {
           const at = (a.reportedAt as { toMillis?: () => number })?.toMillis?.() || 0;
           const bt = (b.reportedAt as { toMillis?: () => number })?.toMillis?.() || 0;
           return bt - at;
         });
-        setModalTickets(tickets.slice(0, 3));
+        setModalTickets(sortedTickets.slice(0, 3));
+
+        // canReadAssetIssueTickets sudah memastikan ticketsResult SELALU
+        // ok:true untuk role yang tidak berhak (tidak pernah di-fetch), jadi
+        // tidak perlu filter tambahan di sini — hasilnya otomatis aman.
+        const failed = [logsResult, ticketsResult].filter((r) => !r.ok).map((r) => r.collectionName);
+        setModalHistoryFailedCollections(failed);
+        console.log("[ScanPage Asset History Summary]", {
+          assetId: selectedAsset.id,
+          assetCode: selectedAsset.assetCode,
+          role,
+          canReadAssetIssueTickets,
+          failedCollections: failed,
+          logsCount: logsResult.data.length,
+          ticketsCount: ticketsResult.data.length,
+        });
       })
-      .catch((err) => console.error("[ScanPage] gagal memuat riwayat aset untuk modal detail", err))
+      .catch((error) => {
+        // Section E — jaring pengaman terakhir kalau ada error TAK TERDUGA di
+        // luar dua safeFetch di atas (mis. bug lain) — modal TETAP terbuka,
+        // cuma riwayatnya dianggap kosong/gagal semua.
+        if (cancelled) return;
+        console.error("[ScanPage] unexpected asset history error", {
+          assetId: selectedAsset.id,
+          assetCode: selectedAsset.assetCode,
+          errorCode: (error as { code?: string })?.code,
+          errorMessage: (error as { message?: string })?.message,
+        });
+        setModalLogs([]);
+        setModalTickets([]);
+        setModalHistoryFailedCollections(["unknown"]);
+      })
       .finally(() => {
         if (!cancelled) setModalHistoryLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [assetDetailModalOpen, selectedAsset]);
+  }, [assetDetailModalOpen, selectedAsset, canReadAssetIssueTickets, role]);
 
   // Riwayat scan lokal — dimuat sekali per user begitu login diketahui.
   // setState dibungkus microtask supaya tidak "setState sinkron di dalam
@@ -1076,7 +1189,7 @@ function ScanPageContent() {
                       label="Estimasi Kembali"
                       value={
                         asset.temporaryUseExpectedReturnAt
-                          ? formatDate(asset.temporaryUseExpectedReturnAt)
+                          ? formatExpectedReturn(asset.temporaryUseExpectedReturnAt)
                           : undefined
                       }
                     />
@@ -1344,7 +1457,7 @@ function ScanPageContent() {
                       </td>
                       <td className="px-4 py-3 text-slate-600">{row.locationText}</td>
                       <td className="px-4 py-3 text-slate-500">
-                        {row.expectedReturnAt ? formatDate(row.expectedReturnAt) : "-"}
+                        {row.expectedReturnAt ? formatExpectedReturn(row.expectedReturnAt) : "-"}
                       </td>
                       <td className="px-4 py-3 text-right">
                         <div className="inline-flex items-center gap-3 flex-wrap justify-end">
@@ -1498,7 +1611,7 @@ function ScanPageContent() {
                     <div>
                       <p className="text-xs text-slate-400">Estimasi Kembali</p>
                       <p className="font-medium text-slate-700">
-                        {row.expectedReturnAt ? formatDate(row.expectedReturnAt) : "-"}
+                        {row.expectedReturnAt ? formatExpectedReturn(row.expectedReturnAt) : "-"}
                       </p>
                     </div>
                   </div>
@@ -1738,6 +1851,8 @@ function ScanPageContent() {
           logs={modalLogs}
           tickets={modalTickets}
           historyLoading={modalHistoryLoading}
+          historyFailedCollections={modalHistoryFailedCollections}
+          canReadIssueTickets={canReadAssetIssueTickets}
           onClose={() => {
             setAssetDetailModalOpen(false);
             setSelectedAsset(null);
@@ -1837,6 +1952,8 @@ function AssetQuickDetailModal({
   logs,
   tickets,
   historyLoading,
+  historyFailedCollections,
+  canReadIssueTickets,
   onClose,
   onRequestTemporaryUse,
   onHandoverTemporary,
@@ -1851,6 +1968,8 @@ function AssetQuickDetailModal({
   logs: AssetLog[];
   tickets: AssetIssueTicket[];
   historyLoading: boolean;
+  historyFailedCollections: string[];
+  canReadIssueTickets: boolean;
   onClose: () => void;
   onRequestTemporaryUse: () => void;
   onHandoverTemporary: () => void;
@@ -1909,7 +2028,7 @@ function AssetQuickDetailModal({
                     label="Estimasi Kembali"
                     value={
                       asset.temporaryUseExpectedReturnAt
-                        ? formatDate(asset.temporaryUseExpectedReturnAt)
+                        ? formatExpectedReturn(asset.temporaryUseExpectedReturnAt)
                         : undefined
                     }
                   />
@@ -1917,6 +2036,15 @@ function AssetQuickDetailModal({
               )}
             </div>
           </div>
+
+          {!historyLoading && historyFailedCollections.length > 0 && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+              Sebagian riwayat belum bisa dimuat. Data utama aset tetap dapat dilihat.
+              <span className="block text-[11px] text-amber-500 mt-0.5">
+                Collection gagal: {historyFailedCollections.join(", ")}
+              </span>
+            </div>
+          )}
 
           <div>
             <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Riwayat Singkat</h4>
@@ -1939,6 +2067,8 @@ function AssetQuickDetailModal({
             <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Kendala Singkat</h4>
             {historyLoading ? (
               <p className="text-sm text-slate-400">Memuat...</p>
+            ) : !canReadIssueTickets ? (
+              <p className="text-sm text-slate-400">Riwayat kendala hanya dapat dilihat oleh QHSE/Admin.</p>
             ) : tickets.length === 0 ? (
               <p className="text-sm text-slate-400">Belum ada laporan kendala.</p>
             ) : (

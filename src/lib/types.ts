@@ -177,6 +177,17 @@ export interface Asset {
   currentUsagePurpose?: string | null;
   currentUsageNote?: string | null;
 
+  // Section E — jejak pemegang TERAKHIR, diisi saat aset dikembalikan
+  // (returnAsset di lib/borrow-actions.ts) dari currentHolder* SEBELUM
+  // dikosongkan. Dipertahankan walau aset sudah "available" lagi supaya
+  // admin tetap bisa tahu siapa yang terakhir pegang — terutama kalau
+  // telat dikembalikan.
+  lastHolderUid?: string | null;
+  lastHolderName?: string | null;
+  lastHolderEmail?: string | null;
+  lastHeldAt?: unknown;
+  lastReturnedAt?: unknown;
+
   // Alias legacy — beberapa data/tampilan lama membaca PIC dari field ini
   // alih-alih custodian* (lihat displayCustodianName di assets/[id]/page.tsx).
   picUid?: string | null;
@@ -242,6 +253,14 @@ export interface AssetBorrowing {
   borrowNotes?: string;
   returnCondition?: AssetCondition;
   returnNotes?: string;
+  // Section F/H — snapshot lokasi saat dipinjam (untuk tampilan riwayat,
+  // TIDAK ikut berubah walau lokasi asetnya berubah belakangan) dan
+  // penanda telat, dihitung & dikunci saat pengembalian (bukan dihitung
+  // ulang tiap render riwayat).
+  locationText?: string;
+  isLate?: boolean;
+  returnedByUid?: string;
+  returnedByName?: string;
 }
 
 export interface AssetLog {
@@ -627,6 +646,12 @@ export interface AssetIssueTicket {
   lastActivityByName?: string;
   lastActivityMessage?: string;
 
+  // Badge notifikasi tab Maintenance & Kendala — UID yang "belum baca" tiket
+  // ini (badge tab menyala untuknya) vs "sudah baca" (mark-as-read saat tab
+  // dibuka / modal detail dibuka). BUKAN dipakai untuk hitung total data.
+  readByUids?: string[];
+  unreadByUids?: string[];
+
   // Diisi kalau ticket dibuat otomatis dari temuan Work Order Maintenance,
   // bukan dari laporan staff via Scan QR/manual web.
   workOrderId?: string;
@@ -958,6 +983,11 @@ export interface MaintenanceWorkOrder {
   lastActivityByUid?: string;
   lastActivityByName?: string;
   lastActivityMessage?: string;
+
+  // Badge notifikasi tab Maintenance Rutin — lihat komentar yang sama di
+  // AssetIssueTicket.readByUids/unreadByUids.
+  readByUids?: string[];
+  unreadByUids?: string[];
 }
 
 export type WorkOrderItemStatus =

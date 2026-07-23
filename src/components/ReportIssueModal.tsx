@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { addDoc, collection, serverTimestamp } from "firebase/firestore";
+import { addDoc, collection, doc, serverTimestamp, updateDoc } from "firebase/firestore";
 import { X, UploadCloud, Check } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
@@ -12,6 +12,7 @@ import {
   IMPACT_TO_PRIORITY,
   writeAssetIssueLog,
   fetchActiveUsersByRole,
+  fetchActiveUsersByRoles,
 } from "@/lib/firestore-helpers";
 import { uploadToDrive } from "@/lib/drive-upload";
 import { createAssetNotification } from "@/lib/notifications";
@@ -150,6 +151,13 @@ export default function ReportIssueModal({
         performedByUid: assetUser?.uid || "",
         performedByName: assetUser?.name || "",
       });
+
+      // Section I — badge notifikasi tab Laporan Kendala Staff: tandai
+      // BELUM DIBACA untuk semua QHSE/Admin aktif (best-effort).
+      const qhseUsers = await fetchActiveUsersByRoles(["asset_admin", "super_admin"]);
+      updateDoc(doc(db, "asset_issue_tickets", ticketRef.id), {
+        unreadByUids: qhseUsers.map((u) => u.uid),
+      }).catch((err) => console.warn("[Report Issue] gagal set unreadByUids", err));
 
       const assetAdmins = await fetchActiveUsersByRole("asset_admin");
       await Promise.all(
