@@ -22,7 +22,11 @@ export type AssetCondition =
   | "good"
   | "fair"
   | "minor_damage"
-  | "heavy_damage";
+  | "heavy_damage"
+  // Status kondisi SEMENTARA — staff baru melapor kendala, belum divalidasi
+  // QHSE. BUKAN kondisi final (Rusak Ringan/Berat/Maintenance dst), cuma
+  // penanda "ada laporan aktif" supaya Assets tidak salah tampil "Baik".
+  | "reported_issue";
 
 export type OwnershipStatus =
   | "Aset Perusahaan"
@@ -204,6 +208,34 @@ export interface Asset {
   handedOverByName?: string | null;
   returnedByUid?: string | null;
   returnedByName?: string | null;
+
+  // ── Laporan kendala aktif (lihat lib/utils.ts getAssetConditionLabel) ────
+  // Dipakai supaya Assets tidak salah tampil "Baik" saat ada laporan kendala
+  // yang belum divalidasi QHSE. condition/conditionLabel dipakai SEMENTARA
+  // ("reported_issue"/"Dilaporkan Bermasalah") sampai QHSE menutup/menolak/
+  // membatalkan laporan — previousCondition* menyimpan kondisi SEBELUM
+  // dilaporkan supaya bisa dikembalikan kalau laporannya ditolak/duplikat.
+  conditionLabel?: string;
+  hasActiveIssue?: boolean;
+  activeIssueTicketId?: string | null;
+  activeIssueTicketNo?: string | null;
+  previousCondition?: AssetCondition | null;
+  previousConditionLabel?: string | null;
+  issueReportedAt?: unknown;
+  issueReportedByUid?: string | null;
+  issueReportedByName?: string | null;
+  // Ringkasan laporan kendala TERAKHIR — dipakai untuk warning card di Scan
+  // QR/Aksi Cepat Asset supaya user tidak perlu buka tiket detail hanya
+  // untuk tahu gejala/catatannya.
+  lastIssueSymptomLabel?: string | null;
+  lastIssueNote?: string | null;
+  lastIssueImpactLabel?: string | null;
+  conditionReviewedAt?: unknown;
+  conditionReviewedByUid?: string | null;
+  conditionReviewedByName?: string | null;
+  issueResolvedAt?: unknown;
+  issueResolvedByUid?: string | null;
+  issueResolvedByName?: string | null;
 
   createdByUid: string;
   createdByName: string;

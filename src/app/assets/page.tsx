@@ -134,13 +134,22 @@ export default function AssetsPage() {
     let fixedLocation = 0;
     let moving = 0;
     let maintenance = 0;
+    let reportedIssue = 0;
     visibleAssets.forEach((a) => {
       const mode = a.trackingMode || (a.usageType === "assigned_daily" ? "assigned_pic" : "shared_borrowable");
       if (mode === "fixed_location") fixedLocation += 1;
       else moving += 1;
       if (a.assetStatus === "maintenance") maintenance += 1;
+      // Section E — asset bermasalah dihitung dari hasActiveIssue (SUMBER
+      // UTAMA) dengan fallback ke field condition mentah untuk data lama,
+      // BUKAN dari asset yang kebetulan berstatus maintenance saja — supaya
+      // laporan kendala aktif yang belum ditentukan kondisi finalnya tetap
+      // kehitung, dan tidak dobel-hitung dengan aset yang sudah "Maintenance".
+      if (a.hasActiveIssue === true || String(a.condition || "").toLowerCase() === "reported_issue") {
+        reportedIssue += 1;
+      }
     });
-    return { fixedLocation, moving, maintenance };
+    return { fixedLocation, moving, maintenance, reportedIssue };
   }, [visibleAssets]);
 
   // Section B/D/E — ringkasan finance untuk Asset Finance: total nilai
@@ -482,7 +491,7 @@ export default function AssetsPage() {
           </div>
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
           <div className="rounded-2xl border border-slate-200 bg-white p-4">
             <p className="text-xs text-slate-500">Total Aset Tetap Lokasi</p>
             <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.fixedLocation}</p>
@@ -494,6 +503,10 @@ export default function AssetsPage() {
           <div className="rounded-2xl border border-slate-200 bg-white p-4">
             <p className="text-xs text-slate-500">Total Aset Maintenance</p>
             <p className="text-2xl font-semibold text-slate-900 mt-1">{trackingSummary.maintenance}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <p className="text-xs text-slate-500">Aset Bermasalah</p>
+            <p className="text-2xl font-semibold text-amber-600 mt-1">{trackingSummary.reportedIssue}</p>
           </div>
         </div>
       )}

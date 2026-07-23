@@ -15,7 +15,6 @@ import {
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { Asset, AssetCondition } from "@/lib/types";
-import { borrowAsset } from "@/lib/borrow-actions";
 import { useAuth } from "@/lib/auth-context";
 import ConfirmModal from "@/components/ConfirmModal";
 
@@ -65,6 +64,53 @@ function returnErrorMessage(err: unknown): string {
   return message || "Gagal mengembalikan aset. Coba lagi atau hubungi admin.";
 }
 
+// Section A — sama seperti logReturnError, tapi untuk alur Pinjam Aset —
+// tetap dipisah fungsinya supaya prefix log ("[Asset Action Borrow Error]")
+// tidak tercampur dengan alur pengembalian.
+function logBorrowError(
+  step: string,
+  err: unknown,
+  asset: Asset | null,
+  firebaseUser?: { uid?: string | null; email?: string | null } | null,
+  assetUser?: { uid?: string | null; email?: string | null } | null
+) {
+  const rawError =
+    err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err;
+  const code = (err as { code?: string } | null)?.code;
+  const message = (err as { message?: string } | null)?.message;
+  const name = (err as { name?: string } | null)?.name;
+
+  console.error(`[Asset Action Borrow Error] FAILED ${step}`, {
+    assetId: asset?.id,
+    assetCode: asset?.assetCode,
+    assetName: asset?.assetName,
+
+    firebaseUid: firebaseUser?.uid,
+    firebaseEmail: firebaseUser?.email,
+
+    assetUserUid: assetUser?.uid,
+    assetUserEmail: assetUser?.email,
+
+    currentUsageStatus: asset?.currentUsageStatus,
+    currentHolderUid: asset?.currentHolderUid,
+    currentHolderName: asset?.currentHolderName,
+
+    errorCode: code,
+    errorMessage: message,
+    errorName: name,
+    rawError,
+  });
+}
+
+function borrowErrorMessage(err: unknown): string {
+  const code = (err as { code?: string } | null)?.code;
+  const message = (err as { message?: string } | null)?.message;
+  if (code === "permission-denied") {
+    return "Anda belum memiliki izin untuk meminjam aset ini.";
+  }
+  return message || "Gagal meminjam aset. Coba lagi atau hubungi admin.";
+}
+
 export function BorrowModal({
   asset,
   open,
@@ -84,46 +130,142 @@ export function BorrowModal({
   const [error, setError] = useState("");
 
   const handleConfirm = async () => {
-    if (!assetUser || !firebaseUser) return;
+    // Section B — UID dari Firebase Auth dulu (sumber kebenaran login),
+    // assetUser cuma fallback kalau firebaseUser belum sempat termuat.
+    const userUid = firebaseUser?.uid || assetUser?.uid;
+    const userEmail = firebaseUser?.email || assetUser?.email || "";
+    const currentUserName =
+      assetUser?.name || firebaseUser?.displayName || firebaseUser?.email || "User";
+
+    if (!userUid) {
+      setError("Sesi login tidak ditemukan. Silakan login ulang.");
+      return;
+    }
+
+    // Section C — aset yang sedang dipegang orang lain tidak boleh dipinjam
+    // (dicek di sini dulu supaya pesannya spesifik, bukan permission-denied
+    // generik dari rules).
+    const currentStatus = String(asset?.currentUsageStatus || "").toLowerCase();
+    const isAvailable = !currentStatus || currentStatus === "available" || currentStatus === "tersedia";
+    if (!isAvailable && asset?.currentHolderUid && asset.currentHolderUid !== userUid) {
+      setError("Aset ini sedang dipakai oleh pengguna lain.");
+      return;
+    }
+
     setSaving(true);
     setError("");
+
+    // Section C/E — tanpa jam, simpan tanggal SAJA ("YYYY-MM-DD") supaya
+    // normalizeExpectedReturnDate (lib/utils.ts) menganggapnya berlaku
+    // sampai akhir hari, bukan otomatis jam 00:00 dini hari.
+    const estimatedReturnAt = estimatedReturnDate
+      ? estimatedReturnTime
+        ? `${estimatedReturnDate}T${estimatedReturnTime}:00`
+        : estimatedReturnDate
+      : "";
+
+    // Section D — payload MINIMAL, cuma field yang memang perlu berubah saat
+    // meminjam (bukan seluruh object asset). assetStatus/currentBorrowerUid/
+    // Name dipertahankan untuk konsumen skema lama (lihat lib/borrow-actions.ts).
+    const assetBorrowPayload = {
+      assetStatus: "borrowed",
+      currentBorrowingId: null,
+      currentBorrowerUid: userUid,
+      currentBorrowerName: currentUserName,
+
+      currentUsageStatus: "borrowed",
+      currentUsageStatusLabel: "Sedang Dipinjam",
+
+      currentHolderUid: userUid,
+      currentHolderName: currentUserName,
+      currentHolderEmail: userEmail || null,
+
+      currentUsageStartedAt: serverTimestamp(),
+      currentUsageExpectedReturnAt: estimatedReturnAt || null,
+      currentUsageNote: borrowNotes || "",
+
+      updatedAt: serverTimestamp(),
+      updatedByUid: userUid,
+      updatedByName: currentUserName,
+    };
+
+    // Section F — dua langkah dipisah try/catch masing-masing supaya kalau
+    // ada yang gagal, log-nya jelas MENUNJUK ke langkah mana yang gagal,
+    // bukan satu catch besar yang bisa menyamarkan error jadi kosong ({}).
     try {
-      // Section C/E — tanpa jam, simpan tanggal SAJA ("YYYY-MM-DD") supaya
-      // normalizeExpectedReturnDate (lib/utils.ts) menganggapnya berlaku
-      // sampai akhir hari, bukan otomatis jam 00:00 dini hari.
-      const estimatedReturnAt = estimatedReturnDate
-        ? estimatedReturnTime
-          ? `${estimatedReturnDate}T${estimatedReturnTime}:00`
-          : estimatedReturnDate
-        : "";
-      await borrowAsset({
-        asset,
-        userUid: assetUser.uid,
-        userName: assetUser.name,
-        userEmail: assetUser.email || firebaseUser.email || "",
-        estimatedReturnAt,
-        borrowNotes,
+      console.log("[Borrow Asset] START update asset", {
+        assetId: asset.id,
+        assetCode: asset.assetCode,
+        userUid,
+        userEmail,
+        currentUsageStatus: asset.currentUsageStatus,
+        payloadKeys: Object.keys(assetBorrowPayload),
       });
-      onDone();
+
+      await updateDoc(doc(db, "assets", asset.id), assetBorrowPayload);
+
+      console.log("[Borrow Asset] SUCCESS update asset");
     } catch (err) {
-      const code = (err as { code?: string })?.code;
-      console.error("[Asset Action Borrow Error]", {
-        assetId: asset?.id,
-        assetCode: asset?.assetCode,
-        currentUsageStatus: asset?.currentUsageStatus,
-        currentHolderUid: asset?.currentHolderUid,
-        userUid: assetUser?.uid,
-        errorCode: code,
-        errorMessage: (err as { message?: string })?.message,
-      });
-      setError(
-        code === "permission-denied"
-          ? "Anda belum punya izin untuk meminjam asset ini."
-          : "Gagal memproses pinjaman. Coba lagi atau hubungi admin."
-      );
-    } finally {
+      logBorrowError("update asset", err, asset, firebaseUser, assetUser);
       setSaving(false);
+      setError(borrowErrorMessage(err));
+      return;
     }
+
+    let borrowingId: string | null = null;
+    try {
+      const borrowingPayload = {
+        assetId: asset.id,
+        assetCode: asset.assetCode,
+        assetName: asset.assetName,
+        locationText: asset.locationText || asset.location || "",
+        borrowedByUid: userUid,
+        borrowedByName: currentUserName,
+        borrowedByEmail: userEmail,
+        status: "borrowed",
+        statusLabel: "Sedang Dipinjam",
+        borrowedAt: serverTimestamp(),
+        estimatedReturnAt: estimatedReturnAt || null,
+        returnedAt: null,
+        borrowNotes: borrowNotes || "",
+      };
+
+      console.log("[Borrow Asset] START create borrowing history", {
+        assetId: asset.id,
+        assetCode: asset.assetCode,
+        userUid,
+        payloadKeys: Object.keys(borrowingPayload),
+      });
+
+      const borrowingRef = await addDoc(collection(db, "asset_borrowings"), borrowingPayload);
+      borrowingId = borrowingRef.id;
+
+      console.log("[Borrow Asset] SUCCESS create borrowing history", {
+        borrowingId: borrowingRef.id,
+      });
+    } catch (err) {
+      logBorrowError("create borrowing history", err, asset, firebaseUser, assetUser);
+      setSaving(false);
+      setError(borrowErrorMessage(err));
+      return;
+    }
+
+    // Section E — best-effort: kalau update currentBorrowingId gagal,
+    // JANGAN gagalkan peminjaman utama (assets + asset_borrowings sudah
+    // benar) — cukup log peringatan.
+    if (borrowingId) {
+      updateDoc(doc(db, "assets", asset.id), {
+        currentBorrowingId: borrowingId,
+        updatedAt: serverTimestamp(),
+        updatedByUid: userUid,
+        updatedByName: currentUserName,
+      }).catch((err) => {
+        console.warn("[Borrow Asset] gagal update currentBorrowingId (non-fatal)", asset.id, err);
+      });
+    }
+
+    setSaving(false);
+    onDone();
   };
 
   return (

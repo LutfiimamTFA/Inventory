@@ -441,6 +441,7 @@ service cloud.firestore {
           "assetStatus", "condition", "currentBorrowingId", "currentBorrowerUid", "currentBorrowerName",
           "currentUsageStatus", "currentUsageStatusLabel",
           "currentUsageStartedAt", "currentUsageExpectedReturnAt",
+          "currentUsagePurpose", "currentUsageNote",
           "currentHolderUid", "currentHolderName", "currentHolderEmail", "currentHolderDivision",
           "lastHolderUid", "lastHolderName", "lastHolderEmail", "lastHeldAt", "lastReturnedAt",
           "borrowedByUid", "borrowedByName", "borrowedByEmail", "borrowedAt",
@@ -458,6 +459,43 @@ service cloud.firestore {
         );
     }
 
+    // Section K — staff (pelapor) menandai aset "Dilaporkan Bermasalah" saat
+    // membuat laporan kendala dari Scan QR/Asset Action. Dibatasi ketat:
+    // HANYA transisi masuk ke status sementara ini (hasActiveIssue harus
+    // true, condition harus "reported_issue"), TIDAK bisa dipakai untuk
+    // set kondisi final (Rusak Ringan/Berat/Maintenance dst — itu tetap
+    // hanya lewat isManager() saat QHSE review/tutup laporan).
+    function isAssetIssueReportUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+
+      return isSignedIn()
+        && changed.hasOnly([
+          "hasActiveIssue",
+          "activeIssueTicketId",
+          "activeIssueTicketNo",
+
+          "condition",
+          "conditionLabel",
+          "previousCondition",
+          "previousConditionLabel",
+
+          "issueReportedAt",
+          "issueReportedByUid",
+          "issueReportedByName",
+
+          "lastIssueSymptomLabel",
+          "lastIssueNote",
+          "lastIssueImpactLabel",
+
+          "updatedAt",
+          "updatedByUid",
+          "updatedByName"
+        ])
+        && request.resource.data.get("hasActiveIssue", false) == true
+        && request.resource.data.get("condition", "") == "reported_issue"
+        && request.resource.data.get("issueReportedByUid", "") == request.auth.uid;
+    }
+
     match /assets/{assetId} {
       allow read: if isActiveAssetUser() || isLocationPicForAsset(resource.data);
       allow create: if isManager() || isLocationPicCreate() || isLocationPicCreateAsset();
@@ -466,7 +504,8 @@ service cloud.firestore {
         isAssetFinanceUpdate() ||
         isLocationPicUpdate() ||
         isLocationPicAllowedAssetUpdate() ||
-        isAssetBorrowAction();
+        isAssetBorrowAction() ||
+        isAssetIssueReportUpdate();
       allow delete: if isSuperAdmin();
     }
 

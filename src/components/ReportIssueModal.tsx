@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { addDoc, collection, doc, serverTimestamp, updateDoc } from "firebase/firestore";
+import { collection, doc, getDoc, serverTimestamp, updateDoc, writeBatch } from "firebase/firestore";
 import { X, UploadCloud, Check } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
@@ -11,7 +11,6 @@ import {
   generateQueueNumber,
   IMPACT_TO_PRIORITY,
   writeAssetIssueLog,
-  fetchActiveUsersByRole,
   fetchActiveUsersByRoles,
 } from "@/lib/firestore-helpers";
 import { uploadToDrive } from "@/lib/drive-upload";
@@ -46,7 +45,7 @@ export default function ReportIssueModal({
   open: boolean;
   onClose: () => void;
 }) {
-  const { assetUser } = useAuth();
+  const { assetUser, firebaseUser } = useAuth();
   const [symptomType, setSymptomType] = useState<IssueSymptomType | "">("");
   const [impactLevel, setImpactLevel] = useState<IssueImpactLevel | "">("");
   const [description, setDescription] = useState("");
@@ -82,10 +81,28 @@ export default function ReportIssueModal({
       return;
     }
 
+    // Section B — UID dari Firebase Auth dulu (SELALU sama dengan
+    // request.auth.uid yang dipakai rules), assetUser cuma pelengkap
+    // nama/email. Sebelumnya reportedByUid/createdByUid pakai assetUser?.uid
+    // saja — kalau assetUser belum sempat termuat saat submit, field itu
+    // jadi "" (!= request.auth.uid) dan create DITOLAK rules (permission-
+    // denied), padahal user sudah login sah.
+    const userUid = firebaseUser?.uid || assetUser?.uid;
+    const userEmail = firebaseUser?.email || assetUser?.email || "";
+    const currentUserName = assetUser?.name || firebaseUser?.displayName || firebaseUser?.email || "User";
+
+    if (!userUid) {
+      setError("Sesi login tidak ditemukan. Silakan login ulang.");
+      return;
+    }
+
     setSubmitting(true);
+    setError("");
+
+    let attachmentUrls: string[] = [];
+    let attachmentFiles: string[] = [];
     try {
-      let attachmentUrls: string[] = [];
-      let attachmentFiles: string[] = [];
+      console.log("[Asset Issue Report] START prepare attachment", { hasFile: !!file });
       if (file) {
         const uploaded = await uploadToDrive(file, "issue_attachment", {
           assetCode: asset.assetCode,
@@ -94,99 +111,243 @@ export default function ReportIssueModal({
         attachmentUrls = [uploaded.url];
         attachmentFiles = [uploaded.fileName];
       }
-
-      const ticketNum = await generateTicketNumber();
-      const queueNum = await generateQueueNumber();
-      const priority = IMPACT_TO_PRIORITY[impactLevel];
-
-      const ticketRef = await addDoc(collection(db, "asset_issue_tickets"), {
-        ticketNumber: ticketNum,
-        queueNumber: queueNum,
-        reportType: "asset_issue",
-        source: "staff_report",
-        title: `${symptomType} - ${asset.assetName}`,
-        assetId: asset.id,
-        assetName: asset.assetName,
-        assetCode: asset.assetCode,
-        assetCategory: asset.categoryName || "",
-        assetLocation: asset.locationText || asset.location || "",
-        locationId: asset.locationId || asset.areaId || asset.roomId || asset.floorId || asset.buildingId || "",
-        buildingId: asset.buildingId || null,
-        floorId: asset.floorId || null,
-        roomId: asset.roomId || null,
-        areaId: asset.areaId || null,
-        buildingName: asset.buildingName || "",
-        floorName: asset.floor || "",
-        roomName: asset.roomName || "",
-        areaName: asset.areaName || "",
-        locationText: asset.locationText || asset.location || "",
-        reportedByUid: assetUser?.uid || "",
-        reportedByName: assetUser?.name || "",
-        reportedByEmail: assetUser?.email || "",
-        reportedAt: serverTimestamp(),
-        createdByUid: assetUser?.uid || "",
-        createdByName: assetUser?.name || "",
-        createdByEmail: assetUser?.email || "",
-        symptomType,
-        impactLevel,
-        description: description.trim(),
-        attachmentUrls,
-        attachmentFiles,
-        photoUrls: attachmentUrls,
-        priority,
-        status: "reported",
-        statusLabel: "Laporan Masuk",
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-        updatedByUid: assetUser?.uid || "",
-        updatedByName: assetUser?.name || "",
+      console.log("[Asset Issue Report] SUCCESS prepare attachment");
+    } catch (error) {
+      console.error("[Asset Issue Report Submit Error] FAILED prepare attachment", {
+        assetId: asset?.id,
+        assetCode: asset?.assetCode,
+        errorCode: (error as { code?: string })?.code,
+        errorMessage: (error as { message?: string })?.message,
+        errorName: (error as { name?: string })?.name,
       });
+      setError("Gagal mengunggah lampiran. Coba lagi atau kirim tanpa lampiran.");
+      setSubmitting(false);
+      return;
+    }
 
+    // Section C — generateTicketNumber/generateQueueNumber query COLLECTION
+    // asset_issue_tickets tanpa filter kepemilikan untuk hitung nomor urut.
+    // Untuk staff biasa ini BISA permission-denied (rules asset_issue_tickets
+    // membatasi baca ke tiket sendiri) — jangan sampai itu menggagalkan
+    // seluruh laporan, fallback ke nomor berbasis waktu.
+    let ticketNum = "";
+    let queueNum = "";
+    try {
+      ticketNum = await generateTicketNumber();
+      queueNum = await generateQueueNumber();
+    } catch (error) {
+      console.warn("[Asset Issue Report] gagal generate nomor tiket, memakai fallback", {
+        errorCode: (error as { code?: string })?.code,
+        errorMessage: (error as { message?: string })?.message,
+      });
+      const fallbackSuffix = Date.now();
+      ticketNum = `TKT-${new Date().getFullYear()}-${fallbackSuffix}`;
+      queueNum = `Q-${fallbackSuffix}`;
+    }
+
+    const priority = IMPACT_TO_PRIORITY[impactLevel];
+    const locationText =
+      asset.locationText ||
+      asset.location ||
+      [asset.buildingName, asset.floor, asset.roomName, asset.areaName].filter(Boolean).join(" / ") ||
+      "-";
+    const locationId =
+      asset.locationId || asset.areaId || asset.roomId || asset.floorId || asset.buildingId || "asset-location";
+
+    const ticketPayload = {
+      ticketNumber: ticketNum,
+      queueNumber: queueNum,
+      reportType: "asset_issue",
+      source: "staff_report" as const,
+      title: `${symptomType} - ${asset.assetName}`,
+      assetId: asset.id,
+      assetName: asset.assetName,
+      assetCode: asset.assetCode,
+      assetCategory: asset.categoryName || "",
+      assetLocation: locationText,
+      locationId,
+      buildingId: asset.buildingId || null,
+      floorId: asset.floorId || null,
+      roomId: asset.roomId || null,
+      areaId: asset.areaId || null,
+      buildingName: asset.buildingName || "",
+      floorName: asset.floor || "",
+      roomName: asset.roomName || "",
+      areaName: asset.areaName || "",
+      locationText,
+      reportedByUid: userUid,
+      reportedByName: currentUserName,
+      reportedByEmail: userEmail,
+      reportedAt: serverTimestamp(),
+      createdByUid: userUid,
+      createdByName: currentUserName,
+      createdByEmail: userEmail,
+      symptomType,
+      impactLevel,
+      description: description.trim(),
+      attachmentUrls,
+      attachmentFiles,
+      photoUrls: attachmentUrls,
+      priority,
+      status: "reported" as const,
+      statusLabel: "Laporan Masuk",
+      staffStatusLabel: "Laporan Dikirim",
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      updatedByUid: userUid,
+      updatedByName: currentUserName,
+    };
+
+    // Section A/B/E — INI SATU-SATUNYA langkah yang boleh menggagalkan
+    // submit. Ticket + kondisi sementara asset ("Dilaporkan Bermasalah")
+    // ditulis dalam SATU writeBatch supaya tidak ada kondisi asset yang
+    // "nyangkut" tanpa tiket, atau sebaliknya. Log/notifikasi di bawah
+    // bersifat best-effort (try/catch masing-masing) supaya kegagalannya
+    // TIDAK membuat laporan yang sudah tersimpan malah dilaporkan gagal.
+    const ticketRef = doc(collection(db, "asset_issue_tickets"));
+    const assetIssuePayload = {
+      hasActiveIssue: true,
+      activeIssueTicketId: ticketRef.id,
+      activeIssueTicketNo: ticketNum,
+
+      condition: "reported_issue" as const,
+      conditionLabel: "Dilaporkan Bermasalah",
+
+      // Section A — kalau asset KEBETULAN sudah "reported_issue" (mis. laporan
+      // kedua sebelum yang pertama selesai direview), jangan snapshot
+      // "reported_issue" itu sendiri sebagai previousCondition — pakai yang
+      // sudah tersimpan sebelumnya, supaya nanti tetap bisa dikembalikan ke
+      // kondisi asli.
+      previousCondition:
+        asset.condition && asset.condition !== "reported_issue" ? asset.condition : asset.previousCondition || "good",
+      previousConditionLabel:
+        asset.conditionLabel && asset.conditionLabel !== "Dilaporkan Bermasalah"
+          ? asset.conditionLabel
+          : asset.previousConditionLabel || "Baik",
+
+      issueReportedAt: serverTimestamp(),
+      issueReportedByUid: userUid,
+      issueReportedByName: currentUserName,
+
+      lastIssueSymptomLabel: symptomType || "",
+      lastIssueNote: description.trim(),
+      lastIssueImpactLabel: impactLevel || "Sedang",
+
+      updatedAt: serverTimestamp(),
+      updatedByUid: userUid,
+      updatedByName: currentUserName,
+    };
+    try {
+      console.log("[Asset Issue Report] START create ticket + update asset condition", {
+        assetId: asset.id,
+        assetCode: asset.assetCode,
+        userUid,
+        ticketPayloadKeys: Object.keys(ticketPayload),
+        assetPayloadKeys: Object.keys(assetIssuePayload),
+      });
+      const batch = writeBatch(db);
+      batch.set(ticketRef, ticketPayload);
+      batch.update(doc(db, "assets", asset.id), assetIssuePayload);
+      await batch.commit();
+      console.log("[Asset Issue Report] SUCCESS create ticket + update asset condition", ticketRef.id);
+
+      // Section B — verifikasi TERBACA (bukan cuma "commit tidak error"),
+      // supaya kalau ada rules/cache aneh, langsung ketahuan dari log.
+      const updatedAssetSnap = await getDoc(doc(db, "assets", asset.id));
+      console.log("[Asset Issue Submit] VERIFY asset condition", {
+        assetId: asset.id,
+        assetCode: asset.assetCode,
+        hasActiveIssue: updatedAssetSnap.data()?.hasActiveIssue,
+        condition: updatedAssetSnap.data()?.condition,
+        conditionLabel: updatedAssetSnap.data()?.conditionLabel,
+        activeIssueTicketId: updatedAssetSnap.data()?.activeIssueTicketId,
+        activeIssueTicketNo: updatedAssetSnap.data()?.activeIssueTicketNo,
+      });
+    } catch (error) {
+      console.error("[Asset Issue Report Submit Error]", {
+        assetId: asset?.id,
+        assetCode: asset?.assetCode,
+        assetName: asset?.assetName,
+
+        userUid,
+        userEmail,
+
+        payloadKeys: Object.keys(ticketPayload || {}),
+        requiredFields: {
+          createdByUid: ticketPayload.createdByUid,
+          reportType: ticketPayload.reportType,
+          title: ticketPayload.title,
+          description: ticketPayload.description,
+          locationId: ticketPayload.locationId,
+          locationText: ticketPayload.locationText,
+          status: ticketPayload.status,
+        },
+
+        errorCode: (error as { code?: string })?.code,
+        errorMessage: (error as { message?: string })?.message,
+        errorName: (error as { name?: string })?.name,
+        rawError:
+          error instanceof Error
+            ? { name: error.name, message: error.message, stack: error.stack }
+            : error,
+      });
+      setError(
+        (error as { code?: string })?.code === "permission-denied"
+          ? "Laporan belum bisa dikirim karena izin data belum sesuai. Cek field laporan atau rules."
+          : "Gagal mengirim laporan. Coba lagi."
+      );
+      setSubmitting(false);
+      return;
+    }
+
+    try {
       await writeAssetIssueLog({
         ticketId: ticketRef.id,
         ticketNumber: ticketNum,
         action: "create_ticket",
         newStatus: "reported",
         note: "Laporan kendala dibuat dari Scan QR",
-        performedByUid: assetUser?.uid || "",
-        performedByName: assetUser?.name || "",
+        performedByUid: userUid,
+        performedByName: currentUserName,
       });
+    } catch (err) {
+      console.warn("[Asset Issue Report] gagal membuat log tiket (non-fatal)", ticketRef.id, err);
+    }
 
-      // Section I — badge notifikasi tab Laporan Kendala Staff: tandai
-      // BELUM DIBACA untuk semua QHSE/Admin aktif (best-effort).
+    // Section D — laporan masuk ke QHSE/Admin dulu (BUKAN Tim IT): badge
+    // unread + notifikasi cuma untuk asset_admin/super_admin.
+    try {
       const qhseUsers = await fetchActiveUsersByRoles(["asset_admin", "super_admin"]);
+
       updateDoc(doc(db, "asset_issue_tickets", ticketRef.id), {
         unreadByUids: qhseUsers.map((u) => u.uid),
-      }).catch((err) => console.warn("[Report Issue] gagal set unreadByUids", err));
+      }).catch((err) => console.warn("[Report Issue] gagal set unreadByUids (non-fatal)", err));
 
-      const assetAdmins = await fetchActiveUsersByRole("asset_admin");
       await Promise.all(
-        assetAdmins.map((admin) =>
+        qhseUsers.map((qhse) =>
           createAssetNotification({
-            recipientUid: admin.uid,
-            recipientName: admin.name,
-            recipientRole: "asset_admin",
-            title: "Ticket Kendala Baru",
-            message: `${asset.assetName} dilaporkan: ${symptomType}`,
+            recipientUid: qhse.uid,
+            recipientName: qhse.name || qhse.email,
+            recipientRole: qhse.role,
+            title: "Laporan Kendala Baru",
+            message: `${currentUserName} melaporkan kendala pada ${asset.assetName}.`,
             type: "ticket_created",
             priority,
             linkUrl: `/maintenance?tab=staff-reports&ticketId=${ticketRef.id}`,
             relatedType: "ticket",
             relatedId: ticketRef.id,
             relatedNumber: ticketNum,
-            createdByUid: assetUser?.uid,
-            createdByName: assetUser?.name,
+            createdByUid: userUid,
+            createdByName: currentUserName,
           })
         )
       );
-
-      setTicketNumber(ticketNum);
     } catch (err) {
-      console.error("[Report Issue] gagal submit", err);
-      setError("Gagal mengirim laporan. Coba lagi.");
-    } finally {
-      setSubmitting(false);
+      console.warn("[Asset Issue Report] gagal kirim notifikasi QHSE (non-fatal)", ticketRef.id, err);
     }
+
+    setTicketNumber(ticketNum);
+    setSubmitting(false);
   };
 
   return (

@@ -42,12 +42,12 @@ import {
   ASSET_STATUS_LABEL,
   ASSET_USAGE_STATUS_COLOR,
   TRACKING_MODE_LABEL,
-  CONDITION_LABEL,
   extractAssetCodeFromQr,
   isVCardOrContactQr,
   formatDate,
   formatDateTime,
   formatExpectedReturn,
+  getAssetConditionLabel,
   isBorrowingLate,
 } from "@/lib/utils";
 import { handoverTemporary, returnToCustodian } from "@/lib/custodian-actions";
@@ -1098,10 +1098,12 @@ function ScanPageContent() {
                 <Badge label={TRACKING_MODE_LABEL.fixed_location} colorClass="bg-slate-100 text-slate-600 border-slate-200" />
               </div>
 
+              <AssetIssueWarningCard asset={asset} />
+
               <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-sm bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-3">
                 <Info label="Lokasi" value={asset.locationText || asset.location} />
                 <Info label="PIC Lokasi" value={getPersonDisplayName(custodianPersonRef(asset), employeeMap)} />
-                <Info label="Kondisi" value={CONDITION_LABEL[asset.condition]} />
+                <Info label="Kondisi" value={getAssetConditionLabel(asset)} />
                 <Info label="Status Maintenance" value={ASSET_STATUS_LABEL[asset.assetStatus]} />
               </div>
 
@@ -1152,6 +1154,8 @@ function ScanPageContent() {
                 <Badge label={getUsagePanel(asset).badge} colorClass={getUsagePanel(asset).colorClass} />
               </div>
 
+              <AssetIssueWarningCard asset={asset} />
+
               {/* Status pemakaian — section G: pesan singkat + lokasi/tanggal
                   supaya jelas tanpa perlu buka detail. */}
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 space-y-1">
@@ -1175,11 +1179,13 @@ function ScanPageContent() {
                 )}
               </div>
 
+              <AssetIssueWarningCard asset={asset} />
+
               <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-sm bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-3">
                 <Info label="Kategori" value={asset.categoryName} />
                 <Info label="Merk" value={asset.brand} />
                 <Info label="Lokasi" value={asset.locationText || asset.location} />
-                <Info label="Kondisi" value={CONDITION_LABEL[asset.condition]} />
+                <Info label="Kondisi" value={getAssetConditionLabel(asset)} />
                 <Info label="PIC / Custodian" value={getPersonDisplayName(custodianPersonRef(asset), employeeMap)} />
                 <Info label="Dipakai oleh" value={getPersonDisplayName(holderPersonRef(asset), employeeMap)} />
                 {asset.currentUsageStatus === "temporary_used_by_other" && (
@@ -1926,6 +1932,34 @@ function Info({ label, value }: { label: string; value?: string }) {
   );
 }
 
+// Section H/I — warning kendala aktif TERPISAH dari status pemakaian:
+// kondisi aset (Dilaporkan Bermasalah) dan status pemakaian (Sedang
+// Dipinjam/Bersama PIC/dst.) dua konsep beda, keduanya boleh tampil
+// bersamaan. Dipakai di panel hasil scan, modal detail aset, dan
+// asset-action.
+function AssetIssueWarningCard({
+  asset,
+}: {
+  asset: Pick<
+    Asset,
+    "hasActiveIssue" | "condition" | "activeIssueTicketNo" | "lastIssueSymptomLabel" | "lastIssueNote"
+  >;
+}) {
+  if (asset.hasActiveIssue !== true && asset.condition !== "reported_issue") return null;
+  return (
+    <div className="rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-amber-800">
+      <p className="font-semibold text-sm">Asset sedang dilaporkan bermasalah</p>
+      <p className="text-sm mt-0.5">
+        Laporan {asset.activeIssueTicketNo || "-"} sedang menunggu review QHSE.
+      </p>
+      {asset.lastIssueSymptomLabel && (
+        <p className="text-xs mt-1">Gejala: {asset.lastIssueSymptomLabel}</p>
+      )}
+      {asset.lastIssueNote && <p className="text-xs mt-0.5">Catatan: {asset.lastIssueNote}</p>}
+    </div>
+  );
+}
+
 // Label singkat untuk riwayat pemakaian (section H, item 13) — aksi custodian
 // dari writeAssetLog di custodian-actions.ts, fallback ke action mentah untuk
 // log lama/lain yang belum dikenal di sini.
@@ -2005,12 +2039,14 @@ function AssetQuickDetailModal({
         </div>
 
         <div className="px-5 py-4 space-y-4">
+          <AssetIssueWarningCard asset={asset} />
+
           <div>
             <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Informasi</h4>
             <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-sm">
               <Info label="Kategori" value={asset.categoryName} />
               <Info label="Merk / Model" value={[asset.brand, asset.model].filter(Boolean).join(" / ")} />
-              <Info label="Kondisi" value={CONDITION_LABEL[asset.condition]} />
+              <Info label="Kondisi" value={getAssetConditionLabel(asset)} />
               <Info label="Lokasi" value={asset.locationText || asset.location} />
             </div>
           </div>

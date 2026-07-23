@@ -149,6 +149,7 @@ export const CONDITION_LABEL: Record<AssetCondition, string> = {
   fair: "Cukup",
   minor_damage: "Rusak Ringan",
   heavy_damage: "Rusak Berat",
+  reported_issue: "Dilaporkan Bermasalah",
 };
 
 export const CONDITION_COLOR: Record<AssetCondition, string> = {
@@ -157,6 +158,7 @@ export const CONDITION_COLOR: Record<AssetCondition, string> = {
   fair: "bg-amber-50 text-amber-700 border-amber-200",
   minor_damage: "bg-orange-50 text-orange-700 border-orange-200",
   heavy_damage: "bg-red-50 text-red-700 border-red-200",
+  reported_issue: "bg-amber-50 text-amber-700 border-amber-200",
 };
 
 // Section A/B — "Kondisi Aset" TIDAK BOLEH menampilkan status pemakaian
@@ -180,14 +182,29 @@ const ASSET_STATUS_AS_CONDITION: AssetStatus[] = [
 ];
 const ASSET_STATUS_AS_USAGE: AssetStatus[] = ["available", "borrowed", "in_use"];
 
-export function getAssetConditionLabel(asset: Pick<Asset, "assetStatus" | "condition">): string {
+export function getAssetConditionLabel(
+  asset: Pick<Asset, "assetStatus" | "condition" | "hasActiveIssue" | "conditionLabel">
+): string {
+  // Section C/D — laporan kendala aktif SELALU didahulukan: walau field
+  // `condition` kebetulan masih "good"/kondisi lama, tampilan tidak boleh
+  // bilang "Baik" selama ada laporan yang belum divalidasi QHSE. Cek
+  // condition === "reported_issue" juga sebagai jaring pengaman kalau
+  // hasActiveIssue kebetulan belum/tidak ke-set di data lama.
+  if (asset.hasActiveIssue === true || asset.condition === "reported_issue") {
+    return asset.conditionLabel || CONDITION_LABEL.reported_issue;
+  }
   if (ASSET_STATUS_AS_CONDITION.includes(asset.assetStatus)) {
     return ASSET_STATUS_LABEL[asset.assetStatus];
   }
   return CONDITION_LABEL[asset.condition] || "Baik";
 }
 
-export function getAssetConditionColor(asset: Pick<Asset, "assetStatus" | "condition">): string {
+export function getAssetConditionColor(
+  asset: Pick<Asset, "assetStatus" | "condition" | "hasActiveIssue">
+): string {
+  if (asset.hasActiveIssue === true || asset.condition === "reported_issue") {
+    return CONDITION_COLOR.reported_issue;
+  }
   if (ASSET_STATUS_AS_CONDITION.includes(asset.assetStatus)) {
     return ASSET_STATUS_COLOR[asset.assetStatus];
   }

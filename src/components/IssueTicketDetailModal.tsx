@@ -5,6 +5,7 @@ import {
   addDoc,
   collection,
   doc,
+  getDoc,
   onSnapshot,
   orderBy,
   query,
@@ -48,6 +49,24 @@ import VendorCoordinationModal from "@/components/VendorCoordinationModal";
 
 const FIELD_IMPACT_OPTIONS: IssueSeverity[] = ["low", "medium", "high", "critical"];
 const HANDLING_PRIORITY_OPTIONS: HandlingPriority[] = ["normal", "soon", "urgent", "emergency"];
+
+// Section H — kondisi final yang boleh QHSE tetapkan saat menutup laporan.
+// Sengaja HANYA memakai field yang sudah ada di data model (condition/
+// assetStatus) — "Hilang"/"Tidak Layak Pakai" butuh nilai baru di field lain
+// yang belum ada konsumennya di aplikasi ini, jadi tidak dimasukkan di sini
+// supaya tidak menambah konsep kondisi yang tidak terhubung ke mana pun.
+type CloseConditionKey = "good" | "minor_damage" | "heavy_damage" | "maintenance";
+
+const CLOSE_CONDITION_OPTIONS: { key: CloseConditionKey; label: string }[] = [
+  { key: "good", label: "Kembali Baik" },
+  { key: "minor_damage", label: "Rusak Ringan" },
+  { key: "heavy_damage", label: "Rusak Berat" },
+  { key: "maintenance", label: "Maintenance" },
+];
+
+function closeConditionLabel(key: CloseConditionKey): string {
+  return CLOSE_CONDITION_OPTIONS.find((o) => o.key === key)?.label || "Baik";
+}
 
 function reportTypeLabel(ticket: AssetIssueTicket) {
   return ticket.reportType ? ISSUE_REPORT_TYPE_LABEL[ticket.reportType] : "Kendala Asset";
@@ -138,6 +157,8 @@ export default function IssueTicketDetailModal({
   const [showVendorModal, setShowVendorModal] = useState(false);
   const [noteInput, setNoteInput] = useState("");
   const [photoFiles, setPhotoFiles] = useState<File[]>([]);
+  // Section H/I — kondisi final aset yang dipilih QHSE saat "Tutup Laporan".
+  const [closeCondition, setCloseCondition] = useState<CloseConditionKey>("good");
 
   const [showImpactCorrection, setShowImpactCorrection] = useState(false);
   const [correctedImpact, setCorrectedImpact] = useState<IssueSeverity>("medium");
@@ -414,6 +435,64 @@ export default function IssueTicketDetailModal({
     });
   };
 
+  // Section H/I/J — begitu QHSE menutup/menolak/menduplikat/membatalkan
+  // laporan, kondisi SEMENTARA aset ("Dilaporkan Bermasalah") harus
+  // diselesaikan: kalau ditutup, pakai kondisi final yang QHSE pilih;
+  // kalau ditolak/duplikat/dibatalkan, kembalikan ke kondisi SEBELUM
+  // dilaporkan (previousCondition). Best-effort (non-fatal) — status ticket
+  // sudah berhasil berubah terlepas dari ini berhasil atau tidak, dan di-
+  // guard oleh activeIssueTicketId supaya tidak menimpa laporan LAIN yang
+  // kebetulan lebih baru untuk aset yang sama.
+  const syncAssetConditionAfterAction = async (action: IssueActionDef) => {
+    if (!ticket.assetId) return;
+    const isClose = action.key === "close";
+    const isRevert = action.key === "reject" || action.key === "duplicate" || action.key === "cancel";
+    if (!isClose && !isRevert) return;
+
+    const assetRef = doc(db, "assets", ticket.assetId);
+    const assetSnap = await getDoc(assetRef);
+    if (!assetSnap.exists()) return;
+    const assetData = assetSnap.data();
+    if (assetData.activeIssueTicketId !== ticket.id) return;
+
+    if (isClose) {
+      await updateDoc(assetRef, {
+        hasActiveIssue: false,
+        activeIssueTicketId: null,
+        activeIssueTicketNo: null,
+        condition: closeCondition,
+        conditionLabel: closeConditionLabel(closeCondition),
+        previousCondition: null,
+        previousConditionLabel: null,
+        conditionReviewedAt: serverTimestamp(),
+        conditionReviewedByUid: currentUid || "",
+        conditionReviewedByName: currentName,
+        issueResolvedAt: serverTimestamp(),
+        issueResolvedByUid: currentUid || "",
+        issueResolvedByName: currentName,
+        updatedAt: serverTimestamp(),
+        updatedByUid: currentUid || "",
+        updatedByName: currentName,
+      });
+    } else {
+      await updateDoc(assetRef, {
+        hasActiveIssue: false,
+        activeIssueTicketId: null,
+        activeIssueTicketNo: null,
+        condition: assetData.previousCondition || "good",
+        conditionLabel: assetData.previousConditionLabel || "Baik",
+        previousCondition: null,
+        previousConditionLabel: null,
+        issueResolvedAt: serverTimestamp(),
+        issueResolvedByUid: currentUid || "",
+        issueResolvedByName: currentName,
+        updatedAt: serverTimestamp(),
+        updatedByUid: currentUid || "",
+        updatedByName: currentName,
+      });
+    }
+  };
+
   const runAction = async (action: IssueActionDef) => {
     if (action.requiresNote && !noteInput.trim()) {
       setError("Catatan wajib diisi untuk aksi ini.");
@@ -512,6 +591,16 @@ export default function IssueTicketDetailModal({
       console.log("[IssueTicketDetailModal Action Debug] SUCCESS notify");
     } catch (notificationError) {
       console.warn("[IssueTicketDetailModal] gagal membuat notifikasi, update ticket tetap berhasil", notificationError);
+    }
+
+    try {
+      await syncAssetConditionAfterAction(action);
+      console.log("[IssueTicketDetailModal Action Debug] SUCCESS sync asset condition");
+    } catch (conditionError) {
+      console.warn(
+        "[IssueTicketDetailModal] gagal sinkronkan kondisi aset, update ticket tetap berhasil",
+        conditionError
+      );
     }
   };
 
@@ -1041,9 +1130,29 @@ export default function IssueTicketDetailModal({
                           <p className="text-xs text-slate-500">Apakah kendala ini sudah selesai/normal di lapangan?</p>
                         )}
                         {pendingAction.key === "close" && (
-                          <p className="text-xs text-slate-500">
-                            Pelapor sudah mengonfirmasi kendala selesai. Setelah ditutup, laporan akan masuk ke riwayat.
-                          </p>
+                          <>
+                            <p className="text-xs text-slate-500">
+                              Pelapor sudah mengonfirmasi kendala selesai. Setelah ditutup, laporan akan masuk ke riwayat.
+                            </p>
+                            {ticket.assetId && (
+                              <div>
+                                <label className="mb-1.5 block text-xs font-medium text-slate-500">
+                                  Kondisi Asset Setelah Review
+                                </label>
+                                <select
+                                  value={closeCondition}
+                                  onChange={(e) => setCloseCondition(e.target.value as CloseConditionKey)}
+                                  className="input cursor-pointer"
+                                >
+                                  {CLOSE_CONDITION_OPTIONS.map((opt) => (
+                                    <option key={opt.key} value={opt.key}>
+                                      {opt.label}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            )}
+                          </>
                         )}
                         <div>
                           <label className="mb-1.5 block text-xs font-medium text-slate-500">

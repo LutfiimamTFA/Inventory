@@ -160,14 +160,14 @@ export default function NewStaffReportPage() {
     const priority = SEVERITY_TO_PRIORITY[severity];
     const impactLevel = SEVERITY_TO_IMPACT[severity];
 
-    // Upload lampiran dan nomor laporan dulu — kalau ini gagal, belum ada
-    // dokumen ticket yang dibuat sama sekali, jadi aman ditampilkan sebagai
-    // "gagal submit" biasa.
-    let ticketNumber = "";
-    let queueNumber = "";
+    // Section A/B — lampiran dan nomor laporan dipisah jadi try/catch
+    // SENDIRI-SENDIRI (bukan satu blok gabungan) supaya log error selalu
+    // jelas menyebut step mana yang gagal, bukan cuma "gagal menyiapkan
+    // lampiran/nomor laporan" yang menyamarkan penyebab aslinya.
     let attachmentUrls: string[] = [];
     let attachmentFiles: string[] = [];
     try {
+      console.log("[NewStaffReportPage] START prepare attachments", { fileCount: files.length });
       const uploadedFiles = await Promise.all(
         files.map((file) =>
           uploadToDrive(file, "issue_attachment", {
@@ -178,13 +178,54 @@ export default function NewStaffReportPage() {
       );
       attachmentUrls = uploadedFiles.map((file) => file.url);
       attachmentFiles = uploadedFiles.map((file) => file.fileName);
-      ticketNumber = await generateTicketNumber();
-      queueNumber = await generateQueueNumber();
-    } catch (prepError) {
-      console.error("[NewStaffReportPage] gagal menyiapkan lampiran/nomor laporan", prepError);
-      setError("Gagal mengirim laporan. Coba lagi.");
+      console.log("[NewStaffReportPage] SUCCESS prepare attachments", {
+        count: attachmentUrls.length,
+      });
+    } catch (error) {
+      console.error("[NewStaffReportPage] FAILED prepare attachments", {
+        step: "storage/upload",
+        errorCode: (error as { code?: string })?.code,
+        errorMessage: (error as { message?: string })?.message,
+        errorName: (error as { name?: string })?.name,
+        rawError:
+          error instanceof Error
+            ? { name: error.name, message: error.message, stack: error.stack }
+            : error,
+      });
+      setError("Gagal mengunggah lampiran. Coba lagi atau kirim tanpa lampiran.");
       setSubmitting(false);
       return;
+    }
+
+    // Section C — generateTicketNumber/generateQueueNumber query COLLECTION
+    // asset_issue_tickets (bukan asset_counters — collection itu tidak ada
+    // di app ini) untuk hitung nomor urut. Untuk staff biasa, query "list"
+    // tanpa filter kepemilikan ini SELALU permission-denied karena rules
+    // asset_issue_tickets membatasi baca ke tiket miliknya sendiri (Firestore
+    // menolak SELURUH query kalau ada satu saja dokumen hasil yang gagal
+    // rules, bukan cuma memfilter diam-diam). Ini BUKAN bug rules — jangan
+    // dilonggarkan (lihat catatan "Rules tetap aman") — cukup fallback ke
+    // nomor berbasis waktu supaya staff tetap bisa submit laporan.
+    let ticketNumber = "";
+    let queueNumber = "";
+    try {
+      console.log("[NewStaffReportPage] START generate report number");
+      ticketNumber = await generateTicketNumber();
+      queueNumber = await generateQueueNumber();
+      console.log("[NewStaffReportPage] SUCCESS generate report number", {
+        ticketNumber,
+        queueNumber,
+      });
+    } catch (error) {
+      console.warn("[NewStaffReportPage] FAILED generate report number, memakai fallback", {
+        step: "asset_issue_tickets (counter query)",
+        errorCode: (error as { code?: string })?.code,
+        errorMessage: (error as { message?: string })?.message,
+        errorName: (error as { name?: string })?.name,
+      });
+      const fallbackSuffix = Date.now();
+      ticketNumber = `TKT-${new Date().getFullYear()}-${fallbackSuffix}`;
+      queueNumber = `Q-${fallbackSuffix}`;
     }
 
     const ticketPayload = cleanFirestoreData({

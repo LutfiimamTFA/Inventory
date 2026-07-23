@@ -756,6 +756,36 @@ export default function AssetDetailPage() {
             </div>
           </Section>
 
+          {/* Section G — laporan kendala aktif: hanya info ringkas + link ke
+              modal detail tiket di Maintenance & Kendala, bukan duplikasi
+              seluruh alur review QHSE di halaman ini. */}
+          {asset.hasActiveIssue && (
+            <Section title="Laporan Kendala Aktif">
+              <div className="flex flex-col gap-1.5 text-sm">
+                <p>
+                  Nomor laporan:{" "}
+                  <span className="font-medium text-slate-800">{asset.activeIssueTicketNo || "-"}</span>
+                </p>
+                <p className="text-slate-500">
+                  Dilaporkan oleh: <span className="text-slate-800">{asset.issueReportedByName || "-"}</span>
+                </p>
+                {asset.issueReportedAt ? (
+                  <p className="text-xs text-slate-400">
+                    Waktu laporan: {formatDate(asset.issueReportedAt)}
+                  </p>
+                ) : null}
+                {asset.activeIssueTicketId && (
+                  <Link
+                    href={`/maintenance?tab=staff-reports&ticketId=${asset.activeIssueTicketId}`}
+                    className="mt-1 inline-flex w-fit items-center rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100"
+                  >
+                    Buka Laporan
+                  </Link>
+                )}
+              </div>
+            </Section>
+          )}
+
           {isFixedLocationAsset ? (
             <Section title="Penempatan Aset">
               <div className="flex flex-col gap-2.5">

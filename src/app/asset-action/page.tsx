@@ -21,8 +21,8 @@ import { repairBrokenBorrowState } from "@/lib/borrow-actions";
 import {
   ASSET_STATUS_COLOR,
   ASSET_STATUS_LABEL,
-  CONDITION_LABEL,
   TRACKING_MODE_LABEL,
+  getAssetConditionLabel,
   hasBrokenBorrowState,
   isBorrowedByMe,
   isBorrowedByOther,
@@ -258,9 +258,22 @@ function AssetActionContent() {
             <Badge label={ASSET_STATUS_LABEL[asset.assetStatus]} colorClass={ASSET_STATUS_COLOR[asset.assetStatus]} />
           </div>
 
+          {(asset.hasActiveIssue === true || asset.condition === "reported_issue") && (
+            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-amber-800">
+              <p className="font-semibold text-sm">Asset sedang dilaporkan bermasalah</p>
+              <p className="text-sm mt-0.5">
+                Laporan {asset.activeIssueTicketNo || "-"} sedang menunggu review QHSE.
+              </p>
+              {asset.lastIssueSymptomLabel && (
+                <p className="text-xs mt-1">Gejala: {asset.lastIssueSymptomLabel}</p>
+              )}
+              {asset.lastIssueNote && <p className="text-xs mt-0.5">Catatan: {asset.lastIssueNote}</p>}
+            </div>
+          )}
+
           <div className="mt-4 space-y-2 text-sm text-slate-600">
             <Row label="Lokasi" value={asset.location || asset.locationText || "-"} />
-            <Row label="Kondisi" value={CONDITION_LABEL[asset.condition]} />
+            <Row label="Kondisi" value={getAssetConditionLabel(asset)} />
             {asset.areaPicName && <Row label="PIC Operasional" value={asset.areaPicName} />}
             {!isFixedLocation && (
               <Row label="Pemegang Saat Ini" value={holderName || "Belum tercatat"} />
