@@ -29,13 +29,18 @@ import { useAuth } from "@/lib/auth-context";
 import { AppRole } from "@/lib/types";
 import { getDefaultRouteForRole, ROLE_LABEL } from "@/lib/roles";
 import NotificationBell from "@/components/NotificationBell";
-import PasskeyActivationPrompt from "@/components/PasskeyActivationPrompt";
 
 interface NavItem {
   href: string;
   label: string;
   icon: React.ComponentType<{ size?: number; className?: string }>;
   roles: AppRole[];
+  // Section D — item tetap tampil untuk role di luar `roles` di atas kalau
+  // user adalah PIC Lokasi (role "location_pic" ATAU staff/role lain yang
+  // ditunjuk PIC di Master Lokasi — lihat isLocationPicRole di
+  // auth-context). Dipakai khusus "Assets" supaya staff+PIC dapat menu ini
+  // tanpa perlu diberi role "location_pic" secara literal.
+  picBucketAllowed?: boolean;
 }
 
 const NAV_ITEMS: NavItem[] = [
@@ -50,6 +55,7 @@ const NAV_ITEMS: NavItem[] = [
     label: "Assets",
     icon: Package,
     roles: ["super_admin", "asset_admin", "asset_finance", "location_pic"],
+    picBucketAllowed: true,
   },
   {
     href: "/categories",
@@ -121,7 +127,10 @@ const NAV_ITEMS: NavItem[] = [
     href: "/settings",
     label: "Settings",
     icon: Settings,
-    roles: ["super_admin", "asset_admin", "asset_finance", "location_pic", "it_team", "staff"],
+    // Section D/J — Settings HANYA untuk Super Admin. Sebelumnya semua role
+    // bisa lihat menu ini padahal isinya cuma pesan "akses terbatas" untuk
+    // non-super-admin — membingungkan, bukan berguna.
+    roles: ["super_admin"],
   },
 ];
 
@@ -139,7 +148,7 @@ function initials(name: string) {
 }
 
 export default function ProtectedLayout({ children }: { children: ReactNode }) {
-  const { firebaseUser, assetUser, role, loading, accessDenied, logout } =
+  const { firebaseUser, assetUser, role, loading, accessDenied, isLocationPicRole, logout } =
     useAuth();
   const router = useRouter();
   const pathname = usePathname();
@@ -168,18 +177,25 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
     }
   }, [loading, firebaseUser, accessDenied, router]);
 
+  // Section C/I — PIC Lokasi lewat Master Lokasi (assignedPicLocations)
+  // dianggap sama seperti role "location_pic" literal untuk keperluan
+  // sidebar/route guard, TANPA mengubah role backend user (tetap "staff").
+  const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
+
   useEffect(() => {
     if (loading || !role) return;
     // /notifications diakses lewat lonceng topbar, bukan lewat sidebar, tapi
     // tetap harus lolos guard untuk semua role yang sudah login.
     if (pathname.startsWith("/notifications")) return;
     const allowed = NAV_ITEMS.some(
-      (item) => item.roles.includes(role) && pathname.startsWith(item.href)
+      (item) =>
+        (item.roles.includes(role) || (item.picBucketAllowed && isLocationPicScoped)) &&
+        pathname.startsWith(item.href)
     );
     if (!allowed) {
       router.replace(getDefaultRouteForRole(role));
     }
-  }, [loading, role, pathname, router]);
+  }, [loading, role, pathname, router, isLocationPicScoped]);
 
   if (loading || !firebaseUser || !assetUser || !role) {
     return (
@@ -192,7 +208,9 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
     );
   }
 
-  const visibleNav = NAV_ITEMS.filter((item) => item.roles.includes(role));
+  const visibleNav = NAV_ITEMS.filter(
+    (item) => item.roles.includes(role) || (item.picBucketAllowed && isLocationPicScoped)
+  );
   const currentNav = visibleNav.find((item) => pathname.startsWith(item.href));
   const isStaff = role === "staff";
 
@@ -341,8 +359,6 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
           {children}
         </TopbarAndMain>
       </div>
-
-      <PasskeyActivationPrompt />
 
       {isStaff && (
         <nav className="fixed bottom-0 inset-x-0 z-30 md:hidden bg-white border-t border-slate-200 flex items-stretch">

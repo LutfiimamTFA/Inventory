@@ -25,7 +25,12 @@ import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { Asset, AssetIssueTicket, AssetLocationNode, LocationType, MaintenanceWorkOrder } from "@/lib/types";
 import { countAssetsAtLocation, getChildren, LOCATION_TYPE_LABEL } from "@/lib/locations";
-import { EmployeeOption, fetchActiveEmployeeOptions, writeLocationPicLog } from "@/lib/firestore-helpers";
+import {
+  backfillAreaPicForLocationSubtree,
+  EmployeeOption,
+  fetchActiveEmployeeOptions,
+  writeLocationPicLog,
+} from "@/lib/firestore-helpers";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
 import EmptyState from "@/components/EmptyState";
@@ -231,7 +236,28 @@ export default function LocationsPage() {
         createdByUid: assetUser.uid,
         createdByName: assetUser.name,
       });
-      setToast({ type: "success", message: "PIC Lokasi berhasil ditetapkan." });
+
+      // Section J — backfill asset yang SUDAH ADA di lokasi ini (dan
+      // turunannya) supaya PIC baru langsung bisa lihat/kelola aset tanpa
+      // menunggu asetnya diedit ulang satu-satu. `locations` di-patch manual
+      // dulu karena listener asset_locations belum tentu keburu refresh.
+      const patchedLocations = locations.map((n) =>
+        n.id === picModalNode.id
+          ? { ...n, picUid: selected.uid, picName: selected.name, picEmail: selected.email }
+          : n
+      );
+      const updatedAssetCount = await backfillAreaPicForLocationSubtree({
+        locations: patchedLocations,
+        locationId: picModalNode.id,
+      });
+
+      setToast({
+        type: "success",
+        message:
+          updatedAssetCount > 0
+            ? `PIC Lokasi berhasil ditetapkan. ${updatedAssetCount} asset diperbarui.`
+            : "PIC Lokasi berhasil ditetapkan.",
+      });
       setPicModalNode(null);
     } catch (err) {
       console.error("[LocationsPage] gagal menetapkan PIC lokasi", err);
@@ -267,7 +293,25 @@ export default function LocationsPage() {
         createdByUid: assetUser.uid,
         createdByName: assetUser.name,
       });
-      setToast({ type: "success", message: "PIC Lokasi berhasil dihapus." });
+
+      // Section J — recompute PIC asset di subtree ini (bisa jatuh ke PIC
+      // level di atasnya lewat cascade resolveAreaPic, atau null kalau tidak
+      // ada PIC lain di atasnya).
+      const patchedLocations = locations.map((n) =>
+        n.id === removePicNode.id ? { ...n, picUid: null, picName: null, picEmail: null } : n
+      );
+      const updatedAssetCount = await backfillAreaPicForLocationSubtree({
+        locations: patchedLocations,
+        locationId: removePicNode.id,
+      });
+
+      setToast({
+        type: "success",
+        message:
+          updatedAssetCount > 0
+            ? `PIC Lokasi berhasil dihapus. ${updatedAssetCount} asset diperbarui.`
+            : "PIC Lokasi berhasil dihapus.",
+      });
       setRemovePicNode(null);
     } catch (err) {
       console.error("[LocationsPage] gagal menghapus PIC lokasi", err);
@@ -907,6 +951,14 @@ function DetailPanel({
                   {(selectedNode.picDivision || selectedNode.picRole) && (
                     <p className="text-xs text-slate-500">
                       {[selectedNode.picDivision, selectedNode.picRole].filter(Boolean).join(" — ")}
+                    </p>
+                  )}
+                  {/* Section M — UID kecil untuk memastikan PIC yang dipilih
+                      di sini sama dengan akun yang login (debug akses PIC
+                      Lokasi), tanpa perlu buka Firestore console. */}
+                  {process.env.NODE_ENV !== "production" && (
+                    <p className="mt-0.5 font-mono text-[10px] text-slate-400">
+                      PIC UID: {selectedNode.picUid}
                     </p>
                   )}
                 </>

@@ -5,6 +5,7 @@ import { QRCodeSVG } from "qrcode.react";
 import { Download, Printer, X, ChevronLeft, ChevronRight } from "lucide-react";
 import { toPng } from "html-to-image";
 import { Asset } from "@/lib/types";
+import { getAppBaseUrl, getAssetActionUrl, getQrDomainNotice } from "@/lib/utils";
 
 const LABEL_SIZES = {
   "50x30": { label: "50mm x 30mm", width: 50, height: 30 },
@@ -86,7 +87,9 @@ function BulkLabelCell({
   borderWidth?: number;
   borderRadius?: number;
 }) {
-  const qrValue = asset.qrCodeValue || asset.assetCode || asset.id;
+  // Section C — sama seperti QrLabelModal: QR berisi URL /asset-action
+  // penuh, bukan lagi kode asset polos.
+  const qrValue = getAssetActionUrl(asset.assetCode || asset.qrCodeValue || asset.id);
   return (
     <div
       className="border border-dashed border-slate-300 rounded flex items-center justify-center overflow-hidden"
@@ -316,6 +319,24 @@ export default function BulkQrLabelModal({
             <X size={18} />
           </button>
         </div>
+
+        {/* Section D — info domain QR, sama seperti QrLabelModal. */}
+        {(() => {
+          const domainNotice = getQrDomainNotice(getAppBaseUrl());
+          return (
+            <div
+              className={`mx-6 mb-3 rounded-xl border px-3 py-2 text-xs no-print ${
+                domainNotice.tone === "success"
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                  : domainNotice.tone === "warning"
+                  ? "border-amber-200 bg-amber-50 text-amber-700"
+                  : "border-blue-200 bg-blue-50 text-blue-700"
+              }`}
+            >
+              {domainNotice.message}
+            </div>
+          );
+        })()}
 
         <div className="grid md:grid-cols-2 gap-6 px-6 pb-6">
           {/* Kiri: preview */}

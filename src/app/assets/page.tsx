@@ -19,6 +19,7 @@ import {
   Pencil,
   Power,
   Package,
+  MapPin,
 } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
@@ -30,6 +31,7 @@ import {
   formatCurrency,
 } from "@/lib/utils";
 import { writeAssetLog } from "@/lib/firestore-helpers";
+import { isAssetInMyPicLocation } from "@/lib/locations";
 import {
   formatRupiah,
   getAssetPrice,
@@ -50,8 +52,12 @@ import QrLabelModal from "@/components/QrLabelModal";
 import BulkQrLabelModal from "@/components/BulkQrLabelModal";
 
 export default function AssetsPage() {
-  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const { firebaseUser, assetUser, role, loading, isLocationPicRole, assignedPicLocations } = useAuth();
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
+  // Section C — staff yang ditunjuk PIC di Master Lokasi (isLocationPicRole
+  // dari auth-context) diperlakukan SAMA seperti role "location_pic"
+  // literal untuk seluruh halaman ini, tanpa mengubah role backend-nya.
+  const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
   const [assets, setAssets] = useState<Asset[]>([]);
   const [categories, setCategories] = useState<AssetCategory[]>([]);
   const [search, setSearch] = useState("");
@@ -74,11 +80,25 @@ export default function AssetsPage() {
   // Section C — PIC Lokasi boleh menambah/edit aset dasar (dikunci ke
   // lokasinya sendiri di form create/edit), TAPI TIDAK boleh nonaktifkan/
   // hapus aset atau pakai aksi bulk — itu tetap khusus canManage.
-  const canCreateOrEditAsset = canManage || role === "location_pic";
+  const canCreateOrEditAsset = canManage || isLocationPicScoped;
   // Section E — kolom "Nilai Asset" (harga beli) HANYA untuk Super
   // Admin/Asset Finance. Asset Admin/QHSE, Staff, Tim IT tidak boleh melihat
   // nominal harga sama sekali.
   const canViewFinance = role === "super_admin" || role === "asset_finance";
+
+  // Section M — debug sementara untuk memastikan staff yang ditunjuk PIC di
+  // Master Lokasi benar-benar terdeteksi di halaman Assets.
+  useEffect(() => {
+    if (!authReady) return;
+    console.log("[Location PIC Access Debug] /assets", {
+      uid: firebaseUser?.uid,
+      email: firebaseUser?.email,
+      role,
+      isLocationPicScoped,
+      canOpenAssetsMenu: true,
+      canCreateAsset: canCreateOrEditAsset,
+    });
+  }, [authReady, firebaseUser?.uid, firebaseUser?.email, role, isLocationPicScoped, canCreateOrEditAsset]);
 
   // Section A — Asset Finance dapat tampilan halaman Assets yang berbeda
   // total: summary card, kolom table, filter, dan aksi semuanya berorientasi
@@ -86,22 +106,34 @@ export default function AssetsPage() {
   // maintenance/PIC).
   const isAssetFinanceRole = role === "asset_finance";
 
-  // Section F — ringkasan aset tetap lokasi vs bergerak (AC/meja/CCTV
+  // Section B/C — PIC Lokasi harus melihat SEMUA asset yang berada di lokasi
+  // tanggung jawabnya, walau bukan dia yang input (createdByUid beda) dan
+  // walau asset lama belum punya locationPicUid/allowedLocationPicUids sama
+  // sekali. isAssetInMyPicLocation fallback ke match lokasi (id, lalu
+  // path/nama) kalau field PIC belum terisi — lihat lib/locations.ts.
+  const visibleAssets = useMemo(() => {
+    if (!isLocationPicScoped) return assets;
+    return assets.filter((a) => isAssetInMyPicLocation(a, assignedPicLocations, firebaseUser?.uid));
+  }, [assets, isLocationPicScoped, assignedPicLocations, firebaseUser?.uid]);
+
+  // Section F/K — ringkasan aset tetap lokasi vs bergerak (AC/meja/CCTV
   // dipisah dari HP/laptop/kamera). Aset lama belum punya trackingMode
   // tersimpan, diturunkan dari usageType lama supaya tetap terhitung. HANYA
   // dipakai untuk role selain Asset Finance (lihat financeSummary di bawah).
+  // Dihitung dari visibleAssets supaya PIC Lokasi lihat ringkasan lokasinya
+  // sendiri, bukan seluruh aset kantor.
   const trackingSummary = useMemo(() => {
     let fixedLocation = 0;
     let moving = 0;
     let maintenance = 0;
-    assets.forEach((a) => {
+    visibleAssets.forEach((a) => {
       const mode = a.trackingMode || (a.usageType === "assigned_daily" ? "assigned_pic" : "shared_borrowable");
       if (mode === "fixed_location") fixedLocation += 1;
       else moving += 1;
       if (a.assetStatus === "maintenance") maintenance += 1;
     });
     return { fixedLocation, moving, maintenance };
-  }, [assets]);
+  }, [visibleAssets]);
 
   // Section B/D/E — ringkasan finance untuk Asset Finance: total nilai
   // aset, kelengkapan harga/invoice, dan pembelian bulan berjalan.
@@ -216,18 +248,14 @@ export default function AssetsPage() {
       ) as string[],
     [assets]
   );
-  const locations = useMemo(
-    () =>
-      Array.from(new Set(assets.map((a) => a.location).filter(Boolean))) as string[],
-    [assets]
-  );
+  // Section E — untuk PIC Lokasi, opsi filter lokasi HANYA berisi lokasi
+  // yang jadi tanggung jawabnya sendiri (bukan seluruh lokasi kantor).
+  const locations = useMemo(() => {
+    const source = isLocationPicScoped ? visibleAssets : assets;
+    return Array.from(new Set(source.map((a) => a.location).filter(Boolean))) as string[];
+  }, [assets, visibleAssets, isLocationPicScoped]);
 
-  const filtered = assets.filter((a) => {
-    // Section H — PIC Lokasi cuma boleh lihat aset di lokasi yang dia
-    // pegang. areaPicUid sudah diisi otomatis via cascade Area/Ruangan/
-    // Lantai/Gedung (lihat resolveAreaPic di lib/locations.ts), jadi cukup
-    // dicocokkan langsung ke sini — sudah mencakup semua level assignment.
-    if (role === "location_pic" && a.areaPicUid !== assetUser?.uid) return false;
+  const filtered = visibleAssets.filter((a) => {
     if (
       search &&
       !`${a.assetName} ${a.assetCode}`
@@ -324,8 +352,12 @@ export default function AssetsPage() {
   return (
     <ProtectedLayout>
       <PageHeader
-        title="Assets"
-        subtitle="Kelola seluruh aset perusahaan dalam satu tempat."
+        title={isLocationPicScoped ? "Asset Lokasi Saya" : "Assets"}
+        subtitle={
+          isLocationPicScoped
+            ? "Anda hanya melihat asset pada lokasi yang menjadi tanggung jawab Anda."
+            : "Kelola seluruh aset perusahaan dalam satu tempat."
+        }
         actions={
           <>
             <Link
@@ -357,6 +389,22 @@ export default function AssetsPage() {
           </>
         }
       />
+
+      {/* Section E — badge mode PIC Lokasi, supaya Daniel dkk langsung sadar
+          daftar ini sudah disaring ke lokasi tanggung jawabnya, bukan bug
+          "asset hilang". */}
+      {isLocationPicScoped && (
+        <div className="mb-5 flex items-center gap-2 rounded-2xl border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-800">
+          <MapPin size={16} className="shrink-0" />
+          {assignedPicLocations.length === 1 ? (
+            <span className="font-semibold">{assignedPicLocations[0].fullPath}</span>
+          ) : assignedPicLocations.length > 1 ? (
+            <span className="font-semibold">{assignedPicLocations.length} lokasi tanggung jawab</span>
+          ) : (
+            <span className="font-semibold">Mode PIC Lokasi</span>
+          )}
+        </div>
+      )}
 
       {isAssetFinanceRole ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-5">
@@ -438,13 +486,13 @@ export default function AssetsPage() {
         <div className="relative lg:col-span-2">
           <Search
             size={16}
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"
+            className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-slate-400"
           />
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Cari nama/kode aset..."
-            className="input pl-9"
+            className="input h-11 w-full !pl-11 pr-4"
           />
         </div>
         <select

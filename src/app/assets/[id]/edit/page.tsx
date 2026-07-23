@@ -13,6 +13,7 @@ import {
 import { QRCodeSVG } from "qrcode.react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
+import { isAssetInMyPicLocation } from "@/lib/locations";
 import {
   Asset,
   AssetCategory,
@@ -35,7 +36,7 @@ import {
   writeAssetLog,
 } from "@/lib/firestore-helpers";
 import { buildChangeMessage, buildChangeSummary, createAssetNotification } from "@/lib/notifications";
-import { buildFullPath, getDescendantIds, resolveAreaPic } from "@/lib/locations";
+import { buildFullPath, getDescendantIds, resolveAreaPic, resolveLocationSelectionForNode } from "@/lib/locations";
 import {
   ASSET_STATUS_HELPER,
   ASSET_STATUS_LABEL,
@@ -51,6 +52,7 @@ import Toggle from "@/components/Toggle";
 import CurrencyInput from "@/components/CurrencyInput";
 import SearchableSelect, { SearchableSelectItem } from "@/components/SearchableSelect";
 import LocationCascadeFields, { LocationSelection } from "@/components/LocationCascadeFields";
+import PicLocationField from "@/components/PicLocationField";
 import FileUploadField from "@/components/FileUploadField";
 import { Toast, ToastState } from "@/components/Toast";
 
@@ -111,7 +113,14 @@ const CONDITION_OPTIONS: AssetCondition[] = [
 export default function EditAssetPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
-  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const {
+    firebaseUser,
+    assetUser,
+    role,
+    loading,
+    isLocationPicRole: isPicViaLocations,
+    assignedPicLocations,
+  } = useAuth();
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [asset, setAsset] = useState<Asset | null>(null);
   const [categories, setCategories] = useState<AssetCategory[]>([]);
@@ -150,6 +159,25 @@ export default function EditAssetPage() {
         console.error("[EditAssetPage GetDoc] assets error:", { id, error });
       });
   }, [authReady, id]);
+
+  // Section G — PIC Lokasi cuma boleh edit asset di lokasi tanggung jawabnya
+  // sendiri. Firestore rules (isLocationPicUpdate) sudah menolak WRITE-nya,
+  // tapi tanpa guard ini form-nya masih bisa dibuka dan diisi (baru gagal
+  // saat submit) — lebih jelas kalau langsung ditolak di sini.
+  useEffect(() => {
+    if (!authReady || !asset) return;
+    if (role !== "location_pic" && !isPicViaLocations) return;
+    if (isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid)) return;
+
+    queueMicrotask(() =>
+      setToast({
+        type: "error",
+        message: "Anda hanya dapat mengelola asset pada lokasi yang menjadi tanggung jawab Anda.",
+      })
+    );
+    const timer = window.setTimeout(() => router.replace("/assets"), 1200);
+    return () => window.clearTimeout(timer);
+  }, [authReady, asset, role, isPicViaLocations, assignedPicLocations, assetUser?.uid, router]);
 
   useEffect(() => {
     if (!authReady) return;
@@ -273,20 +301,46 @@ export default function EditAssetPage() {
   };
 
   // Section E — PIC Lokasi hanya boleh memindahkan aset ke lokasi dalam
-  // scope-nya (dirinya + turunannya) — sama seperti create asset.
-  const isLocationPicRole = role === "location_pic";
+  // scope-nya (dirinya + turunannya) — sama seperti create asset. Berlaku
+  // juga untuk staff yang ditunjuk PIC di Master Lokasi (isPicViaLocations),
+  // bukan cuma role "location_pic" literal.
+  const isLocationPicRole = role === "location_pic" || isPicViaLocations;
+  const myPicLocations = useMemo(() => {
+    if (!isLocationPicRole || !assetUser) return [];
+    return locations.filter((n) => n.picUid === assetUser.uid);
+  }, [locations, isLocationPicRole, assetUser]);
   const scopedLocations = useMemo(() => {
-    if (!isLocationPicRole || !assetUser) return locations;
-    const myNodes = locations.filter((n) => n.picUid === assetUser.uid);
-    if (myNodes.length === 0) return [];
+    if (!isLocationPicRole) return locations;
+    if (myPicLocations.length === 0) return [];
     const idSet = new Set<string>();
-    myNodes.forEach((node) => {
+    myPicLocations.forEach((node) => {
       node.parentPath.forEach((id) => idSet.add(id));
       idSet.add(node.id);
       getDescendantIds(locations, node.id).forEach((id) => idSet.add(id));
     });
     return locations.filter((n) => idSet.has(n.id));
-  }, [locations, isLocationPicRole, assetUser]);
+  }, [locations, isLocationPicRole, myPicLocations]);
+
+  const [selectedPicLocationId, setSelectedPicLocationId] = useState("");
+
+  // Section J — inisialisasi pilihan lokasi PIC dari lokasi asset SAAT INI
+  // (cari node PIC miliknya yang id-nya cocok dengan salah satu level lokasi
+  // asset), supaya form tidak kosong saat pertama dibuka.
+  useEffect(() => {
+    if (!isLocationPicRole || selectedPicLocationId || myPicLocations.length === 0) return;
+    const currentIds = [form.areaId, form.roomId, form.floorId, form.buildingId].filter(Boolean);
+    const match = myPicLocations.find((loc) => currentIds.includes(loc.id));
+    queueMicrotask(() => {
+      if (match) setSelectedPicLocationId(match.id);
+      else if (myPicLocations.length === 1) setSelectedPicLocationId(myPicLocations[0].id);
+    });
+  }, [isLocationPicRole, myPicLocations, selectedPicLocationId, form.areaId, form.roomId, form.floorId, form.buildingId]);
+
+  const handlePicLocationSelect = (nodeId: string) => {
+    setSelectedPicLocationId(nodeId);
+    if (!nodeId) return;
+    handleLocationSelectionChange(resolveLocationSelectionForNode(locations, nodeId));
+  };
 
   const category = useMemo(
     () => categories.find((c) => c.id === form.categoryId),
@@ -410,9 +464,15 @@ export default function EditAssetPage() {
     if (!form.brand?.trim()) errors.brand = "Merk wajib diisi.";
     if (!form.model?.trim()) errors.model = "Model/Tipe wajib diisi.";
     if (!form.companyOwnerId) errors.companyOwnerId = "Perusahaan/Brand wajib dipilih.";
-    if (!form.buildingId) errors.location = "Gedung wajib dipilih.";
-    else if (!form.floorId) errors.location = "Lantai wajib dipilih.";
-    else if (!form.roomId) errors.location = "Ruangan wajib dipilih.";
+    if (isLocationPicRole) {
+      if (!selectedPicLocationId) errors.location = "Lokasi tanggung jawab wajib dipilih.";
+    } else if (!form.buildingId) {
+      errors.location = "Gedung wajib dipilih.";
+    } else if (!form.floorId) {
+      errors.location = "Lantai wajib dipilih.";
+    } else if (!form.roomId) {
+      errors.location = "Ruangan wajib dipilih.";
+    }
     if (!form.ownershipStatus) errors.ownershipStatus = "Status kepemilikan wajib dipilih.";
     if (trackingMode === "assigned_pic" && !form.responsiblePersonUid)
       errors.responsiblePersonUid = "PIC Operasional wajib dipilih untuk aset dengan PIC.";
@@ -955,11 +1015,20 @@ export default function EditAssetPage() {
                       untuk sinkronisasi.
                     </p>
                   )}
-                  <LocationCascadeFields
-                    locations={scopedLocations}
-                    value={locationSelection}
-                    onChange={handleLocationSelectionChange}
-                  />
+                  {isLocationPicRole ? (
+                    <PicLocationField
+                      assignedPicLocations={myPicLocations}
+                      locations={locations}
+                      selectedLocationId={selectedPicLocationId}
+                      onSelectLocation={handlePicLocationSelect}
+                    />
+                  ) : (
+                    <LocationCascadeFields
+                      locations={scopedLocations}
+                      value={locationSelection}
+                      onChange={handleLocationSelectionChange}
+                    />
+                  )}
                   {fieldErrors.location && (
                     <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
                   )}

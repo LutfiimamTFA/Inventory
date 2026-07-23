@@ -729,6 +729,78 @@ export function getQrImageSettings(size: number) {
   };
 }
 
+// Section A/B — domain QR asset. NEXT_PUBLIC_APP_URL WAJIB diisi production
+// (https://qhse-care.vercel.app) supaya QR yang dicetak bisa langsung
+// dibuka kamera bawaan HP (bukan cuma scanner internal web). Fallback ke
+// window.location.origin/produksi hanya jaring pengaman kalau env belum
+// pernah diisi sama sekali, bukan cara normal untuk jalan.
+export function getAppBaseUrl(): string {
+  const envUrl = process.env.NEXT_PUBLIC_APP_URL;
+  if (envUrl && envUrl.trim()) {
+    return envUrl.trim().replace(/\/$/, "");
+  }
+  if (typeof window !== "undefined") {
+    return window.location.origin;
+  }
+  return "https://qhse-care.vercel.app";
+}
+
+export function getAssetActionUrl(assetCode: string): string {
+  return `${getAppBaseUrl()}/asset-action?code=${encodeURIComponent(assetCode)}`;
+}
+
+// Section D — info kecil di modal cetak QR supaya admin tahu label yang
+// akan dicetak itu memang bisa dibuka kamera HP atau cuma untuk testing.
+export function getQrDomainNotice(baseUrl: string): { tone: "warning" | "info" | "success"; message: string } {
+  if (/localhost|127\.0\.0\.1/i.test(baseUrl)) {
+    return {
+      tone: "warning",
+      message: "QR ini masih memakai localhost. QR hanya cocok untuk testing di laptop, bukan untuk kamera HP.",
+    };
+  }
+  if (/^https?:\/\/(\d{1,3}\.){3}\d{1,3}/.test(baseUrl)) {
+    return {
+      tone: "info",
+      message: "QR ini hanya bisa dibuka dari HP yang berada di WiFi yang sama.",
+    };
+  }
+  return {
+    tone: "success",
+    message: "QR siap dipakai. Kamera HP bisa langsung membuka halaman asset.",
+  };
+}
+
+// Section I — scanner internal web tetap harus bisa baca QR LAMA yang cuma
+// berisi kode asset polos, sekaligus QR BARU yang berisi URL penuh
+// (https://qhse-care.vercel.app/asset-action?code=...). qrCodeValue yang
+// tersimpan di Firestore selalu kode polos (lihat assets/new & edit), jadi
+// hasil ekstraksi ini yang dipakai untuk query, bukan raw value dari kamera.
+export function extractAssetCodeFromQr(rawValue: string): string {
+  if (!rawValue) return "";
+  const value = rawValue.trim();
+  try {
+    const url = new URL(value);
+    return url.searchParams.get("code") || "";
+  } catch {
+    return value;
+  }
+}
+
+// Section G — returnUrl setelah login WAJIB path internal saja, tidak boleh
+// dipakai untuk open-redirect ke domain luar.
+export function getSafeReturnUrl(returnUrl: string | null | undefined): string | null {
+  if (!returnUrl) return null;
+  try {
+    const decoded = decodeURIComponent(returnUrl);
+    if (!decoded.startsWith("/")) return null;
+    if (decoded.startsWith("//")) return null;
+    if (decoded.includes("http://") || decoded.includes("https://")) return null;
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
 export const NOTIFICATION_TYPE_LABEL: Record<NotificationType, string> = {
   asset_borrowed: "Asset Dipinjam",
   asset_returned: "Asset Dikembalikan",

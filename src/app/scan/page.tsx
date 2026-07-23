@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   collection,
   getDocs,
@@ -12,9 +12,8 @@ import {
   query,
   where,
 } from "firebase/firestore";
-import { Html5Qrcode } from "html5-qrcode";
+import AssetQrScanner from "@/components/asset/AssetQrScanner";
 import {
-  Camera,
   Search,
   ScanLine,
   PackageSearch,
@@ -41,6 +40,7 @@ import {
   ASSET_USAGE_STATUS_COLOR,
   TRACKING_MODE_LABEL,
   CONDITION_LABEL,
+  extractAssetCodeFromQr,
   formatDate,
   formatDateTime,
 } from "@/lib/utils";
@@ -56,7 +56,6 @@ import SearchableSelect, { SearchableSelectItem } from "@/components/SearchableS
 import ConfirmModal from "@/components/ConfirmModal";
 import { Toast, ToastState } from "@/components/Toast";
 
-const SCANNER_ID = "qr-scanner-region";
 
 // "Riwayat Scan Saya" belum punya collection Firestore sendiri — dipersist
 // ringan di localStorage per-user supaya panel idle & section riwayat sama
@@ -365,11 +364,27 @@ const USAGE_FILTERS: { key: UsageFilter; label: string }[] = [
 ];
 
 export default function ScanPage() {
+  return (
+    <Suspense
+      fallback={
+        <ProtectedLayout>
+          <div className="flex items-center justify-center py-20">
+            <div className="h-8 w-8 rounded-full border-2 border-slate-200 border-t-slate-900 animate-spin" />
+          </div>
+        </ProtectedLayout>
+      }
+    >
+      <ScanPageContent />
+    </Suspense>
+  );
+}
+
+function ScanPageContent() {
   const { assetUser, role } = useAuth();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const isManager = role === "asset_admin" || role === "super_admin";
   const [toast, setToast] = useState<ToastState | null>(null);
-  const [scanning, setScanning] = useState(false);
   const [manualCode, setManualCode] = useState("");
   const [asset, setAsset] = useState<Asset | null>(null);
   const [notFound, setNotFound] = useState(false);
@@ -396,7 +411,6 @@ export default function ScanPage() {
   const [modalLogs, setModalLogs] = useState<AssetLog[]>([]);
   const [modalTickets, setModalTickets] = useState<AssetIssueTicket[]>([]);
   const [modalHistoryLoading, setModalHistoryLoading] = useState(false);
-  const scannerRef = useRef<Html5Qrcode | null>(null);
 
   // Debug SEMENTARA (hapus setelah overflow mobile terkonfirmasi beres) —
   // cari elemen mana persis di dalam .scan-page yang scrollWidth-nya lebih
@@ -686,8 +700,13 @@ export default function ScanPage() {
     setError("");
     setNotFound(false);
     setAsset(null);
-    const trimmed = code.trim();
-    if (!trimmed) return;
+    // Section I — dukung QR lama (kode polos) maupun QR baru (URL penuh
+    // /asset-action?code=...) dari kamera bawaan HP maupun scanner internal.
+    const trimmed = extractAssetCodeFromQr(code).trim();
+    if (!trimmed) {
+      setError("QR tidak berisi kode asset yang valid.");
+      return;
+    }
     // Scan HANYA membaca data — tidak ada write/ubah status di sini sama
     // sekali, perubahan status hanya lewat aksi eksplisit (Pinjam/
     // Kembalikan/Lapor Kendala/Ubah Status admin) di bawah.
@@ -707,50 +726,20 @@ export default function ScanPage() {
     pushScanHistory(found);
   };
 
-  const startScanner = async () => {
-    setError("");
-    setScanning(true);
-  };
-
+  // Section J — dipakai tombol "Pinjam Asset"/"Kembalikan Asset" di
+  // /asset-action supaya user diarahkan ke alur pinjam/kembalikan yang
+  // SUDAH lengkap di halaman ini (custodian/handover/dll), bukan
+  // duplikasi logic borrow/return di halaman quick-action.
   useEffect(() => {
-    if (!scanning) return;
-    const scanner = new Html5Qrcode(SCANNER_ID);
-    scannerRef.current = scanner;
-    let isRunning = false;
+    if (!assetUser) return;
+    const code = searchParams.get("code");
+    if (!code) return;
+    queueMicrotask(() => {
+      lookupAsset(code);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assetUser, searchParams]);
 
-    const safeStop = async () => {
-      if (!isRunning) return;
-      isRunning = false;
-      try {
-        await scanner.stop();
-      } catch {
-        // scanner sudah berhenti/tidak sempat mulai — abaikan
-      }
-    };
-
-    scanner
-      .start(
-        { facingMode: "environment" },
-        { fps: 10, qrbox: 240 },
-        async (decodedText) => {
-          await lookupAsset(decodedText);
-          await safeStop();
-          setScanning(false);
-        },
-        undefined
-      )
-      .then(() => {
-        isRunning = true;
-      })
-      .catch(() => {
-        setError("Tidak bisa mengakses kamera. Gunakan input manual.");
-        setScanning(false);
-      });
-
-    return () => {
-      safeStop();
-    };
-  }, [scanning]);
 
   const isFixedLocationAsset = asset ? resolveTrackingMode(asset) === "fixed_location" : false;
   const isBorrowedByMe = asset?.currentBorrowerUid === assetUser?.uid;
@@ -866,20 +855,7 @@ export default function ScanPage() {
             <h2 className="font-semibold text-slate-800">Kamera Scanner</h2>
           </div>
 
-          {!scanning ? (
-            <button
-              onClick={startScanner}
-              className="w-full min-w-0 inline-flex flex-col items-center justify-center gap-2 rounded-2xl bg-gradient-to-br from-blue-600 to-teal-500 text-white py-10 text-sm font-medium hover:brightness-105 shadow-md shadow-blue-900/20 cursor-pointer"
-            >
-              <Camera size={30} />
-              Mulai Scan
-            </button>
-          ) : (
-            <div
-              id={SCANNER_ID}
-              className="w-full max-w-full min-w-0 rounded-2xl overflow-hidden border border-slate-200"
-            />
-          )}
+          <AssetQrScanner onScan={lookupAsset} />
           {error && (
             <p className="text-sm text-red-600 mt-3 bg-red-50 border border-red-200 rounded-xl px-3 py-2">
               {error}
@@ -921,7 +897,7 @@ export default function ScanPage() {
             <>
               <h2 className="font-semibold text-slate-800 mb-4">Hasil</h2>
               <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl px-3 py-2">
-                Kode aset tidak ditemukan.
+                Asset dengan kode tersebut tidak ditemukan.
               </p>
             </>
           )}

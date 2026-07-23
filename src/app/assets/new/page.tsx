@@ -30,7 +30,7 @@ import {
   writeAssetLog,
 } from "@/lib/firestore-helpers";
 import { createAssetNotification } from "@/lib/notifications";
-import { buildFullPath, getDescendantIds, resolveAreaPic } from "@/lib/locations";
+import { buildFullPath, getDescendantIds, resolveAreaPic, resolveLocationSelectionForNode } from "@/lib/locations";
 import {
   ASSET_STATUS_HELPER,
   ASSET_STATUS_LABEL,
@@ -49,6 +49,7 @@ import LocationCascadeFields, {
   EMPTY_LOCATION_SELECTION,
   LocationSelection,
 } from "@/components/LocationCascadeFields";
+import PicLocationField from "@/components/PicLocationField";
 import FileUploadField from "@/components/FileUploadField";
 import { Toast, ToastState } from "@/components/Toast";
 
@@ -110,7 +111,7 @@ const CONDITION_OPTIONS: AssetCondition[] = [
 ];
 
 export default function NewAssetPage() {
-  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const { firebaseUser, assetUser, role, loading, isLocationPicRole: isPicViaLocations } = useAuth();
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const router = useRouter();
 
@@ -196,19 +197,51 @@ export default function NewAssetPage() {
   // pegang: LocationCascadeFields cuma diberi node-node dalam scope-nya
   // (dirinya + leluhur untuk konteks cascade + seluruh turunannya), jadi
   // secara struktural tidak mungkin memilih lokasi lain.
-  const isLocationPicRole = role === "location_pic";
+  // Berlaku juga untuk staff yang ditunjuk PIC di Master Lokasi
+  // (isPicViaLocations dari auth-context), bukan cuma role "location_pic".
+  const isLocationPicRole = role === "location_pic" || isPicViaLocations;
+  // Lokasi-lokasi yang JADI TANGGUNG JAWAB user ini secara langsung (bukan
+  // turunannya) — dipakai PicLocationField untuk "Pilih Lokasi Tanggung
+  // Jawab" kalau lebih dari satu, atau auto-select kalau cuma satu.
+  const myPicLocations = useMemo(() => {
+    if (!isLocationPicRole || !assetUser) return [];
+    return locations.filter((n) => n.picUid === assetUser.uid);
+  }, [locations, isLocationPicRole, assetUser]);
   const scopedLocations = useMemo(() => {
-    if (!isLocationPicRole || !assetUser) return locations;
-    const myNodes = locations.filter((n) => n.picUid === assetUser.uid);
-    if (myNodes.length === 0) return [];
+    if (!isLocationPicRole) return locations;
+    if (myPicLocations.length === 0) return [];
     const idSet = new Set<string>();
-    myNodes.forEach((node) => {
+    myPicLocations.forEach((node) => {
       node.parentPath.forEach((id) => idSet.add(id));
       idSet.add(node.id);
       getDescendantIds(locations, node.id).forEach((id) => idSet.add(id));
     });
     return locations.filter((n) => idSet.has(n.id));
-  }, [locations, isLocationPicRole, assetUser]);
+  }, [locations, isLocationPicRole, myPicLocations]);
+
+  const [selectedPicLocationId, setSelectedPicLocationId] = useState("");
+
+  // Section F — kalau PIC cuma pegang 1 lokasi, langsung auto-select tanpa
+  // perlu user memilih apa pun.
+  useEffect(() => {
+    if (isLocationPicRole && myPicLocations.length === 1 && !selectedPicLocationId) {
+      queueMicrotask(() => setSelectedPicLocationId(myPicLocations[0].id));
+    }
+  }, [isLocationPicRole, myPicLocations, selectedPicLocationId]);
+
+  // Section F/G — locationSelection (dipakai validasi & payload save) SELALU
+  // diturunkan dari selectedPicLocationId untuk PIC Lokasi, supaya struktur
+  // datanya identik dengan hasil dropdown cascade biasa.
+  useEffect(() => {
+    if (!isLocationPicRole) return;
+    queueMicrotask(() => {
+      if (!selectedPicLocationId) {
+        setLocationSelection(EMPTY_LOCATION_SELECTION);
+        return;
+      }
+      setLocationSelection(resolveLocationSelectionForNode(locations, selectedPicLocationId));
+    });
+  }, [isLocationPicRole, selectedPicLocationId, locations]);
 
   const category = useMemo(
     () => categories.find((c) => c.id === categoryId),
@@ -368,9 +401,18 @@ export default function NewAssetPage() {
     if (!brand.trim()) errors.brand = "Merk wajib diisi.";
     if (!model.trim()) errors.model = "Model/Tipe wajib diisi.";
     if (!companyOwnerId) errors.companyOwnerId = "Perusahaan/Brand wajib dipilih.";
-    if (!locationSelection.buildingId) errors.location = "Gedung wajib dipilih.";
-    else if (!locationSelection.floorId) errors.location = "Lantai wajib dipilih.";
-    else if (!locationSelection.roomId) errors.location = "Ruangan wajib dipilih.";
+    // PIC Lokasi bisa ditugaskan di level Gedung/Lantai/Area juga (bukan
+    // wajib sampai Ruangan) — cukup pastikan dia sudah memilih salah satu
+    // lokasi tanggung jawabnya.
+    if (isLocationPicRole) {
+      if (!selectedPicLocationId) errors.location = "Lokasi tanggung jawab wajib dipilih.";
+    } else if (!locationSelection.buildingId) {
+      errors.location = "Gedung wajib dipilih.";
+    } else if (!locationSelection.floorId) {
+      errors.location = "Lantai wajib dipilih.";
+    } else if (!locationSelection.roomId) {
+      errors.location = "Ruangan wajib dipilih.";
+    }
     if (!ownershipStatus) errors.ownershipStatus = "Status kepemilikan wajib dipilih.";
     if (trackingMode === "assigned_pic" && !responsiblePersonUid)
       errors.responsiblePersonUid = "PIC Operasional wajib dipilih untuk aset dengan PIC.";
@@ -467,6 +509,22 @@ export default function NewAssetPage() {
         areaPicEmail: areaPic?.email || null,
         areaPicLocationId: areaPic?.locationId || null,
         areaPicLocationName: areaPic?.locationName || null,
+        // Section G — metadata tambahan saat asset dibuat oleh PIC Lokasi
+        // (role "location_pic" ATAU staff yang ditunjuk PIC di Master
+        // Lokasi), dipakai firestore.rules (isLocationPicCreateAsset) untuk
+        // memverifikasi pembuatnya memang PIC lokasi yang bersangkutan.
+        ...(isLocationPicRole
+          ? {
+              createdFromLocationPic: true,
+              createdByUid: firebaseUser?.uid || "",
+              createdByName: assetUser?.name || firebaseUser?.email || "",
+              createdByRole: "location_pic",
+              locationPicUid: firebaseUser?.uid || "",
+              locationPicName: assetUser?.name || firebaseUser?.email || "",
+              locationPicEmail: firebaseUser?.email || "",
+              allowedLocationPicUids: firebaseUser?.uid ? [firebaseUser.uid] : [],
+            }
+          : {}),
         responsiblePersonUid: responsiblePersonUid || null,
         responsiblePersonName: responsiblePerson?.name || "",
         responsiblePersonEmail: responsiblePerson?.email || "",
@@ -780,18 +838,22 @@ export default function NewAssetPage() {
                   <label className="block text-xs font-medium text-slate-500 mb-1.5">
                     Lokasi Asset <span className="text-red-500">*</span>
                   </label>
-                  <LocationCascadeFields
-                    locations={scopedLocations}
-                    value={locationSelection}
-                    onChange={setLocationSelection}
-                  />
+                  {isLocationPicRole ? (
+                    <PicLocationField
+                      assignedPicLocations={myPicLocations}
+                      locations={locations}
+                      selectedLocationId={selectedPicLocationId}
+                      onSelectLocation={setSelectedPicLocationId}
+                    />
+                  ) : (
+                    <LocationCascadeFields
+                      locations={scopedLocations}
+                      value={locationSelection}
+                      onChange={setLocationSelection}
+                    />
+                  )}
                   {fieldErrors.location && (
                     <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
-                  )}
-                  {isLocationPicRole && scopedLocations.length === 0 && (
-                    <p className="mt-1 text-xs text-amber-600">
-                      Anda belum ditetapkan sebagai PIC lokasi manapun — hubungi Asset Admin/QHSE.
-                    </p>
                   )}
                 </div>
                 <Field

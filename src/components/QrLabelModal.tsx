@@ -9,6 +9,9 @@ import {
   ASSET_STATUS_COLOR,
   ASSET_STATUS_LABEL,
   CONDITION_LABEL,
+  getAppBaseUrl,
+  getAssetActionUrl,
+  getQrDomainNotice,
 } from "@/lib/utils";
 import Badge from "@/components/Badge";
 
@@ -212,7 +215,11 @@ export default function QrLabelModal({
 
   if (!open) return null;
 
-  const qrValue = asset.qrCodeValue || asset.assetCode || asset.id;
+  // Section C — QR sekarang berisi URL /asset-action lengkap (domain
+  // production dari NEXT_PUBLIC_APP_URL), bukan lagi kode asset polos,
+  // supaya kamera bawaan HP bisa langsung membuka halaman aksi asset.
+  const qrValue = getAssetActionUrl(asset.assetCode || asset.qrCodeValue || asset.id);
+  const domainNotice = getQrDomainNotice(getAppBaseUrl());
   const singleWidth = Math.round(resolvedLabelWidthMm * PX_PER_MM);
   const singleHeight = Math.round(resolvedLabelHeightMm * PX_PER_MM);
   const singleQrSizeMm = getLabelQrSizeMm(resolvedLabelWidthMm, resolvedLabelHeightMm);
@@ -391,6 +398,21 @@ export default function QrLabelModal({
           </button>
         </div>
 
+        {/* Section D — info domain QR, HANYA di layar (no-print), supaya
+            admin tahu label yang akan dicetak bisa langsung dibuka kamera
+            HP atau cuma untuk testing lokal. */}
+        <div
+          className={`mx-6 mb-3 rounded-xl border px-3 py-2 text-xs no-print ${
+            domainNotice.tone === "success"
+              ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+              : domainNotice.tone === "warning"
+              ? "border-amber-200 bg-amber-50 text-amber-700"
+              : "border-blue-200 bg-blue-50 text-blue-700"
+          }`}
+        >
+          {domainNotice.message}
+        </div>
+
         <div className="grid md:grid-cols-2 gap-6 px-6 pb-6">
           {/* Kiri: preview */}
           <div className="flex flex-col items-center">
@@ -404,6 +426,12 @@ export default function QrLabelModal({
                 colorClass="bg-slate-100 text-slate-600 border-slate-200"
               />
             </div>
+
+            {/* Section K — hint layar saja, TIDAK ikut tercetak di label
+                fisik (label tetap cuma QR + nama + kode). */}
+            <p className="mb-2 self-start text-[11px] text-slate-400 no-print">
+              Scan kamera HP untuk membuka asset.
+            </p>
 
             {!customValid ? (
               <p className="text-sm text-red-600 py-8 text-center">

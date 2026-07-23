@@ -96,6 +96,19 @@ export interface Asset {
   areaPicLocationId?: string | null;
   areaPicLocationName?: string | null;
 
+  // PIC Lokasi via staff (bukan role "location_pic" literal) — diisi saat
+  // asset dibuat oleh PIC Lokasi ITU SENDIRI (lihat createdFromLocationPic
+  // di assets/new), dipakai firestore.rules isLocationPicForAsset/
+  // isLocationPicAllowedAssetUpdate. TETAP fallback ke match lokasi
+  // (lib/locations.ts isAssetInMyPicLocation) untuk asset lama yang belum
+  // punya field ini sama sekali.
+  createdFromLocationPic?: boolean;
+  createdByRole?: string;
+  locationPicUid?: string | null;
+  locationPicName?: string | null;
+  locationPicEmail?: string | null;
+  allowedLocationPicUids?: string[];
+
   maintenanceEnabled?: boolean;
   maintenanceIntervalMonths?: number;
   lastMaintenanceAt?: unknown;

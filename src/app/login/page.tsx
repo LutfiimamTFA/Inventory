@@ -1,36 +1,46 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import { Fingerprint, LogIn, ShieldAlert } from "lucide-react";
+import { Suspense, useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { LogIn, ShieldAlert } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
 import { getDefaultRouteForRole } from "@/lib/roles";
-import {
-  friendlyPasskeyError,
-  isPasskeySupported,
-  loginWithPasskey,
-} from "@/lib/passkeys";
+import { getSafeReturnUrl } from "@/lib/utils";
 
 export default function LoginPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex flex-1 items-center justify-center p-4 min-h-screen bg-gradient-to-br from-slate-50 via-white to-blue-50">
+          <div className="h-9 w-9 rounded-full border-2 border-slate-200 border-t-blue-600 animate-spin" />
+        </div>
+      }
+    >
+      <LoginPageContent />
+    </Suspense>
+  );
+}
+
+function LoginPageContent() {
   const { firebaseUser, assetUser, role, loading, accessDenied, accessDeniedReason, login, logout } =
     useAuth();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [passkeySubmitting, setPasskeySubmitting] = useState(false);
-  const [passkeySupported, setPasskeySupported] = useState(false);
 
-  useEffect(() => {
-    queueMicrotask(() => setPasskeySupported(isPasskeySupported()));
-  }, []);
-
+  // Section G — kalau datang dari QR (/asset-action -> /login?returnUrl=...),
+  // balik ke returnUrl itu setelah login berhasil, bukan selalu ke halaman
+  // default role. getSafeReturnUrl menolak apa pun yang bukan path internal
+  // supaya tidak bisa dipakai untuk open-redirect ke domain luar.
   useEffect(() => {
     if (!loading && firebaseUser && assetUser && role) {
-      router.replace(getDefaultRouteForRole(role));
+      const safeReturnUrl = getSafeReturnUrl(searchParams.get("returnUrl"));
+      router.replace(safeReturnUrl || getDefaultRouteForRole(role));
     }
-  }, [loading, firebaseUser, assetUser, role, router]);
+  }, [loading, firebaseUser, assetUser, role, router, searchParams]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -42,18 +52,6 @@ export default function LoginPage() {
       setError("Email atau password salah.");
     } finally {
       setSubmitting(false);
-    }
-  };
-
-  const handlePasskeyLogin = async () => {
-    setError("");
-    setPasskeySubmitting(true);
-    try {
-      await loginWithPasskey(email);
-    } catch (err) {
-      setError(friendlyPasskeyError(err, "Login passkey gagal."));
-    } finally {
-      setPasskeySubmitting(false);
     }
   };
 
@@ -142,34 +140,12 @@ export default function LoginPage() {
           )}
           <button
             type="submit"
-            disabled={submitting || passkeySubmitting}
+            disabled={submitting}
             className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-teal-500 text-white py-2.5 text-sm font-medium hover:brightness-105 disabled:opacity-60 shadow-md shadow-blue-900/20"
           >
             <LogIn size={16} />
             {submitting ? "Memproses..." : "Masuk"}
           </button>
-          {passkeySupported && (
-            <>
-              <div className="flex items-center gap-3">
-                <div className="h-px flex-1 bg-slate-200" />
-                <span className="text-xs text-slate-400">atau</span>
-                <div className="h-px flex-1 bg-slate-200" />
-              </div>
-              <button
-                type="button"
-                onClick={handlePasskeyLogin}
-                disabled={submitting || passkeySubmitting}
-                className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60"
-              >
-                <Fingerprint size={16} />
-                {passkeySubmitting ? "Memproses..." : "Masuk dengan Passkey"}
-              </button>
-              <p className="text-xs text-center leading-5 text-slate-400">
-                Gunakan fingerprint, Face ID, Touch ID, atau Windows Hello jika
-                sudah diaktifkan di perangkat ini.
-              </p>
-            </>
-          )}
           <p className="text-xs text-center text-slate-400">
             Gunakan akun yang sudah terdaftar di QHSE Care.
           </p>

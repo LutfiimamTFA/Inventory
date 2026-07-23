@@ -14,9 +14,19 @@ import {
   signOut as firebaseSignOut,
   User,
 } from "firebase/auth";
-import { doc, getDoc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  where,
+} from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
-import { AppRole, AssetUser } from "@/lib/types";
+import { AppRole, AssetLocationNode, AssetUser } from "@/lib/types";
 import { findActiveHrpEmployeeByUid } from "@/lib/hrp";
 
 interface AuthState {
@@ -26,6 +36,13 @@ interface AuthState {
   loading: boolean;
   accessDenied: boolean;
   accessDeniedReason: string;
+  // Section B — lokasi yang dipegang user sebagai PIC Lokasi, TERLEPAS dari
+  // role backend-nya. Staff biasa yang ditunjuk jadi PIC di Master Lokasi
+  // TETAP role "staff" (spec eksplisit minta ini), tapi dapat akses
+  // tambahan lewat isLocationPicRole di bawah — dipakai sidebar, guard
+  // route, dan filter halaman Assets.
+  assignedPicLocations: AssetLocationNode[];
+  isLocationPicRole: boolean;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
 }
@@ -73,6 +90,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [accessDenied, setAccessDenied] = useState(false);
   const [accessDeniedReason, setAccessDeniedReason] = useState("");
+  const [assignedPicLocations, setAssignedPicLocations] = useState<AssetLocationNode[]>([]);
   const hasUpdatedLoginRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -193,6 +211,68 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => unsub();
   }, []);
 
+  // Section B — load lokasi yang dipegang user sebagai PIC Lokasi, LEPAS
+  // dari role backend-nya. Jalan untuk SEMUA user yang login (harmless
+  // untuk role yang sudah bisa akses semua asset lewat canManageAllAssets),
+  // supaya staff yang ditunjuk PIC di Master Lokasi langsung dapat akses
+  // tambahan tanpa perlu ganti role lewat User Access.
+  useEffect(() => {
+    if (!firebaseUser) {
+      queueMicrotask(() => setAssignedPicLocations([]));
+      return;
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const primarySnap = await getDocs(
+          query(
+            collection(db, "asset_locations"),
+            where("picUid", "==", firebaseUser.uid),
+            where("status", "==", "active")
+          )
+        );
+        let nodes = primarySnap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetLocationNode));
+
+        // Fallback untuk data lama yang belum punya picUid tersimpan (cuma
+        // picEmail) — supaya PIC yang ditunjuk sebelum picUid diwajibkan
+        // tetap terdeteksi.
+        if (nodes.length === 0 && firebaseUser.email) {
+          const fallbackSnap = await getDocs(
+            query(
+              collection(db, "asset_locations"),
+              where("picEmail", "==", firebaseUser.email),
+              where("status", "==", "active")
+            )
+          );
+          nodes = fallbackSnap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetLocationNode));
+        }
+
+        if (!cancelled) setAssignedPicLocations(nodes);
+      } catch (error) {
+        console.error("[Location PIC Access] gagal memuat assignedPicLocations", error);
+        if (!cancelled) setAssignedPicLocations([]);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [firebaseUser]);
+
+  useEffect(() => {
+    if (!firebaseUser) return;
+    console.log("[Location PIC Access Debug]", {
+      uid: firebaseUser.uid,
+      email: firebaseUser.email,
+      role: assetUser?.role,
+      assignedPicLocationsCount: assignedPicLocations.length,
+      assignedPicLocations,
+      isLocationPicRole: assignedPicLocations.length > 0,
+    });
+  }, [firebaseUser, assetUser?.role, assignedPicLocations]);
+
   const login = async (email: string, password: string) => {
     await signInWithEmailAndPassword(auth, email, password);
   };
@@ -210,6 +290,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         loading,
         accessDenied,
         accessDeniedReason,
+        assignedPicLocations,
+        isLocationPicRole: assignedPicLocations.length > 0,
         login,
         logout,
       }}

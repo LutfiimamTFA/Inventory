@@ -5,7 +5,7 @@ import {
   type FirebaseApp,
   type FirebaseOptions,
 } from "firebase/app";
-import { getAuth, type Auth } from "firebase/auth";
+import { browserLocalPersistence, getAuth, setPersistence, type Auth } from "firebase/auth";
 import {
   getFirestore,
   initializeFirestore,
@@ -97,6 +97,13 @@ function getFirebaseAuth() {
   }
   if (!cachedAuth) {
     cachedAuth = getAuth(getFirebaseApp());
+    // Section H — eksplisit local persistence supaya user yang sudah login
+    // di HP tidak perlu login ulang saat scan QR lain kali (SDK web memang
+    // sudah default begini, tapi dibuat eksplisit biar tidak bergantung ke
+    // default yang bisa berubah antar versi SDK).
+    setPersistence(cachedAuth, browserLocalPersistence).catch((error) => {
+      console.error("[Firebase Auth] gagal set local persistence", error);
+    });
   }
   return cachedAuth;
 }

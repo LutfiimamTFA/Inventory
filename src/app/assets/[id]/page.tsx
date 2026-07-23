@@ -36,6 +36,7 @@ import {
 } from "@/lib/reports";
 import ConfirmModal from "@/components/ConfirmModal";
 import { useAuth } from "@/lib/auth-context";
+import { isAssetInMyPicLocation } from "@/lib/locations";
 import { Asset, AssetBorrowing, AssetIssueTicket, AssetLog } from "@/lib/types";
 import {
   ASSET_STATUS_COLOR,
@@ -54,12 +55,16 @@ import ProtectedLayout from "@/components/ProtectedLayout";
 import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 import SearchableSelect, { SearchableSelectItem } from "@/components/SearchableSelect";
+import { Toast, ToastState } from "@/components/Toast";
 import Link from "next/link";
 
 export default function AssetDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
-  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const { firebaseUser, assetUser, role, loading, isLocationPicRole, assignedPicLocations } = useAuth();
+  // Section C — staff yang ditunjuk PIC di Master Lokasi diperlakukan sama
+  // seperti role "location_pic" literal untuk halaman ini.
+  const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [asset, setAsset] = useState<Asset | null>(null);
   const [photoImgError, setPhotoImgError] = useState(false);
@@ -82,6 +87,7 @@ export default function AssetDetailPage() {
   const [forceNote, setForceNote] = useState("");
   const [usageSaving, setUsageSaving] = useState(false);
   const [usageError, setUsageError] = useState("");
+  const [toast, setToast] = useState<ToastState | null>(null);
 
   const canManage = role === "super_admin" || role === "asset_admin";
   // Finance/Bukti Pembelian: HANYA Super Admin & Asset Finance yang boleh
@@ -135,6 +141,26 @@ export default function AssetDetailPage() {
     );
     return () => unsub();
   }, [authReady, id]);
+
+  // Section G/H — PIC Lokasi tidak boleh melihat asset di luar lokasi
+  // tanggung jawabnya, walau dibuka lewat URL langsung. Firestore rules
+  // sudah menolak WRITE-nya (isLocationPicUpdate), tapi tanpa guard ini dia
+  // masih bisa membaca detail operasional (lokasi/kondisi/custodian) asset
+  // orang lain lewat halaman ini.
+  useEffect(() => {
+    if (!authReady || !asset) return;
+    if (!isLocationPicScoped) return;
+    if (isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid)) return;
+
+    queueMicrotask(() =>
+      setToast({
+        type: "error",
+        message: "Anda hanya dapat mengelola asset pada lokasi yang menjadi tanggung jawab Anda.",
+      })
+    );
+    const timer = window.setTimeout(() => router.replace("/assets"), 1200);
+    return () => window.clearTimeout(timer);
+  }, [authReady, asset, isLocationPicScoped, assignedPicLocations, assetUser?.uid, router]);
 
   useEffect(() => {
     if (!authReady) return;
@@ -539,7 +565,8 @@ export default function AssetDetailPage() {
           </div>
         </div>
         <div className="flex gap-2">
-          {canManage && (
+          {(canManage ||
+            (isLocationPicScoped && isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid))) && (
             <button
               onClick={() => router.push(`/assets/${asset.id}/edit`)}
               className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium hover:bg-slate-50 shadow-sm"
@@ -1079,6 +1106,8 @@ export default function AssetDetailPage() {
           {usageError && <p className="text-sm text-red-600">{usageError}</p>}
         </div>
       </ConfirmModal>
+
+      <Toast toast={toast} onClose={() => setToast(null)} />
     </ProtectedLayout>
   );
 }

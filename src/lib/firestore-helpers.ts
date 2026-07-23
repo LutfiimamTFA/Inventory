@@ -1,16 +1,21 @@
 import {
   addDoc,
   collection,
+  doc,
   getDocs,
   limit,
   query,
   serverTimestamp,
+  updateDoc,
   where,
 } from "firebase/firestore";
 import { db, EMPLOYEE_PROFILES_COLLECTION } from "@/lib/firebase";
+import { getDescendantIds, resolveAreaPic } from "@/lib/locations";
 import {
   AppRole,
+  Asset,
   AssetIssueLogAction,
+  AssetLocationNode,
   AssetUser,
   AssetUserLogAction,
   IssueImpactLevel,
@@ -392,4 +397,84 @@ export async function fetchActiveEmployeeOptions(): Promise<EmployeeOption[]> {
 
   const options = Array.from(byUid.values());
   return options.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+// Section J — backfill PIC Lokasi ke asset yang SUDAH ADA saat PIC sebuah
+// lokasi ditetapkan/diganti/dihapus di Master Lokasi. areaPicUid/areaPicName
+// dkk pada dokumen asset SEBELUMNYA hanya dihitung sekali saat asset
+// dibuat/diedit (lihat resolveAreaPic di assets/new & assets/[id]/edit) —
+// tanpa backfill ini, asset yang sudah ada di suatu lokasi SEBELUM PIC-nya
+// ditunjuk tidak akan pernah ikut ter-assign ke PIC baru itu, sehingga PIC
+// Lokasi baru akan melihat daftar Assets kosong walau lokasinya sudah benar.
+//
+// `locations` yang dioper WAJIB sudah berisi perubahan PIC terbaru (patch
+// manual di pemanggil) karena listener onSnapshot lokasi belum tentu selesai
+// re-render saat fungsi ini dipanggil tepat setelah updateDoc PIC.
+export async function backfillAreaPicForLocationSubtree({
+  locations,
+  locationId,
+}: {
+  locations: AssetLocationNode[];
+  locationId: string;
+}): Promise<number> {
+  const affectedLocationIds = [locationId, ...getDescendantIds(locations, locationId)];
+  const locationIdChunks = chunkArray(affectedLocationIds, 10);
+  const scopeFields = ["buildingId", "floorId", "roomId", "areaId"] as const;
+
+  const matchedDocs = new Map<string, { id: string; data: Asset }>();
+  for (const field of scopeFields) {
+    for (const idsChunk of locationIdChunks) {
+      const snap = await getDocs(query(collection(db, "assets"), where(field, "in", idsChunk)));
+      snap.docs.forEach((d) => matchedDocs.set(d.id, { id: d.id, data: d.data() as Asset }));
+    }
+  }
+
+  let updatedCount = 0;
+  for (const { id, data: asset } of matchedDocs.values()) {
+    const areaPic = resolveAreaPic(locations, {
+      buildingId: asset.buildingId,
+      floorId: asset.floorId,
+      roomId: asset.roomId,
+      areaId: asset.areaId,
+    });
+
+    const nextAreaPicUid = areaPic?.uid || null;
+    const nextAreaPicLocationId = areaPic?.locationId || null;
+    if (
+      (asset.areaPicUid || null) === nextAreaPicUid &&
+      (asset.areaPicLocationId || null) === nextAreaPicLocationId
+    ) {
+      continue;
+    }
+
+    // Section F — locationPicUid/allowedLocationPicUids (dipakai
+    // firestore.rules isLocationPicForAsset/isLocationPicAllowedAssetUpdate
+    // untuk staff yang ditunjuk PIC di Master Lokasi, TANPA butuh role
+    // "location_pic") dihitung ULANG dari resolveAreaPic setiap kali — bukan
+    // arrayUnion/arrayRemove — supaya PIC lama otomatis kehilangan akses
+    // begitu diganti/dihapus (tidak ada sisa uid basi di array).
+    await updateDoc(doc(db, "assets", id), {
+      areaPicUid: nextAreaPicUid,
+      areaPicName: areaPic?.name || null,
+      areaPicEmail: areaPic?.email || null,
+      areaPicLocationId: nextAreaPicLocationId,
+      areaPicLocationName: areaPic?.locationName || null,
+      locationPicUid: nextAreaPicUid,
+      locationPicName: areaPic?.name || null,
+      locationPicEmail: areaPic?.email || null,
+      allowedLocationPicUids: nextAreaPicUid ? [nextAreaPicUid] : [],
+      updatedAt: serverTimestamp(),
+    });
+    updatedCount += 1;
+  }
+
+  return updatedCount;
 }

@@ -355,13 +355,70 @@ service cloud.firestore {
         ]);
     }
 
+    // Section L — akses PIC Lokasi berbasis FIELD ASSET (locationPicUid/
+    // areaPicUid/allowedLocationPicUids), BUKAN role "location_pic". Ini
+    // yang memungkinkan staff biasa yang ditunjuk PIC di Master Lokasi
+    // (mis. Daniel) langsung dapat akses tanpa perlu ganti role lewat User
+    // Access — beda dari isLocationPic()/isLocationPicCreate()/
+    // isLocationPicUpdate() di atas yang masih role-gated (dipertahankan,
+    // tidak dihapus, untuk akun yang literal berrole "location_pic").
+    function isLocationPicForAsset(data) {
+      return isSignedIn()
+        && (
+          data.get("locationPicUid", "") == request.auth.uid
+          || data.get("areaPicUid", "") == request.auth.uid
+          || request.auth.uid in data.get("allowedLocationPicUids", [])
+        );
+    }
+
+    function isLocationPicCreateAsset() {
+      return isSignedIn()
+        && request.resource.data.get("createdFromLocationPic", false) == true
+        && request.resource.data.get("locationPicUid", "") == request.auth.uid
+        && request.auth.uid in request.resource.data.get("allowedLocationPicUids", []);
+    }
+
+    function isLocationPicAllowedAssetUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+
+      return isLocationPicForAsset(resource.data)
+        && changed.hasOnly([
+          "name", "assetName", "categoryId", "categoryName", "brandName", "model", "type", "serialNumber",
+          "divisionId", "divisionName",
+
+          "locationId", "location", "locationText",
+          "buildingId", "buildingName", "floorId", "floorName", "roomId", "roomName", "areaId", "areaName",
+
+          "trackingMode", "usageType", "usageTypeLabel",
+          "custodianUid", "custodianName", "custodianEmail", "custodianDivision", "custodianRole",
+          "currentHolderUid", "currentHolderName", "currentHolderEmail", "currentHolderDivision",
+          "currentUsageStatus", "currentUsageStatusLabel",
+
+          "assetStatus", "status", "condition", "conditionLabel", "isBorrowable",
+
+          "photoUrl", "photoUrls", "imageUrl", "driveFileId", "driveUrl", "thumbnailUrl",
+
+          "operationalNote", "note",
+
+          "areaPicUid", "areaPicName", "areaPicEmail", "areaPicLocationId", "areaPicLocationName",
+          "locationPicUid", "locationPicName", "locationPicEmail", "allowedLocationPicUids",
+
+          "updatedAt", "updatedByUid", "updatedByName", "updatedByRole"
+        ])
+        && !changed.hasAny([
+          "purchasePrice", "price", "assetValue", "purchaseDate", "vendorName", "invoiceNumber",
+          "invoiceFileId", "invoiceUrl", "fundingSource", "purchaseMethod", "estimatedUsefulLife", "financeNote"
+        ]);
+    }
+
     match /assets/{assetId} {
-      allow read: if isActiveAssetUser();
-      allow create: if isManager() || isLocationPicCreate();
+      allow read: if isActiveAssetUser() || isLocationPicForAsset(resource.data);
+      allow create: if isManager() || isLocationPicCreate() || isLocationPicCreateAsset();
       allow update: if isManager() ||
         isCustodianOrHolderUsageUpdate() ||
         isAssetFinanceUpdate() ||
         isLocationPicUpdate() ||
+        isLocationPicAllowedAssetUpdate() ||
         (isActiveAssetUser() &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(["assetStatus", "condition", "currentBorrowingId",
