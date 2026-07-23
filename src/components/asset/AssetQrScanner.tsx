@@ -11,6 +11,7 @@ import {
   FlashlightOff,
   Flashlight,
   RefreshCw,
+  RotateCw,
   Video,
   VideoOff,
   ZoomIn,
@@ -31,11 +32,37 @@ interface ExtendedTrackConstraintSet extends MediaTrackConstraintSet {
   zoom?: number;
   torch?: boolean;
   focusMode?: string;
+  exposureMode?: string;
+  whiteBalanceMode?: string;
 }
 
-const AUTO_ZOOM_START_DELAY_MS = 2000;
-const AUTO_ZOOM_INTERVAL_MS = 1500;
-const AUTO_ZOOM_STEP = 0.2;
+// Section A/B — BarcodeDetector native (Chrome/Android) belum masuk
+// lib.dom.d.ts baku, jadi dideklarasikan manual di sini saja.
+interface NativeBarcodeResult {
+  rawValue: string;
+}
+interface NativeBarcodeDetector {
+  detect(source: CanvasImageSource): Promise<NativeBarcodeResult[]>;
+}
+interface NativeBarcodeDetectorConstructor {
+  new (options?: { formats: string[] }): NativeBarcodeDetector;
+}
+declare global {
+  interface Window {
+    BarcodeDetector?: NativeBarcodeDetectorConstructor;
+  }
+}
+
+// Section B — SATU sumber ukuran viewport kamera, dipakai identik untuk
+// video aktif maupun placeholder "Mulai Scan", supaya tidak ada lompatan
+// tinggi saat kamera dinyalakan/dimatikan. Sengaja fixed height (BUKAN
+// aspect-video) karena aspect-video di card lebar bikin tinggi ikut
+// membesar mengikuti lebar card.
+const SCANNER_VIEWPORT_CLASS = "h-[220px] w-full sm:h-[240px] lg:h-[260px]";
+
+const AUTO_ZOOM_START_DELAY_MS = 1500;
+const AUTO_ZOOM_INTERVAL_MS = 1300;
+const AUTO_ZOOM_STEP = 0.25;
 
 export interface AssetQrScannerProps {
   onScan: (rawValue: string) => void;
@@ -74,6 +101,8 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
   const hasScannedRef = useRef(false);
   const autoZoomTimeoutRef = useRef<number | null>(null);
   const autoZoomIntervalRef = useRef<number | null>(null);
+  const nativeDetectorRef = useRef<NativeBarcodeDetector | null>(null);
+  const nativeScanFrameRef = useRef<number | null>(null);
 
   const [scanning, setScanning] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -115,6 +144,9 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
 
   const stopScanner = useCallback(() => {
     clearAutoZoomTimers();
+    if (nativeScanFrameRef.current) cancelAnimationFrame(nativeScanFrameRef.current);
+    nativeScanFrameRef.current = null;
+    nativeDetectorRef.current = null;
     controlsRef.current?.stop();
     controlsRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -158,6 +190,61 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
     [applyZoom, autoZoomEnabled, clearAutoZoomTimers, hasManualZoom]
   );
 
+  // Section C — jalur fallback ZXing, dipakai baik sebagai jalur utama
+  // (browser tidak punya BarcodeDetector) maupun sebagai fallback kalau
+  // native detector tiba-tiba error di tengah scan.
+  const startZxingDecode = useCallback(
+    async (stream: MediaStream) => {
+      if (!codeReaderRef.current) {
+        codeReaderRef.current = new BrowserMultiFormatReader();
+        codeReaderRef.current.possibleFormats = [BarcodeFormat.QR_CODE];
+      }
+      const controls = await codeReaderRef.current.decodeFromStream(
+        stream,
+        videoRef.current || undefined,
+        (result) => {
+          if (result) handleDecoded(result.getText());
+        }
+      );
+      controlsRef.current = controls;
+    },
+    [handleDecoded]
+  );
+
+  // Section A/B — scan loop BarcodeDetector native. Membaca SELURUH frame
+  // video (bukan cuma area kotak panduan) via requestAnimationFrame supaya
+  // seresponsif mungkin di Android Chrome. Kalau native detector error di
+  // tengah jalan (jarang, tapi bisa terjadi di sebagian device), turun ke
+  // ZXing tanpa mengulang getUserMedia (stream yang sama dipakai lagi).
+  // Disimpan lewat ref (bukan langsung useCallback self-reference) supaya
+  // pemanggilan rekursif via requestAnimationFrame tidak menangkap closure
+  // basi/melanggar aturan react-hooks soal referensi sebelum deklarasi.
+  const scanWithNativeDetectorRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    scanWithNativeDetectorRef.current = () => {
+      const detector = nativeDetectorRef.current;
+      if (!detector || !videoRef.current || hasScannedRef.current) return;
+
+      detector
+        .detect(videoRef.current)
+        .then((barcodes) => {
+          if (hasScannedRef.current) return;
+          const rawValue = barcodes?.[0]?.rawValue;
+          if (rawValue) {
+            handleDecoded(rawValue);
+            return;
+          }
+          nativeScanFrameRef.current = requestAnimationFrame(() => scanWithNativeDetectorRef.current());
+        })
+        .catch((err) => {
+          console.warn("[QR Native Detector] gagal, fallback ke ZXing:", err);
+          nativeDetectorRef.current = null;
+          if (streamRef.current) startZxingDecode(streamRef.current).catch(() => {});
+        });
+    };
+  }, [handleDecoded, startZxingDecode]);
+
   const startScanner = useCallback(
     async (preferredDeviceId?: string) => {
       setError("");
@@ -170,15 +257,15 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
         const deviceId = preferredDeviceId || selectedDeviceId || pickBackCameraId(videoDevices);
         setSelectedDeviceId(deviceId);
 
-        // Section C — resolusi tinggi + focusMode continuous kalau
-        // browser/device dukung. Kalau constraint ini gagal (Overconstrained),
-        // fallback ke constraint standar supaya scan tetap jalan.
+        // Section E — resolusi tinggi + frameRate 30fps kalau browser/device
+        // dukung. Kalau constraint ini gagal (Overconstrained), fallback ke
+        // constraint standar supaya scan tetap jalan.
         const idealConstraints: MediaStreamConstraints = {
           video: {
             ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: "environment" } }),
             width: { ideal: 1920 },
             height: { ideal: 1080 },
-            advanced: [{ focusMode: "continuous" } as ExtendedTrackConstraintSet],
+            frameRate: { ideal: 30 },
           } as MediaTrackConstraints,
           audio: false,
         };
@@ -205,6 +292,22 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
         }
 
         const track = stream.getVideoTracks()[0];
+
+        // Section E — focusMode/exposureMode/whiteBalanceMode continuous
+        // kalau device dukung. TIDAK boleh bikin proses start gagal kalau
+        // tidak didukung — cukup dicoba, diamkan kalau ditolak.
+        try {
+          await track.applyConstraints({
+            advanced: [
+              { focusMode: "continuous" },
+              { exposureMode: "continuous" },
+              { whiteBalanceMode: "continuous" },
+            ] as ExtendedTrackConstraintSet[],
+          });
+        } catch (constraintError) {
+          console.warn("[Camera] advanced constraints tidak didukung:", constraintError);
+        }
+
         const capabilities = track.getCapabilities?.() as ExtendedTrackCapabilities | undefined;
         const settings = track.getSettings?.() as ExtendedTrackSettings | undefined;
 
@@ -223,20 +326,18 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
         }
         setTorchSupported(!!capabilities?.torch);
 
-        if (!codeReaderRef.current) {
-          codeReaderRef.current = new BrowserMultiFormatReader();
-          codeReaderRef.current.possibleFormats = [BarcodeFormat.QR_CODE];
+        // Section A/B — pakai BarcodeDetector native kalau browser dukung
+        // (umumnya Android Chrome, lebih cepat), fallback ke ZXing kalau
+        // tidak ada.
+        const hasNativeBarcodeDetector = typeof window !== "undefined" && "BarcodeDetector" in window;
+        if (hasNativeBarcodeDetector && window.BarcodeDetector) {
+          nativeDetectorRef.current = new window.BarcodeDetector({ formats: ["qr_code"] });
+          setScanning(true);
+          scanWithNativeDetectorRef.current();
+        } else {
+          setScanning(true);
+          await startZxingDecode(stream);
         }
-
-        const controls = await codeReaderRef.current.decodeFromStream(
-          stream,
-          videoRef.current || undefined,
-          (result) => {
-            if (result) handleDecoded(result.getText());
-          }
-        );
-        controlsRef.current = controls;
-        setScanning(true);
       } catch (err) {
         console.error("[AssetQrScanner] gagal mengakses kamera", err);
         const message = getCameraErrorMessage(err);
@@ -247,7 +348,7 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
         setStarting(false);
       }
     },
-    [autoZoomEnabled, handleDecoded, onError, selectedDeviceId, startAutoZoomLoop]
+    [autoZoomEnabled, onError, selectedDeviceId, startAutoZoomLoop, startZxingDecode]
   );
 
   const switchCamera = useCallback(() => {
@@ -276,6 +377,25 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
     }
   };
 
+  // Section G — "Fokus Ulang", buat kasus kamera sempat gagal fokus (mis.
+  // sempat digerakkan) — coba re-apply continuous focus/exposure. Aman
+  // diabaikan kalau device tidak dukung.
+  const refocusCamera = async () => {
+    const track = getVideoTrack();
+    if (!track) return;
+    try {
+      await track.applyConstraints({
+        advanced: [
+          { focusMode: "continuous" },
+          { exposureMode: "continuous" },
+          { whiteBalanceMode: "continuous" },
+        ] as ExtendedTrackConstraintSet[],
+      });
+    } catch {
+      // tidak didukung — abaikan diam-diam.
+    }
+  };
+
   useEffect(() => {
     return () => {
       stopScanner();
@@ -283,22 +403,20 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
   }, [stopScanner]);
 
   return (
-    <div>
-      <div className="relative overflow-hidden rounded-2xl bg-slate-900">
-        <video
-          ref={videoRef}
-          className="h-[320px] w-full object-cover md:h-[360px]"
-          muted
-          playsInline
-        />
+    <div className="mx-auto w-full max-w-[640px]">
+      <div className={`relative overflow-hidden rounded-3xl bg-slate-950 ${SCANNER_VIEWPORT_CLASS}`}>
+        <video ref={videoRef} className="h-full w-full object-cover" muted playsInline autoPlay />
 
         {scanning && (
           <>
+            {/* Section F — kotak ini HANYA bantuan visual. Scanner (native
+                detector maupun ZXing decodeFromStream) tetap membaca
+                seluruh frame video, bukan cuma area di dalam kotak. */}
             <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-              <div className="h-64 w-64 rounded-3xl border-2 border-cyan-400 shadow-[0_0_0_9999px_rgba(15,23,42,0.45)] md:h-80 md:w-80" />
+              <div className="h-[140px] w-[140px] rounded-2xl border-2 border-cyan-400 shadow-[0_0_0_9999px_rgba(15,23,42,0.28)] sm:h-[160px] sm:w-[160px]" />
             </div>
-            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full bg-black/60 px-4 py-2 text-xs text-white">
-              Arahkan QR ke dalam kotak
+            <div className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/60 px-3 py-1.5 text-xs text-white">
+              Arahkan QR ke area kamera
             </div>
           </>
         )}
@@ -308,9 +426,9 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
             type="button"
             onClick={() => startScanner()}
             disabled={starting}
-            className="flex h-[320px] w-full flex-col items-center justify-center gap-2 text-sm font-medium text-white disabled:opacity-70 md:h-[360px]"
+            className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm font-medium text-white disabled:opacity-70"
           >
-            <Camera size={30} />
+            <Camera className="h-6 w-6" />
             {starting ? "Membuka kamera..." : "Mulai Scan"}
           </button>
         )}
@@ -322,51 +440,63 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
         </p>
       )}
 
-      <p className="mt-3 text-xs text-slate-400">
-        Pastikan QR tidak blur, cukup cahaya, dan masuk ke kotak panduan.
+      <p className="mt-2 text-xs text-slate-400">
+        QR tidak harus pas di kotak, tapi pastikan tidak blur dan cukup cahaya.
       </p>
 
       {scanning && (
-        <div className="mt-4 space-y-3">
-          <div className="flex flex-wrap gap-2">
+        <div className="mt-3 space-y-3">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
             <button
               type="button"
               onClick={stopScanner}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
             >
               <VideoOff size={14} />
               Stop Kamera
             </button>
-            {devices.length > 1 && (
+            {devices.length > 1 ? (
               <button
                 type="button"
                 onClick={switchCamera}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
               >
                 <RefreshCw size={14} />
                 Ganti Kamera
               </button>
+            ) : (
+              <span />
             )}
-            {torchSupported && (
+            <button
+              type="button"
+              onClick={refocusCamera}
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              <RotateCw size={14} />
+              Fokus Ulang
+            </button>
+            {torchSupported ? (
               <button
                 type="button"
                 onClick={toggleTorch}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
               >
                 {torchOn ? <Flashlight size={14} /> : <FlashlightOff size={14} />}
                 Flash
               </button>
+            ) : (
+              <span />
             )}
           </div>
 
           {zoomCapability ? (
-            <div className="rounded-xl border border-slate-200 bg-white p-3">
-              <div className="mb-2 flex items-center justify-between text-xs font-semibold text-slate-600">
-                <span className="flex items-center gap-1.5">
+            <div className="rounded-2xl border border-slate-200 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-slate-600">
                   <ZoomIn size={14} />
                   Zoom Kamera
                 </span>
-                <label className="flex items-center gap-1.5 font-normal text-slate-500">
+                <label className="flex items-center gap-2 text-sm text-slate-500">
                   <input
                     type="checkbox"
                     checked={autoZoomEnabled}
@@ -393,7 +523,7 @@ export default function AssetQrScanner({ onScan, onError }: AssetQrScannerProps)
           ) : (
             <p className="flex items-center gap-1.5 text-xs text-slate-400">
               <Video size={13} />
-              Zoom kamera tidak didukung di perangkat ini.
+              Auto zoom tidak didukung di perangkat ini.
             </p>
           )}
         </div>

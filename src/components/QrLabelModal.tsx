@@ -145,6 +145,7 @@ export default function QrLabelModal({
   const [labelCountInput, setLabelCountInput] = useState("18");
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
   const [copied, setCopied] = useState(false);
+  const [copiedUrl, setCopiedUrl] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const singleLabelRef = useRef<HTMLDivElement>(null);
   const activePageRef = useRef<HTMLDivElement>(null);
@@ -265,6 +266,19 @@ export default function QrLabelModal({
       await navigator.clipboard.writeText(asset.assetCode);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // clipboard tidak tersedia — abaikan diam-diam
+    }
+  };
+
+  // Section J — Copy QR URL, supaya admin bisa langsung memverifikasi isi
+  // QR yang bakal dicetak itu URL /asset-action yang benar, bukan kebetulan
+  // kepotong data vCard/kontak lain.
+  const handleCopyUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(qrValue);
+      setCopiedUrl(true);
+      setTimeout(() => setCopiedUrl(false), 1500);
     } catch {
       // clipboard tidak tersedia — abaikan diam-diam
     }
@@ -868,6 +882,27 @@ export default function QrLabelModal({
                 )}
               </>
             )}
+
+            {/* Section J — preview isi QR yang bakal dicetak, supaya admin
+                bisa memastikan ini URL /asset-action yang benar (bukan
+                vCard/kontak lain yang kebetulan tersimpan). */}
+            <div className="mb-3 rounded-xl border border-slate-200 bg-slate-50 p-3 no-print">
+              <p className="mb-1 text-[11px] font-semibold uppercase text-slate-400">QR Value</p>
+              <p className="break-all font-mono text-xs text-slate-700">{qrValue}</p>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleCopyUrl}
+              className="w-full mb-2 inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 cursor-pointer hover:bg-slate-50"
+            >
+              {copiedUrl ? (
+                <Check size={15} className="text-emerald-600" />
+              ) : (
+                <Copy size={15} />
+              )}
+              {copiedUrl ? "URL Tersalin" : "Copy QR URL"}
+            </button>
 
             <button
               type="button"

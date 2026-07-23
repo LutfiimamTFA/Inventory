@@ -41,6 +41,7 @@ import {
   TRACKING_MODE_LABEL,
   CONDITION_LABEL,
   extractAssetCodeFromQr,
+  isVCardOrContactQr,
   formatDate,
   formatDateTime,
 } from "@/lib/utils";
@@ -700,11 +701,15 @@ function ScanPageContent() {
     setError("");
     setNotFound(false);
     setAsset(null);
-    // Section I — dukung QR lama (kode polos) maupun QR baru (URL penuh
+    // Section I/J — dukung QR lama (kode polos) maupun QR baru (URL penuh
     // /asset-action?code=...) dari kamera bawaan HP maupun scanner internal.
+    if (isVCardOrContactQr(code)) {
+      setError("QR ini bukan QR asset QHSE Care. Silakan cetak ulang QR label asset.");
+      return;
+    }
     const trimmed = extractAssetCodeFromQr(code).trim();
     if (!trimmed) {
-      setError("QR tidak berisi kode asset yang valid.");
+      setError("QR tidak berisi kode asset yang valid. Pastikan QR berasal dari label asset QHSE Care.");
       return;
     }
     // Scan HANYA membaca data — tidak ada write/ubah status di sini sama
@@ -836,16 +841,12 @@ function ScanPageContent() {
   return (
     <ProtectedLayout>
       <div className="scan-page min-h-screen w-full max-w-full overflow-x-hidden bg-slate-50 px-4 pb-[calc(6rem+env(safe-area-inset-bottom))] pt-4 md:px-6 md:pb-6 md:pt-0">
-      <div className="block md:hidden rounded-xl bg-green-50 p-2 text-xs font-semibold text-green-700">
-        Mobile Scan Layout Aktif
-      </div>
-
       <PageHeader
         title="Scan QR Aset"
         subtitle="Arahkan kamera ke QR code pada aset, atau masukkan kode secara manual."
       />
 
-      <div className="grid w-full max-w-full grid-cols-1 gap-5 md:grid-cols-2">
+      <div className="grid w-full max-w-full grid-cols-1 gap-5 xl:grid-cols-[minmax(0,0.95fr)_minmax(360px,0.75fr)]">
         {/* Kiri: area scan — tidak diubah alurnya, cuma dipertahankan */}
         <div className="w-full min-w-0 max-w-full overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 shadow-sm md:p-6">
           <div className="flex items-center gap-2 mb-4">

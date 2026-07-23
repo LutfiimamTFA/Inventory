@@ -1,25 +1,31 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { collection, getDocs, limit, query, where } from "firebase/firestore";
 import {
   AlertTriangle,
   ArrowRightLeft,
+  ChevronUp,
   Eye,
   Pencil,
+  QrCode,
   Undo2,
 } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { Asset } from "@/lib/types";
+import { isAssetInMyPicLocation } from "@/lib/locations";
 import {
   ASSET_STATUS_COLOR,
   ASSET_STATUS_LABEL,
   CONDITION_LABEL,
+  TRACKING_MODE_LABEL,
 } from "@/lib/utils";
 import Badge from "@/components/Badge";
 import ReportIssueModal from "@/components/ReportIssueModal";
+import { BorrowModal, ReturnModal } from "@/components/BorrowReturnModal";
+import { Toast, ToastState } from "@/components/Toast";
 
 // Section E — halaman ini SENGAJA berdiri sendiri (bukan dalam
 // ProtectedLayout/sidebar) supaya bisa langsung dibuka kamera bawaan HP dari
@@ -36,13 +42,29 @@ export default function AssetActionPage() {
 function AssetActionContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const { firebaseUser, assetUser, role, loading, isLocationPicRole, assignedPicLocations } = useAuth();
   const code = searchParams.get("code") || "";
 
   const [asset, setAsset] = useState<Asset | null>(null);
   const [notFound, setNotFound] = useState(false);
   const [loadingAsset, setLoadingAsset] = useState(true);
   const [reportOpen, setReportOpen] = useState(false);
+  const [borrowOpen, setBorrowOpen] = useState(false);
+  const [returnOpen, setReturnOpen] = useState(false);
+  const [showFullDetail, setShowFullDetail] = useState(false);
+  const [toast, setToast] = useState<ToastState | null>(null);
+
+  // Section K — diekstrak jadi fungsi sendiri supaya bisa dipanggil ULANG
+  // setelah Pinjam/Kembalikan sukses (refresh status asset), TANPA perlu
+  // scan ulang atau redirect ke /scan sama sekali.
+  const fetchAssetByCode = useCallback(async (assetCode: string) => {
+    const snap = await getDocs(
+      query(collection(db, "assets"), where("assetCode", "==", assetCode), limit(1))
+    );
+    if (snap.empty) return null;
+    const d = snap.docs[0];
+    return { id: d.id, ...d.data() } as Asset;
+  }, []);
 
   // Section E — flow: tunggu auth selesai, redirect ke login kalau belum
   // login (bawa returnUrl supaya balik ke sini lagi setelah login), baru
@@ -69,31 +91,41 @@ function AssetActionContent() {
       setNotFound(false);
     });
 
-    (async () => {
-      try {
-        const snap = await getDocs(
-          query(collection(db, "assets"), where("assetCode", "==", code), limit(1))
-        );
+    fetchAssetByCode(code)
+      .then((found) => {
         if (cancelled) return;
-        if (snap.empty) {
+        if (!found) {
           setNotFound(true);
           setAsset(null);
         } else {
-          const d = snap.docs[0];
-          setAsset({ id: d.id, ...d.data() } as Asset);
+          setAsset(found);
         }
-      } catch (error) {
+      })
+      .catch((error) => {
         console.error("[Asset Action] gagal memuat asset", { code, error });
-        setNotFound(true);
-      } finally {
+        if (!cancelled) setNotFound(true);
+      })
+      .finally(() => {
         if (!cancelled) setLoadingAsset(false);
-      }
-    })();
+      });
 
     return () => {
       cancelled = true;
     };
-  }, [loading, firebaseUser, code]);
+  }, [loading, firebaseUser, code, fetchAssetByCode]);
+
+  // Section K/L/M — setelah Pinjam/Kembalikan sukses, refresh data asset
+  // YANG SAMA di tempat (tanpa navigasi/scan ulang) supaya tombol aksi
+  // langsung menyesuaikan status terbaru.
+  const refreshAsset = useCallback(async () => {
+    if (!code) return;
+    try {
+      const found = await fetchAssetByCode(code);
+      if (found) setAsset(found);
+    } catch (error) {
+      console.error("[Asset Action] gagal refresh asset", { code, error });
+    }
+  }, [code, fetchAssetByCode]);
 
   if (loading || (!firebaseUser && !code)) {
     return (
@@ -145,7 +177,37 @@ function AssetActionContent() {
   const usedBySomeoneElse =
     !isFixedLocation && !isHeldByMe && !isAvailableToBorrow && usageStatus !== "available";
 
-  const isLocationPicOwner = role === "location_pic" && asset.areaPicUid === assetUser?.uid;
+  const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
+  const isLocationPicOwner = isLocationPicScoped && isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid);
+  // Section P — /assets/{id} punya guard sidebar sendiri (Super Admin/Asset
+  // Admin/Asset Finance/Tim IT selalu boleh, PIC Lokasi hanya untuk asset di
+  // lokasinya). Staff biasa (atau PIC di luar lokasinya) akan langsung
+  // dilempar balik oleh guard itu — jadi utk mereka "Lihat Detail" TIDAK
+  // boleh navigasi ke sana, cukup buka ringkasan tambahan di halaman ini.
+  const canOpenFullDetailPage =
+    role === "super_admin" || role === "asset_admin" || role === "asset_finance" || role === "it_team" || isLocationPicOwner;
+
+  // Section L — validasi sebelum buka modal Pinjam, SESUAI logic yang sudah
+  // ada di BorrowModal/borrowAsset, cuma dicek lebih awal di sini supaya
+  // pesan penolakannya spesifik (bukan modal kebuka lalu gagal submit).
+  const handleBorrowClick = () => {
+    if (!asset.isBorrowable) {
+      setToast({ type: "error", message: "Asset ini tidak dapat dipinjam." });
+      return;
+    }
+    if (isFixedLocation) {
+      setToast({ type: "error", message: "Asset tetap lokasi tidak dapat dipinjam." });
+      return;
+    }
+    if (asset.currentHolderUid && asset.currentHolderUid !== firebaseUser.uid) {
+      setToast({
+        type: "error",
+        message: `Asset sedang digunakan oleh ${asset.currentHolderName || "user lain"}.`,
+      });
+      return;
+    }
+    setBorrowOpen(true);
+  };
 
   return (
     <PageShell>
@@ -168,6 +230,20 @@ function AssetActionContent() {
             )}
           </div>
 
+          {/* Section P — ringkasan tambahan TANPA finance, dipakai staff/PIC
+              yang tidak punya akses ke /assets/{id} — jadi "Lihat Detail"
+              tidak perlu navigasi sama sekali untuk mereka. */}
+          {!canOpenFullDetailPage && showFullDetail && (
+            <div className="mt-3 space-y-2 border-t border-slate-100 pt-3 text-sm text-slate-600">
+              <Row label="Kategori" value={asset.categoryName || "-"} />
+              <Row label="Merk" value={asset.brand || "-"} />
+              <Row label="Model/Tipe" value={asset.model || "-"} />
+              <Row label="Serial Number" value={asset.serialNumber || "-"} />
+              <Row label="Mode Tracking" value={asset.trackingMode ? TRACKING_MODE_LABEL[asset.trackingMode] : "-"} />
+              {asset.operationalNotes && <Row label="Catatan Operasional" value={asset.operationalNotes} />}
+            </div>
+          )}
+
           {usedBySomeoneElse && (
             <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
               <AlertTriangle size={14} className="mt-0.5 shrink-0" />
@@ -179,9 +255,15 @@ function AssetActionContent() {
 
           <div className="mt-5 space-y-2">
             <ActionButton
-              icon={Eye}
+              icon={showFullDetail && !canOpenFullDetailPage ? ChevronUp : Eye}
               label="Lihat Detail"
-              onClick={() => router.push(`/assets/${asset.id}`)}
+              onClick={() => {
+                if (canOpenFullDetailPage) {
+                  router.push(`/assets/${asset.id}`);
+                  return;
+                }
+                setShowFullDetail((prev) => !prev);
+              }}
             />
 
             {isLocationPicOwner && (
@@ -193,19 +275,11 @@ function AssetActionContent() {
             )}
 
             {!isFixedLocation && isHeldByMe && (
-              <ActionButton
-                icon={Undo2}
-                label="Kembalikan Asset"
-                onClick={() => router.push(`/scan?code=${encodeURIComponent(asset.assetCode)}`)}
-              />
+              <ActionButton icon={Undo2} label="Kembalikan Asset" onClick={() => setReturnOpen(true)} />
             )}
 
             {!isFixedLocation && isAvailableToBorrow && (
-              <ActionButton
-                icon={ArrowRightLeft}
-                label="Pinjam Asset"
-                onClick={() => router.push(`/scan?code=${encodeURIComponent(asset.assetCode)}`)}
-              />
+              <ActionButton icon={ArrowRightLeft} label="Pinjam Asset" onClick={handleBorrowClick} />
             )}
 
             <ActionButton
@@ -215,10 +289,42 @@ function AssetActionContent() {
               onClick={() => setReportOpen(true)}
             />
           </div>
+
+          {/* Section N/Q — scan ulang HANYA lewat tombol ini, tidak pernah
+              otomatis/dipaksa saat klik aksi lain di halaman ini. */}
+          <button
+            type="button"
+            onClick={() => router.push("/scan")}
+            className="mt-3 flex w-full items-center justify-center gap-1.5 text-xs font-medium text-slate-400 hover:text-slate-600"
+          >
+            <QrCode size={13} />
+            Scan Asset Lain
+          </button>
         </div>
       </div>
 
       <ReportIssueModal asset={asset} open={reportOpen} onClose={() => setReportOpen(false)} />
+      <BorrowModal
+        asset={asset}
+        open={borrowOpen}
+        onClose={() => setBorrowOpen(false)}
+        onDone={() => {
+          setBorrowOpen(false);
+          setToast({ type: "success", message: "Asset berhasil dipinjam." });
+          refreshAsset();
+        }}
+      />
+      <ReturnModal
+        asset={asset}
+        open={returnOpen}
+        onClose={() => setReturnOpen(false)}
+        onDone={() => {
+          setReturnOpen(false);
+          setToast({ type: "success", message: "Asset berhasil dikembalikan." });
+          refreshAsset();
+        }}
+      />
+      <Toast toast={toast} onClose={() => setToast(null)} />
     </PageShell>
   );
 }
@@ -287,4 +393,3 @@ function ErrorState({ message }: { message: string }) {
     </div>
   );
 }
-

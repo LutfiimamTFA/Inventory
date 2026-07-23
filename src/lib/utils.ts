@@ -775,12 +775,33 @@ export function getQrDomainNotice(baseUrl: string): { tone: "warning" | "info" |
 // (https://qhse-care.vercel.app/asset-action?code=...). qrCodeValue yang
 // tersimpan di Firestore selalu kode polos (lihat assets/new & edit), jadi
 // hasil ekstraksi ini yang dipakai untuk query, bukan raw value dari kamera.
+// Section J — kamera bawaan HP kadang salah mendeteksi QR sebagai vCard/
+// kontak (mis. kalau ada QR kontak lama tertukar dengan label asset).
+// Dicek terpisah dari extractAssetCodeFromQr supaya pemanggil bisa kasih
+// pesan yang lebih spesifik ("ini QR kontak, bukan QR asset") daripada
+// cuma "kode tidak valid".
+export function isVCardOrContactQr(rawValue: string): boolean {
+  if (!rawValue) return false;
+  const value = rawValue.trim();
+  return value.includes("BEGIN:VCARD") || /^tel:|^mailto:/i.test(value);
+}
+
 export function extractAssetCodeFromQr(rawValue: string): string {
   if (!rawValue) return "";
   const value = rawValue.trim();
+  if (isVCardOrContactQr(value)) return "";
+
   try {
     const url = new URL(value);
-    return url.searchParams.get("code") || "";
+    const codeFromParam = url.searchParams.get("code");
+    if (codeFromParam) return codeFromParam.trim();
+
+    // Section I — fallback kalau suatu saat format URL berubah jadi path
+    // (/assets/AST-...) alih-alih query param ?code=.
+    const lastSegment = url.pathname.split("/").filter(Boolean).pop();
+    if (lastSegment?.startsWith("AST-")) return lastSegment;
+
+    return "";
   } catch {
     return value;
   }
