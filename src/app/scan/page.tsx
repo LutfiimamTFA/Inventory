@@ -49,9 +49,14 @@ import {
   formatExpectedReturn,
   getAssetConditionLabel,
   isBorrowingLate,
+  isIssueTicketActive,
 } from "@/lib/utils";
 import { handoverTemporary, returnToCustodian } from "@/lib/custodian-actions";
 import { EmployeeOption, fetchActiveEmployeeOptions } from "@/lib/firestore-helpers";
+import {
+  canReportAssetIssue,
+  getAssetIssueReportContext,
+} from "@/lib/asset-issue-reporting";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
 import Badge from "@/components/Badge";
@@ -74,6 +79,7 @@ interface ScanHistoryEntry {
   scannedAt: number;
 }
 const SCAN_HISTORY_LIMIT = 10;
+type AssetLookupSource = "qr" | "manual" | "history" | "refresh";
 
 function scanHistoryKey(uid: string) {
   return `assetview_scan_history_${uid}`;
@@ -264,6 +270,13 @@ function getUsagePanel(a: Asset): { badge: string; colorClass: string; message: 
       message: `Aset ini sedang dipakai oleh ${name}.`,
     };
   }
+  if (status === "inspection_required" || (!status && a.assetStatus === "inspection_required")) {
+    return {
+      badge: "Menunggu Pemeriksaan QHSE",
+      colorClass: ASSET_USAGE_STATUS_COLOR.inspection_required,
+      message: "Aset menunggu pemeriksaan QHSE sebelum dapat dipakai lagi.",
+    };
+  }
   if (status === "maintenance" || (!status && a.assetStatus === "maintenance")) {
     return {
       badge: "Maintenance",
@@ -298,7 +311,7 @@ function getUsagePanel(a: Asset): { badge: string; colorClass: string; message: 
 // borrowed/in_use/maintenance.
 function isUsageCandidate(a: Asset): boolean {
   if (a.currentUsageStatus) return a.currentUsageStatus !== "available";
-  return ["borrowed", "in_use", "maintenance"].includes(a.assetStatus);
+  return ["borrowed", "in_use", "inspection_required", "maintenance"].includes(a.assetStatus);
 }
 
 // ── Baris tunggal untuk section "Status Pemakaian Aset Kantor" ────────────
@@ -307,7 +320,7 @@ function isUsageCandidate(a: Asset): boolean {
 // status termasuk "available") sedangkan tabel cuma dari usageCandidates
 // (assetStatus borrowed/in_use/maintenance saja, "available" DIBUANG),
 // makanya total di summary vs jumlah baris di tabel tidak pernah sinkron.
-type AssetUsageStatusGroup = "available" | "in_use" | "maintenance";
+type AssetUsageStatusGroup = "available" | "in_use" | "inspection_required" | "maintenance";
 
 interface AssetUsageRow {
   id: string;
@@ -332,6 +345,7 @@ interface AssetUsageRow {
 
 function normalizeUsageStatus(a: Asset): AssetUsageStatusGroup {
   const usageStatus = a.currentUsageStatus || a.assetStatus || "available";
+  if (usageStatus === "inspection_required") return "inspection_required";
   if (usageStatus === "maintenance") return "maintenance";
   if (
     usageStatus === "with_custodian" ||
@@ -346,6 +360,7 @@ function normalizeUsageStatus(a: Asset): AssetUsageStatusGroup {
 
 const USAGE_STATUS_GROUP_LABEL: Record<AssetUsageStatusGroup, string> = {
   in_use: "Sedang Dipakai",
+  inspection_required: "Menunggu Pemeriksaan QHSE",
   maintenance: "Maintenance",
   available: "Tersedia",
 };
@@ -448,11 +463,13 @@ function ScanPageContent() {
   const [toast, setToast] = useState<ToastState | null>(null);
   const [manualCode, setManualCode] = useState("");
   const [asset, setAsset] = useState<Asset | null>(null);
+  const [assetLookupSource, setAssetLookupSource] = useState<AssetLookupSource>("manual");
   const [notFound, setNotFound] = useState(false);
   const [error, setError] = useState("");
   const [borrowOpen, setBorrowOpen] = useState(false);
   const [returnOpen, setReturnOpen] = useState(false);
   const [reportIssueOpen, setReportIssueOpen] = useState(false);
+  const [reportIssueAllowQrObservation, setReportIssueAllowQrObservation] = useState(false);
   const [allAssets, setAllAssets] = useState<Asset[]>([]);
   const [activeBorrowings, setActiveBorrowings] = useState<AssetBorrowing[]>([]);
   const [myReportCount, setMyReportCount] = useState(0);
@@ -502,21 +519,51 @@ function ScanPageContent() {
     console.log("[Scan Mobile Overflow Debug]", overflowing);
   }, []);
 
-  // Daftar karyawan aktif — dimuat sekali saat halaman dibuka (bukan lazy
-  // lagi) karena sekarang dipakai untuk menerjemahkan uid/email jadi nama di
+  // Section A — hanya role yang benar-benar butuh daftar karyawan (assign
+  // custodian/serahkan sementara/input aset) yang boleh fetch employee_profiles.
+  // Staff biasa (termasuk staff HRP fallback yang belum punya dokumen
+  // asset_users sama sekali) TIDAK punya akses baca collection ini — nama
+  // PIC/pemegang tetap tampil dari field yang sudah tersimpan di asset
+  // sendiri (custodianName/currentHolderName/dst.), bukan dari lookup ini.
+  const canLoadActiveEmployees =
+    role === "super_admin" || role === "asset_admin" || role === "location_pic";
+
+  // Daftar karyawan aktif — dimuat sekali saat role sudah diketahui (bukan
+  // lazy lagi) karena dipakai untuk menerjemahkan uid/email jadi nama di
   // SELURUH tabel "Status Pemakaian Aset Kantor", bukan cuma modal Serahkan
-  // Sementara.
+  // Sementara. Section E — sengaja menunggu role !== undefined dulu supaya
+  // tidak sempat fetch dengan role yang belum siap.
   useEffect(() => {
+    if (role === undefined) return;
+    if (!canLoadActiveEmployees) {
+      console.log("[ScanPage] skip load active employees for role", { role });
+      Promise.resolve().then(() => setEmployeeOptions([]));
+      return;
+    }
     let cancelled = false;
     fetchActiveEmployeeOptions()
       .then((options) => {
         if (!cancelled) setEmployeeOptions(options);
       })
-      .catch((err) => console.error("[ScanPage] gagal memuat daftar karyawan aktif", err));
+      .catch((err) => {
+        // Section D — permission-denied di sini untuk role yang memang tidak
+        // seharusnya baca collection ini bukan bug, jadi cukup warn, bukan
+        // error merah (fetch ini opsional, bukan fitur wajib Scan QR).
+        const code = (err as { code?: string })?.code;
+        if (code === "permission-denied") {
+          console.warn("[ScanPage] daftar karyawan tidak dimuat untuk role ini", { role, errorCode: code });
+          return;
+        }
+        console.error("[ScanPage] gagal memuat daftar karyawan aktif", {
+          role,
+          errorCode: code,
+          errorMessage: (err as { message?: string })?.message,
+        });
+      });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [role, canLoadActiveEmployees]);
 
   const employeeMap: EmployeeMap = useMemo(() => {
     const byUid: Record<string, EmployeeOption> = {};
@@ -773,7 +820,7 @@ function ScanPageContent() {
     () => ({
       sedangDipakai: assetUsageRows.filter((row) => row.status === "in_use").length,
       tersedia: assetUsageRows.filter((row) => row.status === "available").length,
-      maintenance: assetUsageRows.filter((row) => row.status === "maintenance").length,
+      maintenance: assetUsageRows.filter((row) => row.status === "maintenance" || row.status === "inspection_required").length,
       terlambat: assetUsageRows.filter((row) => isOverdue(row.expectedReturnAt)).length,
     }),
     [assetUsageRows]
@@ -810,7 +857,7 @@ function ScanPageContent() {
     return rows;
   }, [assetUsageRows, usageFilter, usageSearch, assetUser?.uid]);
 
-  const lookupAsset = async (code: string) => {
+  const lookupAsset = async (code: string, source: AssetLookupSource = "manual") => {
     setError("");
     setNotFound(false);
     setAsset(null);
@@ -840,6 +887,7 @@ function ScanPageContent() {
     }
     const d = snap.docs[0];
     const found = { id: d.id, ...d.data() } as Asset;
+    setAssetLookupSource(source);
     setAsset(found);
     pushScanHistory(found);
   };
@@ -853,7 +901,7 @@ function ScanPageContent() {
     const code = searchParams.get("code");
     if (!code) return;
     queueMicrotask(() => {
-      lookupAsset(code);
+      lookupAsset(code, "qr");
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [assetUser, searchParams]);
@@ -872,7 +920,7 @@ function ScanPageContent() {
   const usedBySomeoneElse =
     asset &&
     isUsageCandidate(asset) &&
-    (asset.currentUsageStatus || asset.assetStatus) !== "maintenance" &&
+    !["maintenance", "inspection_required"].includes(asset.currentUsageStatus || asset.assetStatus) &&
     !isBorrowedByMe &&
     !isInUseByMe &&
     !isCurrentHolderMe &&
@@ -886,12 +934,40 @@ function ScanPageContent() {
     asset &&
     asset.currentUsageStatus === "temporary_used_by_other" &&
     (isCurrentHolderMe || isMyCustodianAsset || isManager);
+  const currentReportUser = assetUser?.uid
+    ? {
+        uid: assetUser.uid,
+        name: assetUser.name || "",
+        email: assetUser.email || "",
+        role: role || assetUser.role || "staff",
+      }
+    : null;
+  const activeBorrowingForCurrentAsset = asset ? borrowingByAssetId.get(asset.id) || null : null;
+  const scannedAssetReportContext = asset
+    ? getAssetIssueReportContext({
+        user: currentReportUser,
+        asset,
+        activeBorrowing: activeBorrowingForCurrentAsset,
+        allowQrPhysicalObservation: assetLookupSource === "qr",
+      })
+    : null;
+  const canReportScannedAsset = !!scannedAssetReportContext?.canReport;
+  const scannedAssetReportLabel =
+    scannedAssetReportContext?.reportSource === "qr_physical_observation"
+      ? "Saya Menemukan Kendala"
+      : "Laporkan Kendala";
 
   const openReturnFor = async (a: Asset) => {
     // Baris di tabel cuma punya Asset ringkas dari listener assets — sudah
     // cukup lengkap (beda dengan borrowing doc), jadi bisa langsung dipakai.
     setAsset(a);
     setReturnOpen(true);
+  };
+
+  const openReportFor = (a: Asset, allowQrPhysicalObservation = false) => {
+    setAsset(a);
+    setReportIssueAllowQrObservation(allowQrPhysicalObservation);
+    setReportIssueOpen(true);
   };
 
   const handleReturnToCustodianNow = async (a: Asset) => {
@@ -901,7 +977,7 @@ function ScanPageContent() {
         asset: a,
         performedBy: { uid: assetUser?.uid || "", name: assetUser?.name || "" },
       });
-      if (asset?.id === a.id) lookupAsset(a.qrCodeValue);
+      if (asset?.id === a.id) lookupAsset(a.qrCodeValue, "refresh");
     } catch (err) {
       console.error("[ScanPage] gagal mengembalikan ke custodian", err);
     } finally {
@@ -941,7 +1017,7 @@ function ScanPageContent() {
         expectedReturnAt: handoverExpectedReturnAt || undefined,
         performedBy: { uid: assetUser?.uid || "", name: assetUser?.name || "" },
       });
-      if (asset?.id === handoverModalAsset.id) lookupAsset(handoverModalAsset.qrCodeValue);
+      if (asset?.id === handoverModalAsset.id) lookupAsset(handoverModalAsset.qrCodeValue, "refresh");
       closeHandoverModal();
     } catch (err) {
       console.error("[ScanPage] gagal menyerahkan aset sementara", err);
@@ -969,7 +1045,7 @@ function ScanPageContent() {
             <h2 className="font-semibold text-slate-800">Kamera Scanner</h2>
           </div>
 
-          <AssetQrScanner onScan={lookupAsset} />
+          <AssetQrScanner onScan={(code) => lookupAsset(code, "qr")} />
           {error && (
             <p className="text-sm text-red-600 mt-3 bg-red-50 border border-red-200 rounded-xl px-3 py-2">
               {error}
@@ -988,7 +1064,7 @@ function ScanPageContent() {
                 className="input w-full min-w-0"
               />
               <button
-                onClick={() => lookupAsset(manualCode)}
+                onClick={() => lookupAsset(manualCode, "manual")}
                 className="w-full md:w-auto rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium hover:bg-slate-50 inline-flex items-center justify-center gap-1.5 shrink-0 cursor-pointer"
               >
                 <Search size={14} />
@@ -1055,7 +1131,7 @@ function ScanPageContent() {
                       <li key={h.assetId}>
                         <button
                           type="button"
-                          onClick={() => lookupAsset(h.assetCode)}
+                          onClick={() => lookupAsset(h.assetCode, "history")}
                           className="w-full flex items-center justify-between gap-2 rounded-xl border border-slate-200 px-3 py-2 text-left hover:bg-slate-50 cursor-pointer"
                         >
                           <span className="min-w-0">
@@ -1108,13 +1184,15 @@ function ScanPageContent() {
               </div>
 
               <div className="flex flex-wrap gap-2 pt-1">
-                <button
-                  onClick={() => setReportIssueOpen(true)}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-red-200 bg-red-50 text-red-700 px-5 py-2.5 text-sm font-medium hover:bg-red-100 cursor-pointer"
-                >
-                  <AlertTriangle size={15} />
-                  Laporkan Kendala
-                </button>
+                {canReportScannedAsset && (
+                  <button
+                    onClick={() => openReportFor(asset, assetLookupSource === "qr")}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-red-200 bg-red-50 text-red-700 px-5 py-2.5 text-sm font-medium hover:bg-red-100 cursor-pointer"
+                  >
+                    <AlertTriangle size={15} />
+                    {scannedAssetReportLabel}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => {
@@ -1178,8 +1256,6 @@ function ScanPageContent() {
                   </>
                 )}
               </div>
-
-              <AssetIssueWarningCard asset={asset} />
 
               <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-sm bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-3">
                 <Info label="Kategori" value={asset.categoryName} />
@@ -1253,13 +1329,15 @@ function ScanPageContent() {
                     Lihat Riwayat
                   </Link>
                 )}
-                <button
-                  onClick={() => setReportIssueOpen(true)}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-red-200 bg-red-50 text-red-700 px-5 py-2.5 text-sm font-medium hover:bg-red-100 cursor-pointer"
-                >
-                  <AlertTriangle size={15} />
-                  Laporkan Kendala
-                </button>
+                {canReportScannedAsset && (
+                  <button
+                    onClick={() => openReportFor(asset, assetLookupSource === "qr")}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-red-200 bg-red-50 text-red-700 px-5 py-2.5 text-sm font-medium hover:bg-red-100 cursor-pointer"
+                  >
+                    <AlertTriangle size={15} />
+                    {scannedAssetReportLabel}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => {
@@ -1381,6 +1459,7 @@ function ScanPageContent() {
                   <th className="px-4 py-3 font-semibold">Nama Aset</th>
                   <th className="px-4 py-3 font-semibold">Kode</th>
                   <th className="px-4 py-3 font-semibold">Status</th>
+                  <th className="px-4 py-3 font-semibold">Kondisi / Kendala</th>
                   <th className="px-4 py-3 font-semibold">PIC Operasional</th>
                   <th className="px-4 py-3 font-semibold">Pemegang Saat Ini</th>
                   <th className="px-4 py-3 font-semibold">Lokasi</th>
@@ -1399,6 +1478,7 @@ function ScanPageContent() {
                   // dari nama (nama bisa ambigu/duplikat, uid tidak).
                   const isMineHolder = !!assetUser?.uid && row.currentHolderUid === assetUser.uid;
                   const isMineCustodian = !!assetUser?.uid && row.custodianUid === assetUser.uid;
+                  const canReportRow = canReportAssetIssue(currentReportUser, a, borrowingByAssetId.get(a.id));
                   const rowHighlight = isMineHolder
                     ? "bg-blue-50/50"
                     : isMineCustodian
@@ -1427,6 +1507,8 @@ function ScanPageContent() {
                             colorClass={
                               row.status === "in_use"
                                 ? "bg-blue-100 text-blue-700"
+                                : row.status === "inspection_required"
+                                ? "bg-amber-100 text-amber-700"
                                 : row.status === "maintenance"
                                 ? "bg-purple-100 text-purple-700"
                                 : "bg-emerald-100 text-emerald-700"
@@ -1434,6 +1516,9 @@ function ScanPageContent() {
                           />
                           {overdue && <Badge label="Terlambat" colorClass="bg-red-100 text-red-700" />}
                         </div>
+                      </td>
+                      <td className="px-4 py-3 max-w-[180px]">
+                        <ConditionCell asset={a} />
                       </td>
                       <td className="px-4 py-3">
                         <PersonCell
@@ -1486,16 +1571,15 @@ function ScanPageContent() {
                           >
                             Lihat Detail
                           </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setAsset(a);
-                              setReportIssueOpen(true);
-                            }}
-                            className="text-sm font-medium text-red-600 hover:underline cursor-pointer"
-                          >
-                            Laporkan Kendala
-                          </button>
+                          {canReportRow && (
+                            <button
+                              type="button"
+                              onClick={() => openReportFor(a, false)}
+                              className="text-sm font-medium text-red-600 hover:underline cursor-pointer"
+                            >
+                              Laporkan Kendala
+                            </button>
+                          )}
                           {/* Staff hanya boleh kembalikan barang yang dia pinjam
                               sendiri — TIDAK BOLEH ambil alih/mengembalikan
                               punya orang lain. */}
@@ -1554,6 +1638,7 @@ function ScanPageContent() {
                 a.responsiblePersonUid === assetUser?.uid && a.assetStatus === "in_use";
               const isMineHolder = !!assetUser?.uid && row.currentHolderUid === assetUser.uid;
               const isMineCustodian = !!assetUser?.uid && row.custodianUid === assetUser.uid;
+              const canReportRow = canReportAssetIssue(currentReportUser, a, borrowingByAssetId.get(a.id));
               return (
                 <div
                   key={row.id}
@@ -1572,6 +1657,8 @@ function ScanPageContent() {
                         colorClass={
                           row.status === "in_use"
                             ? "bg-blue-100 text-blue-700"
+                            : row.status === "inspection_required"
+                            ? "bg-amber-100 text-amber-700"
                             : row.status === "maintenance"
                             ? "bg-purple-100 text-purple-700"
                             : "bg-emerald-100 text-emerald-700"
@@ -1582,6 +1669,10 @@ function ScanPageContent() {
                   </div>
 
                   <div className="mt-4 space-y-3 text-sm">
+                    <div>
+                      <p className="text-xs text-slate-400">Kondisi / Kendala</p>
+                      <ConditionCell asset={a} />
+                    </div>
                     <div>
                       <p className="text-xs text-slate-400">PIC Operasional</p>
                       <PersonCell
@@ -1642,16 +1733,15 @@ function ScanPageContent() {
                     >
                       Lihat Detail
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setAsset(a);
-                        setReportIssueOpen(true);
-                      }}
-                      className="w-full rounded-xl border border-red-200 px-3 py-2 text-sm font-medium text-red-600 cursor-pointer hover:bg-red-50"
-                    >
-                      Laporkan Kendala
-                    </button>
+                    {canReportRow && (
+                      <button
+                        type="button"
+                        onClick={() => openReportFor(a, false)}
+                        className="w-full rounded-xl border border-red-200 px-3 py-2 text-sm font-medium text-red-600 cursor-pointer hover:bg-red-50"
+                      >
+                        Laporkan Kendala
+                      </button>
+                    )}
                     {mineBorrowed && (
                       <button
                         type="button"
@@ -1733,7 +1823,7 @@ function ScanPageContent() {
                     <td className="px-4 py-3 text-right">
                       <button
                         type="button"
-                        onClick={() => lookupAsset(h.assetCode)}
+                        onClick={() => lookupAsset(h.assetCode, "history")}
                         className="text-sm font-medium text-blue-600 hover:underline cursor-pointer"
                       >
                         Lihat Detail
@@ -1764,7 +1854,7 @@ function ScanPageContent() {
                 </p>
                 <button
                   type="button"
-                  onClick={() => lookupAsset(h.assetCode)}
+                  onClick={() => lookupAsset(h.assetCode, "history")}
                   className="mt-3 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 cursor-pointer hover:bg-slate-50"
                 >
                   Lihat Detail
@@ -1784,22 +1874,28 @@ function ScanPageContent() {
             onClose={() => setBorrowOpen(false)}
             onDone={() => {
               setBorrowOpen(false);
-              lookupAsset(asset.qrCodeValue);
+              lookupAsset(asset.qrCodeValue, "refresh");
             }}
           />
           <ReturnModal
             asset={asset}
             open={returnOpen}
             onClose={() => setReturnOpen(false)}
-            onDone={() => {
+            onDone={(message) => {
               setReturnOpen(false);
-              lookupAsset(asset.qrCodeValue);
+              setToast({ type: "success", message: message || "Aset berhasil dikembalikan." });
+              lookupAsset(asset.qrCodeValue, "refresh");
             }}
           />
           <ReportIssueModal
             asset={asset}
             open={reportIssueOpen}
-            onClose={() => setReportIssueOpen(false)}
+            activeBorrowing={activeBorrowingForCurrentAsset}
+            allowQrPhysicalObservation={reportIssueAllowQrObservation}
+            onClose={() => {
+              setReportIssueOpen(false);
+              setReportIssueAllowQrObservation(false);
+            }}
           />
         </>
       )}
@@ -1859,6 +1955,7 @@ function ScanPageContent() {
           historyLoading={modalHistoryLoading}
           historyFailedCollections={modalHistoryFailedCollections}
           canReadIssueTickets={canReadAssetIssueTickets}
+          canReportIssue={canReportAssetIssue(currentReportUser, selectedAsset, borrowingByAssetId.get(selectedAsset.id))}
           onClose={() => {
             setAssetDetailModalOpen(false);
             setSelectedAsset(null);
@@ -1881,8 +1978,7 @@ function ScanPageContent() {
             setAssetDetailModalOpen(false);
           }}
           onReportIssue={() => {
-            setAsset(selectedAsset);
-            setReportIssueOpen(true);
+            openReportFor(selectedAsset, false);
             setAssetDetailModalOpen(false);
           }}
           onOpenAdminDetail={() => {
@@ -1932,6 +2028,36 @@ function Info({ label, value }: { label: string; value?: string }) {
   );
 }
 
+// Section 4 — kolom ringkas "Kondisi / Kendala" di tabel Status Pemakaian
+// Aset Kantor. TERPISAH dari kolom Status (pemakaian) — badge kondisi +
+// gejala/catatan dipotong (line-clamp) supaya tabel tidak melebar, detail
+// lengkap tetap ada di modal/panel scan (AssetIssueWarningCard).
+function ConditionCell({
+  asset,
+}: {
+  asset: Pick<
+    Asset,
+    "assetStatus" | "condition" | "hasActiveIssue" | "conditionLabel" | "lastIssueSymptomLabel" | "lastIssueNote"
+  >;
+}) {
+  const hasIssue = asset.hasActiveIssue === true || asset.condition === "reported_issue";
+  return (
+    <div className="max-w-[170px]">
+      <Badge label={getAssetConditionLabel(asset)} colorClass={hasIssue ? "bg-amber-100 text-amber-700" : "bg-emerald-100 text-emerald-700"} />
+      {hasIssue && asset.lastIssueSymptomLabel && (
+        <p className="mt-1 text-xs text-slate-500 line-clamp-1" title={asset.lastIssueSymptomLabel}>
+          {asset.lastIssueSymptomLabel}
+        </p>
+      )}
+      {hasIssue && asset.lastIssueNote && (
+        <p className="text-xs text-slate-400 line-clamp-1" title={asset.lastIssueNote}>
+          &ldquo;{asset.lastIssueNote}&rdquo;
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Section H/I — warning kendala aktif TERPISAH dari status pemakaian:
 // kondisi aset (Dilaporkan Bermasalah) dan status pemakaian (Sedang
 // Dipinjam/Bersama PIC/dst.) dua konsep beda, keduanya boleh tampil
@@ -1942,20 +2068,54 @@ function AssetIssueWarningCard({
 }: {
   asset: Pick<
     Asset,
-    "hasActiveIssue" | "condition" | "activeIssueTicketNo" | "lastIssueSymptomLabel" | "lastIssueNote"
+    "id" | "hasActiveIssue" | "condition" | "activeIssueTicketNo" | "lastIssueSymptomLabel" | "lastIssueNote"
   >;
 }) {
-  if (asset.hasActiveIssue !== true && asset.condition !== "reported_issue") return null;
+  const hasIssueFromAssetDoc = asset.hasActiveIssue === true || asset.condition === "reported_issue";
+
+  // Section 5 — fallback untuk data lama: kalau dokumen assets belum
+  // punya hasActiveIssue/condition ter-sinkron (mis. tiketnya dibuat
+  // sebelum fitur ini ada), cari langsung tiket aktif untuk aset ini
+  // supaya warning TETAP muncul. Dokumen asset tetap sumber UTAMA — query
+  // ini cuma jalan kalau dokumen asset sendiri belum menandakan ada issue.
+  const [fallbackTicket, setFallbackTicket] = useState<AssetIssueTicket | null>(null);
+  useEffect(() => {
+    if (hasIssueFromAssetDoc || !asset.id) {
+      Promise.resolve().then(() => setFallbackTicket(null));
+      return;
+    }
+    let cancelled = false;
+    getDocs(query(collection(db, "asset_issue_tickets"), where("assetId", "==", asset.id)))
+      .then((snap) => {
+        if (cancelled) return;
+        const activeTickets = snap.docs
+          .map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket))
+          .filter((t) => isIssueTicketActive(t.status))
+          .sort((a, b) => {
+            const at = (a.createdAt as { toMillis?: () => number })?.toMillis?.() || 0;
+            const bt = (b.createdAt as { toMillis?: () => number })?.toMillis?.() || 0;
+            return bt - at;
+          });
+        setFallbackTicket(activeTickets[0] || null);
+      })
+      .catch((err) => console.warn("[AssetIssueWarningCard] gagal fallback query tiket aktif", asset.id, err));
+    return () => {
+      cancelled = true;
+    };
+  }, [asset.id, hasIssueFromAssetDoc]);
+
+  if (!hasIssueFromAssetDoc && !fallbackTicket) return null;
+
+  const ticketNo = asset.activeIssueTicketNo || fallbackTicket?.ticketNumber || "-";
+  const symptomLabel = asset.lastIssueSymptomLabel || fallbackTicket?.symptomType || fallbackTicket?.title;
+  const note = asset.lastIssueNote || fallbackTicket?.description;
+
   return (
     <div className="rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-amber-800">
       <p className="font-semibold text-sm">Asset sedang dilaporkan bermasalah</p>
-      <p className="text-sm mt-0.5">
-        Laporan {asset.activeIssueTicketNo || "-"} sedang menunggu review QHSE.
-      </p>
-      {asset.lastIssueSymptomLabel && (
-        <p className="text-xs mt-1">Gejala: {asset.lastIssueSymptomLabel}</p>
-      )}
-      {asset.lastIssueNote && <p className="text-xs mt-0.5">Catatan: {asset.lastIssueNote}</p>}
+      <p className="text-sm mt-0.5">Laporan {ticketNo} sedang menunggu review QHSE.</p>
+      {symptomLabel && <p className="text-xs mt-1">Gejala: {symptomLabel}</p>}
+      {note && <p className="text-xs mt-0.5 line-clamp-2">Catatan: {note}</p>}
     </div>
   );
 }
@@ -1988,6 +2148,7 @@ function AssetQuickDetailModal({
   historyLoading,
   historyFailedCollections,
   canReadIssueTickets,
+  canReportIssue,
   onClose,
   onRequestTemporaryUse,
   onHandoverTemporary,
@@ -2004,6 +2165,7 @@ function AssetQuickDetailModal({
   historyLoading: boolean;
   historyFailedCollections: string[];
   canReadIssueTickets: boolean;
+  canReportIssue: boolean;
   onClose: () => void;
   onRequestTemporaryUse: () => void;
   onHandoverTemporary: () => void;
@@ -2147,13 +2309,15 @@ function AssetQuickDetailModal({
               Kembalikan ke Custodian
             </button>
           )}
-          <button
-            type="button"
-            onClick={onReportIssue}
-            className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-2 text-sm font-medium hover:bg-red-100 cursor-pointer"
-          >
-            Lapor Kendala
-          </button>
+          {canReportIssue && (
+            <button
+              type="button"
+              onClick={onReportIssue}
+              className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-2 text-sm font-medium hover:bg-red-100 cursor-pointer"
+            >
+              Lapor Kendala
+            </button>
+          )}
           {isManager && (
             <button
               type="button"

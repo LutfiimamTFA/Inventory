@@ -4,6 +4,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { addDoc, collection, doc, onSnapshot, serverTimestamp, updateDoc } from "firebase/firestore";
+import { createAssetIssueTicket } from "@/lib/assets/create-asset-issue-ticket";
+import {
+  getAssetIssueReportContext,
+  getAssetIssueSourceFields,
+} from "@/lib/asset-issue-reporting";
 import { ArrowLeft, CheckCircle2, ClipboardPlus, Send, UploadCloud } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
@@ -159,6 +164,42 @@ export default function NewStaffReportPage() {
     const reporterEmail = assetUser?.email || firebaseUser?.email || "";
     const priority = SEVERITY_TO_PRIORITY[severity];
     const impactLevel = SEVERITY_TO_IMPACT[severity];
+    const assetReportContext = reportAsset
+      ? getAssetIssueReportContext({
+          user: reporterUid
+            ? {
+                uid: reporterUid,
+                name: reporterName,
+                email: reporterEmail,
+                role: role || assetUser?.role || "staff",
+              }
+            : null,
+          asset: reportAsset,
+        })
+      : null;
+
+    if (reportAsset && assetReportContext && !assetReportContext.canReport) {
+      setError("Untuk aset yang tidak sedang Anda pegang, scan QR fisik aset lalu gunakan tombol Saya Menemukan Kendala.");
+      setSubmitting(false);
+      return;
+    }
+
+    const issueSourceFields =
+      reportAsset && assetReportContext
+        ? getAssetIssueSourceFields({
+            context: assetReportContext,
+            asset: reportAsset,
+          })
+        : {
+            reportSource: "manual_web",
+            reporterRelationship: "manual_reporter",
+            sourceBorrowingId: null,
+            sourceQrScanLogId: null,
+            holderUidAtReport: null,
+            holderNameAtReport: null,
+            usageStatusAtReport: null,
+            conditionAtReport: null,
+          };
 
     // Section A/B — lampiran dan nomor laporan dipisah jadi try/catch
     // SENDIRI-SENDIRI (bukan satu blok gabungan) supaya log error selalu
@@ -264,6 +305,7 @@ export default function NewStaffReportPage() {
       status: "reported",
       statusLabel: "Laporan Masuk",
       staffStatusLabel: ISSUE_STATUS_STAFF_LABEL.reported,
+      ...issueSourceFields,
       assignedTeam: null,
       assignedToUid: null,
       assignedToName: null,
@@ -283,23 +325,42 @@ export default function NewStaffReportPage() {
       updatedByName: reporterName,
     }) as Record<string, unknown>;
 
-    // 1) Buat ticket-nya — INI SATU-SATUNYA langkah yang boleh membuat
-    // submit dianggap gagal. Log dan notifikasi di bawah ini best-effort:
-    // kalau gagal (mis. staff HRP fallback belum punya dokumen asset_users
+    // 1) Buat ticket-nya (+ update kondisi asset dalam SATU writeBatch kalau
+    // laporan ini benar-benar terkait aset — lewat service bersama
+    // createAssetIssueTicket, SAMA dengan yang dipakai Laporkan Kendala di
+    // Scan QR) — INI SATU-SATUNYA langkah yang boleh membuat submit
+    // dianggap gagal. Log dan notifikasi di bawah ini best-effort: kalau
+    // gagal (mis. staff HRP fallback belum punya dokumen asset_users
     // sehingga sebagian rule lain menolak), laporan yang sudah tersimpan
     // TETAP dianggap berhasil.
-    let ticketRef;
+    let ticketRef: { id: string };
     try {
       console.log("[NewStaffReportPage Submit Debug] START create ticket", {
         uid: firebaseUser?.uid,
         email: firebaseUser?.email,
         role,
+        assetId: reportAsset?.id || null,
         payloadKeys: Object.keys(ticketPayload),
       });
-      ticketRef = await addDoc(collection(db, "asset_issue_tickets"), ticketPayload);
+      const result = await createAssetIssueTicket({
+        ticketPayload,
+        ticketNumber,
+        asset: reportAsset,
+        userUid: reporterUid,
+        userName: reporterName,
+        symptomLabel: title.trim(),
+        note: description.trim(),
+        impactLabel: FIELD_IMPACT_LABEL[severity],
+      });
+      ticketRef = { id: result.ticketId };
       console.log("[NewStaffReportPage Submit Debug] SUCCESS create ticket", ticketRef.id);
     } catch (ticketError) {
-      console.error("[NewStaffReportPage] gagal create asset_issue_tickets", ticketError);
+      console.error("[NewStaffReportPage] gagal create asset_issue_tickets", {
+        assetId: reportAsset?.id || null,
+        errorCode: (ticketError as { code?: string })?.code,
+        errorMessage: (ticketError as { message?: string })?.message,
+        rawError: ticketError,
+      });
       setError("Gagal mengirim laporan. Coba lagi.");
       setSubmitting(false);
       return;

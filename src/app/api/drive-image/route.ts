@@ -2,20 +2,22 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
+function jsonError(message: string, status: number) {
+  return NextResponse.json({ success: false, message }, { status });
+}
+
+function safeInlineFileName(value: unknown, fallback: string) {
+  const raw = typeof value === "string" && value.trim() ? value.trim() : fallback;
+  return raw.replace(/["\r\n]/g, "").slice(0, 120) || fallback;
+}
+
 export async function GET(request: NextRequest) {
   try {
-    console.log("[Drive Image] route hit");
-
-    const fileId = request.nextUrl.searchParams.get("fileId");
+    const fileId = request.nextUrl.searchParams.get("fileId")?.trim();
 
     if (!fileId) {
-      return NextResponse.json(
-        { success: false, message: "fileId wajib diisi" },
-        { status: 400 }
-      );
+      return jsonError("fileId wajib diisi", 400);
     }
-
-    console.log("[Drive Image] fileId:", fileId);
 
     const scriptUrl =
       process.env.GOOGLE_APPS_SCRIPT_UPLOAD_URL ||
@@ -31,13 +33,8 @@ export async function GET(request: NextRequest) {
 
     if (!scriptUrl || !secret) {
       console.error("[Drive Image] missing env");
-      return NextResponse.json(
-        { success: false, message: "Konfigurasi Google Drive belum lengkap" },
-        { status: 500 }
-      );
+      return jsonError("Konfigurasi Google Drive belum lengkap", 500);
     }
-
-    console.log("[Drive Image] fetching from Google Drive");
 
     const res = await fetch(scriptUrl, {
       method: "POST",
@@ -52,50 +49,38 @@ export async function GET(request: NextRequest) {
       cache: "no-store",
     });
 
+    if (!res.ok) {
+      console.error("[Drive Image] Apps Script HTTP error:", res.status);
+      return jsonError(res.status === 404 ? "File tidak ditemukan" : "Gagal mengambil file Drive", res.status);
+    }
+
     const data = await res.json().catch(() => null);
 
     if (!data || !data.success || !data.base64) {
       console.error("[Drive Image] Apps Script error:", data?.error || data?.message);
-      return NextResponse.json(
-        {
-          success: false,
-          message: data?.error || data?.message || "Gagal mengambil file Drive",
-        },
-        { status: 404 }
-      );
+      return jsonError(data?.error || data?.message || "File tidak ditemukan", 404);
     }
 
-    const mimeType: string = data.mimeType || data.fileType || "image/jpeg";
-    console.log("[Drive Image] mimeType:", mimeType);
+    const mimeType: string = data.mimeType || data.fileType || data.contentType || "application/octet-stream";
 
-    if (!mimeType.startsWith("image/")) {
-      return NextResponse.json(
-        { success: false, message: "File bukan gambar" },
-        { status: 400 }
-      );
+    if (!mimeType.startsWith("image/") && !mimeType.startsWith("video/")) {
+      return jsonError("Format file tidak didukung untuk preview", 415);
     }
 
     const buffer = Buffer.from(data.base64, "base64");
-
-    console.log("[Drive Image] image response success:", mimeType);
+    const fileName = safeInlineFileName(data.fileName, mimeType.startsWith("video/") ? "asset-video" : "asset-photo");
 
     return new NextResponse(buffer, {
       status: 200,
       headers: {
         "Content-Type": mimeType,
         "Cache-Control": "private, max-age=3600",
-        "Content-Disposition": `inline; filename="${data.fileName || "asset-photo"}"`,
+        "Content-Disposition": `inline; filename="${fileName}"`,
+        "X-Content-Type-Options": "nosniff",
       },
     });
   } catch (error) {
     console.error("[Drive Image] error:", error);
-
-    return NextResponse.json(
-      {
-        success: false,
-        message: error instanceof Error ? error.message : "Gagal mengambil gambar",
-      },
-      { status: 500 }
-    );
+    return jsonError(error instanceof Error ? error.message : "Gagal mengambil file", 500);
   }
 }

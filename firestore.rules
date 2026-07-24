@@ -438,7 +438,7 @@ service cloud.firestore {
 
       return isActiveAssetUser()
         && changed.hasOnly([
-          "assetStatus", "condition", "currentBorrowingId", "currentBorrowerUid", "currentBorrowerName",
+          "assetStatus", "condition", "conditionLabel", "currentBorrowingId", "currentBorrowerUid", "currentBorrowerName",
           "currentUsageStatus", "currentUsageStatusLabel",
           "currentUsageStartedAt", "currentUsageExpectedReturnAt",
           "currentUsagePurpose", "currentUsageNote",
@@ -447,6 +447,15 @@ service cloud.firestore {
           "borrowedByUid", "borrowedByName", "borrowedByEmail", "borrowedAt",
           "returnedAt", "returnedByUid", "returnedByName",
           "lastMaintenanceAt", "nextMaintenanceAt",
+          // Section 8 — pengembalian bermasalah menandai laporan kendala
+          // dalam update YANG SAMA (satu writeBatch, lihat BorrowReturnModal
+          // ReturnModal) — field ini SAMA dengan yang sudah diizinkan
+          // isAssetIssueReportUpdate() di bawah, cuma di sini boleh nyatu
+          // dengan field transisi pemakaian/holder di atas sekaligus.
+          "hasActiveIssue", "activeIssueTicketId", "activeIssueTicketNo",
+          "previousCondition", "previousConditionLabel",
+          "issueReportedAt", "issueReportedByUid", "issueReportedByName",
+          "lastIssueSymptomLabel", "lastIssueNote", "lastIssueImpactLabel",
           "updatedAt", "updatedByUid", "updatedByName"
         ])
         && (
@@ -454,8 +463,9 @@ service cloud.firestore {
           (prevStatus in ["available", "tersedia"] && nextStatus == "borrowed" && nextHolderUid == request.auth.uid)
           ||
           // Kembalikan: aset sebelumnya dipegang diri sendiri, sekarang
-          // tersedia (atau masuk maintenance kalau dikembalikan rusak).
-          (prevHolderUid == request.auth.uid && nextStatus in ["available", "tersedia", "maintenance"])
+          // tersedia/maintenance, ATAU menunggu pemeriksaan QHSE kalau
+          // dikembalikan dengan kendala/rusak/tidak lengkap (section 10).
+          (prevHolderUid == request.auth.uid && nextStatus in ["available", "tersedia", "maintenance", "inspection_required"])
         );
     }
 
@@ -493,7 +503,8 @@ service cloud.firestore {
         ])
         && request.resource.data.get("hasActiveIssue", false) == true
         && request.resource.data.get("condition", "") == "reported_issue"
-        && request.resource.data.get("issueReportedByUid", "") == request.auth.uid;
+        && request.resource.data.get("issueReportedByUid", "") == request.auth.uid
+        && request.resource.data.get("updatedByUid", "") == request.auth.uid;
     }
 
     match /assets/{assetId} {

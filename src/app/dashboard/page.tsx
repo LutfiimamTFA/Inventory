@@ -21,6 +21,7 @@ import {
   ASSET_STATUS_COLOR,
   ASSET_STATUS_LABEL,
   formatDate,
+  isProblemAsset,
 } from "@/lib/utils";
 import { isWorkOrderOverdueRecord } from "@/lib/reports";
 import {
@@ -146,9 +147,11 @@ export default function DashboardPage() {
   const maintenance = assets.filter(
     (a) => a.assetStatus === "maintenance"
   ).length;
-  const broken = assets.filter(
-    (a) => a.assetStatus === "broken" || a.assetStatus === "lost"
-  ).length;
+  // Section 3/10 — pakai isProblemAsset (SATU sumber kebenaran, sama dengan
+  // yang dipakai summary card & filter di halaman Assets) supaya laporan
+  // kendala staff yang belum divalidasi QHSE (hasActiveIssue) ikut kehitung,
+  // bukan cuma assetStatus "broken"/"lost" yang biasanya baru diisi manual.
+  const broken = assets.filter(isProblemAsset).length;
   // Section A/D — nominal harga di dashboard utama HANYA dihitung untuk
   // Asset Finance. QHSE/Asset Admin, Tim IT, Staff — bahkan Super Admin di
   // dashboard utama ini — tidak boleh lihat nominal, jadi tidak perlu
@@ -324,7 +327,7 @@ export default function DashboardPage() {
           />
           <StatCard
             icon={AlertTriangle}
-            label="Rusak / Hilang"
+            label="Aset Bermasalah"
             value={broken}
             tone="red"
           />

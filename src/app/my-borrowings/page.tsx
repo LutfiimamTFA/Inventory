@@ -325,8 +325,8 @@ export default function MyBorrowingsPage() {
           asset={returnTarget}
           open={!!returnTarget}
           onClose={() => setReturnTarget(null)}
-          onDone={() => {
-            setToast({ type: "success", message: "Aset berhasil dikembalikan." });
+          onDone={(message) => {
+            setToast({ type: "success", message: message || "Aset berhasil dikembalikan." });
             setReturnTarget(null);
           }}
         />
@@ -336,6 +336,7 @@ export default function MyBorrowingsPage() {
         <ReportIssueModal
           asset={reportTarget}
           open={!!reportTarget}
+          activeBorrowing={activeBorrowingByAssetId.get(reportTarget.id) || null}
           onClose={() => setReportTarget(null)}
         />
       )}

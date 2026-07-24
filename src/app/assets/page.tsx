@@ -28,6 +28,7 @@ import {
   formatCurrency,
   getAssetConditionColor,
   getAssetConditionLabel,
+  isProblemAsset,
 } from "@/lib/utils";
 import { writeAssetLog } from "@/lib/firestore-helpers";
 import { isAssetInMyPicLocation } from "@/lib/locations";
@@ -140,14 +141,10 @@ export default function AssetsPage() {
       if (mode === "fixed_location") fixedLocation += 1;
       else moving += 1;
       if (a.assetStatus === "maintenance") maintenance += 1;
-      // Section E — asset bermasalah dihitung dari hasActiveIssue (SUMBER
-      // UTAMA) dengan fallback ke field condition mentah untuk data lama,
-      // BUKAN dari asset yang kebetulan berstatus maintenance saja — supaya
-      // laporan kendala aktif yang belum ditentukan kondisi finalnya tetap
-      // kehitung, dan tidak dobel-hitung dengan aset yang sudah "Maintenance".
-      if (a.hasActiveIssue === true || String(a.condition || "").toLowerCase() === "reported_issue") {
-        reportedIssue += 1;
-      }
+      // Section 3/10 — isProblemAsset() adalah SATU sumber kebenaran yang
+      // sama dipakai Dashboard, supaya angka "Aset Bermasalah" TIDAK PERNAH
+      // beda antar halaman.
+      if (isProblemAsset(a)) reportedIssue += 1;
     });
     return { fixedLocation, moving, maintenance, reportedIssue };
   }, [visibleAssets]);
@@ -782,6 +779,9 @@ export default function AssetsPage() {
                             label={getAssetConditionLabel(a)}
                             colorClass={getAssetConditionColor(a)}
                           />
+                          {a.hasActiveIssue && a.activeIssueTicketNo && (
+                            <p className="mt-1 font-mono text-[11px] text-amber-600">{a.activeIssueTicketNo}</p>
+                          )}
                         </td>
                         {canViewFinance && (
                           <td className="px-4 py-3 text-slate-500">
@@ -865,18 +865,23 @@ export default function AssetsPage() {
                       <p className="mt-0.5 text-xs text-slate-500 break-all">{a.assetCode || "-"}</p>
                     </Link>
                   </div>
-                  <Badge
-                    label={
-                      isAssetFinanceRole
-                        ? FINANCE_STATUS_LABEL[getFinanceStatus(a)]
-                        : getAssetConditionLabel(a)
-                    }
-                    colorClass={
-                      isAssetFinanceRole
-                        ? FINANCE_STATUS_COLOR[getFinanceStatus(a)]
-                        : getAssetConditionColor(a)
-                    }
-                  />
+                  <div className="text-right shrink-0">
+                    <Badge
+                      label={
+                        isAssetFinanceRole
+                          ? FINANCE_STATUS_LABEL[getFinanceStatus(a)]
+                          : getAssetConditionLabel(a)
+                      }
+                      colorClass={
+                        isAssetFinanceRole
+                          ? FINANCE_STATUS_COLOR[getFinanceStatus(a)]
+                          : getAssetConditionColor(a)
+                      }
+                    />
+                    {!isAssetFinanceRole && a.hasActiveIssue && a.activeIssueTicketNo && (
+                      <p className="mt-1 font-mono text-[11px] text-amber-600">{a.activeIssueTicketNo}</p>
+                    )}
+                  </div>
                 </div>
 
                 <div className="mt-4 grid grid-cols-1 gap-3 text-sm">

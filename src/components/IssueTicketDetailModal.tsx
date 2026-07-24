@@ -6,12 +6,14 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
   updateDoc,
   where,
+  writeBatch,
 } from "firebase/firestore";
 import { Check, X } from "lucide-react";
 import clsx from "clsx";
@@ -42,6 +44,7 @@ import {
   ISSUE_STATUS_STAFF_LABEL,
   EXTERNAL_COORDINATION_STAFF_LABEL,
   EXTERNAL_COORDINATION_STATUS_LABEL,
+  isIssueTicketActive,
 } from "@/lib/utils";
 import Badge from "@/components/Badge";
 import AssignIssueTicketModal from "@/components/AssignIssueTicketModal";
@@ -125,6 +128,235 @@ function getReporterConfirmationCopy(ticket: AssetIssueTicket) {
     stillProblemLabel: "Masih Bermasalah",
     notePlaceholder: "Contoh: kendala masih terjadi, jelaskan kondisinya.",
   };
+}
+
+type ReporterAttachmentKind = "image" | "video";
+
+interface ReporterAttachment {
+  id: string;
+  fileId: string;
+  src: string;
+  kind: ReporterAttachmentKind;
+  name: string;
+}
+
+const DRIVE_FILE_ID_KEYS = ["driveFileId", "fileId", "attachmentFileId", "photoFileId"] as const;
+const ATTACHMENT_COLLECTION_KEYS = ["photoUrls", "attachmentUrls", "attachments", "evidencePhotoUrls"] as const;
+const VIDEO_EXTENSIONS = [".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv"];
+
+function proxiedDriveUrl(fileId: string) {
+  return `/api/drive-image?fileId=${encodeURIComponent(fileId)}`;
+}
+
+function extractDriveFileId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const raw = value.trim();
+  if (!raw) return null;
+
+  try {
+    const url = new URL(raw, "https://assetview.local");
+    const fileId = url.searchParams.get("fileId") || url.searchParams.get("id");
+    if (fileId) return fileId;
+  } catch {
+    // Bukan URL valid; lanjut cek pola ID/URL Drive mentah.
+  }
+
+  const decoded = decodeURIComponent(raw);
+  const drivePathMatch = decoded.match(/\/file\/d\/([^/?#]+)/);
+  if (drivePathMatch?.[1]) return drivePathMatch[1];
+
+  const queryMatch = decoded.match(/[?&](?:fileId|id)=([^&#]+)/);
+  if (queryMatch?.[1]) return queryMatch[1];
+
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(decoded)) return decoded;
+  return null;
+}
+
+function inferAttachmentKind(source: { mimeType?: string; name?: string; url?: string }): ReporterAttachmentKind {
+  const mime = (source.mimeType || "").toLowerCase();
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("image/")) return "image";
+
+  const text = `${source.name || ""} ${source.url || ""}`.toLowerCase();
+  return VIDEO_EXTENSIONS.some((ext) => text.includes(ext)) ? "video" : "image";
+}
+
+function attachmentName(value: unknown, fallback: string) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (value && typeof value === "object") {
+    const data = value as Record<string, unknown>;
+    return (
+      (data.name as string) ||
+      (data.fileName as string) ||
+      (data.originalName as string) ||
+      (data.label as string) ||
+      fallback
+    );
+  }
+  return fallback;
+}
+
+function normalizeAttachmentValue(value: unknown, fallbackName: string): ReporterAttachment | null {
+  const data = value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  const fileId =
+    DRIVE_FILE_ID_KEYS.map((key) => data?.[key]).map(extractDriveFileId).find(Boolean) ||
+    extractDriveFileId(value) ||
+    extractDriveFileId(data?.url) ||
+    extractDriveFileId(data?.photoUrl) ||
+    extractDriveFileId(data?.attachmentUrl) ||
+    extractDriveFileId(data?.downloadUrl);
+
+  if (!fileId) return null;
+
+  const name = attachmentName(value, fallbackName);
+  const mimeType = (data?.mimeType as string) || (data?.contentType as string) || (data?.type as string) || "";
+  const url =
+    typeof value === "string"
+      ? value
+      : ((data?.url as string) || (data?.photoUrl as string) || (data?.attachmentUrl as string) || "");
+
+  return {
+    id: fileId,
+    fileId,
+    src: proxiedDriveUrl(fileId),
+    kind: inferAttachmentKind({ mimeType, name, url }),
+    name,
+  };
+}
+
+function normalizeReporterAttachments(ticket: AssetIssueTicket): ReporterAttachment[] {
+  const raw = ticket as unknown as Record<string, unknown>;
+  const attachmentNames = Array.isArray(raw.attachmentFiles) ? raw.attachmentFiles : [];
+  const byFileId = new Map<string, ReporterAttachment>();
+
+  const add = (value: unknown, fallbackName: string) => {
+    const item = normalizeAttachmentValue(value, fallbackName);
+    if (item && !byFileId.has(item.fileId)) byFileId.set(item.fileId, item);
+  };
+
+  ATTACHMENT_COLLECTION_KEYS.forEach((key) => {
+    const value = raw[key];
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => add(item, attachmentName(attachmentNames[index], `Lampiran ${index + 1}`)));
+    } else if (value && typeof value === "object") {
+      if (DRIVE_FILE_ID_KEYS.some((fileKey) => rawValueHasKey(value, fileKey))) {
+        add(value, "Lampiran");
+      } else {
+        Object.values(value as Record<string, unknown>).forEach((item, index) => add(item, `Lampiran ${index + 1}`));
+      }
+    } else {
+      add(value, "Lampiran");
+    }
+  });
+
+  DRIVE_FILE_ID_KEYS.forEach((key) => add(raw[key], "Lampiran"));
+
+  return Array.from(byFileId.values());
+}
+
+function rawValueHasKey(value: unknown, key: string) {
+  return !!value && typeof value === "object" && key in value;
+}
+
+function ReporterAttachmentTile({
+  attachment,
+  single,
+  onPreview,
+}: {
+  attachment: ReporterAttachment;
+  single: boolean;
+  onPreview: (attachment: ReporterAttachment) => void;
+}) {
+  const [state, setState] = useState<"loading" | "loaded" | "error">("loading");
+  const frameClass = clsx(
+    "relative overflow-hidden rounded-xl border border-slate-200 bg-slate-100",
+    single ? "aspect-[16/10]" : "aspect-[4/3]"
+  );
+
+  if (state === "error") {
+    return (
+      <div className={clsx(frameClass, "flex items-center justify-center px-4 text-center text-xs text-slate-500")}>
+        Lampiran tidak dapat ditampilkan.
+      </div>
+    );
+  }
+
+  return (
+    <div className={frameClass}>
+      {state === "loading" && <div className="absolute inset-0 animate-pulse bg-slate-200" />}
+      {attachment.kind === "video" ? (
+        <video
+          src={attachment.src}
+          controls
+          preload="metadata"
+          className={clsx("h-full w-full bg-black object-cover", state !== "loaded" && "opacity-0")}
+          onLoadedData={() => setState("loaded")}
+          onError={() => setState("error")}
+        />
+      ) : (
+        <button
+          type="button"
+          onClick={() => state === "loaded" && onPreview(attachment)}
+          className="block h-full w-full cursor-zoom-in"
+          aria-label={`Preview ${attachment.name}`}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={attachment.src}
+            alt={attachment.name}
+            className={clsx("h-full w-full object-cover transition-opacity", state !== "loaded" && "opacity-0")}
+            onLoad={() => setState("loaded")}
+            onError={() => setState("error")}
+          />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ReporterAttachmentGallery({ ticket }: { ticket: AssetIssueTicket }) {
+  const [preview, setPreview] = useState<ReporterAttachment | null>(null);
+  const attachments = normalizeReporterAttachments(ticket);
+  if (attachments.length === 0) return null;
+
+  const single = attachments.length === 1;
+
+  return (
+    <div className="mt-3">
+      <p className="mb-2 text-xs text-slate-400">Lampiran Pelapor</p>
+      <div className={clsx("grid gap-3", single ? "grid-cols-1" : "grid-cols-1 min-[420px]:grid-cols-2 lg:grid-cols-3")}>
+        {attachments.map((attachment) => (
+          <ReporterAttachmentTile
+            key={attachment.id}
+            attachment={attachment}
+            single={single}
+            onPreview={setPreview}
+          />
+        ))}
+      </div>
+
+      {preview && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/80 p-4" onClick={() => setPreview(null)}>
+          <button
+            type="button"
+            className="absolute right-4 top-4 rounded-full bg-white/90 p-2 text-slate-700 shadow hover:bg-white"
+            onClick={() => setPreview(null)}
+            aria-label="Tutup preview"
+          >
+            <X size={18} />
+          </button>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={preview.src}
+            alt={preview.name}
+            className="max-h-[88vh] max-w-[92vw] rounded-xl bg-white object-contain shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+            onError={() => setPreview(null)}
+          />
+        </div>
+      )}
+    </div>
+  );
 }
 
 const ACTION_TONE_CLASS: Record<IssueActionDef["tone"], string> = {
@@ -437,45 +669,88 @@ export default function IssueTicketDetailModal({
 
   // Section H/I/J — begitu QHSE menutup/menolak/menduplikat/membatalkan
   // laporan, kondisi SEMENTARA aset ("Dilaporkan Bermasalah") harus
-  // diselesaikan: kalau ditutup, pakai kondisi final yang QHSE pilih;
-  // kalau ditolak/duplikat/dibatalkan, kembalikan ke kondisi SEBELUM
-  // dilaporkan (previousCondition). Best-effort (non-fatal) — status ticket
-  // sudah berhasil berubah terlepas dari ini berhasil atau tidak, dan di-
-  // guard oleh activeIssueTicketId supaya tidak menimpa laporan LAIN yang
-  // kebetulan lebih baru untuk aset yang sama.
-  const syncAssetConditionAfterAction = async (action: IssueActionDef) => {
-    if (!ticket.assetId) return;
+  // diselesaikan: kalau ditutup, pakai kondisi final yang QHSE pilih; kalau
+  // ditolak/duplikat/dibatalkan, kembalikan ke kondisi SEBELUM dilaporkan
+  // (previousCondition) — KECUALI masih ada tiket aktif LAIN untuk aset yang
+  // sama (section 6/7), yang berarti aset itu tetap "Dilaporkan Bermasalah"
+  // dan activeIssueTicketId dialihkan ke tiket aktif terbaru itu. Fungsi ini
+  // HANYA membaca dan menghitung payload — tidak menulis apa pun — supaya
+  // penulisannya bisa digabung SATU writeBatch dengan update ticket-nya di
+  // runAction (atomik, bukan best-effort terpisah lagi).
+  const buildAssetConditionSyncPayload = async (
+    action: IssueActionDef
+  ): Promise<{ assetRef: ReturnType<typeof doc>; payload: Record<string, unknown> } | null> => {
+    if (!ticket.assetId) return null;
     const isClose = action.key === "close";
     const isRevert = action.key === "reject" || action.key === "duplicate" || action.key === "cancel";
-    if (!isClose && !isRevert) return;
+    if (!isClose && !isRevert) return null;
 
     const assetRef = doc(db, "assets", ticket.assetId);
     const assetSnap = await getDoc(assetRef);
-    if (!assetSnap.exists()) return;
+    if (!assetSnap.exists()) return null;
     const assetData = assetSnap.data();
-    if (assetData.activeIssueTicketId !== ticket.id) return;
+    if (assetData.activeIssueTicketId !== ticket.id) return null;
+
+    // Section 7 — cari tiket aktif LAIN untuk aset yang sama (bukan tiket
+    // yang sedang diproses) sebelum memutuskan mengosongkan hasActiveIssue.
+    const otherTicketsSnap = await getDocs(
+      query(collection(db, "asset_issue_tickets"), where("assetId", "==", ticket.assetId))
+    );
+    const otherActiveTickets = otherTicketsSnap.docs
+      .filter((d) => d.id !== ticket.id && isIssueTicketActive(d.data().status))
+      .map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket))
+      .sort((a, b) => {
+        const at = (a.createdAt as { toMillis?: () => number })?.toMillis?.() || 0;
+        const bt = (b.createdAt as { toMillis?: () => number })?.toMillis?.() || 0;
+        return bt - at;
+      });
+
+    if (otherActiveTickets.length > 0) {
+      const nextActive = otherActiveTickets[0];
+      return {
+        assetRef,
+        payload: {
+          hasActiveIssue: true,
+          activeIssueTicketId: nextActive.id,
+          activeIssueTicketNo: nextActive.ticketNumber || null,
+          lastIssueSymptomLabel: nextActive.symptomType || nextActive.title || "",
+          lastIssueNote: nextActive.description || "",
+          updatedAt: serverTimestamp(),
+          updatedByUid: currentUid || "",
+          updatedByName: currentName,
+        },
+      };
+    }
 
     if (isClose) {
-      await updateDoc(assetRef, {
-        hasActiveIssue: false,
-        activeIssueTicketId: null,
-        activeIssueTicketNo: null,
-        condition: closeCondition,
-        conditionLabel: closeConditionLabel(closeCondition),
-        previousCondition: null,
-        previousConditionLabel: null,
-        conditionReviewedAt: serverTimestamp(),
-        conditionReviewedByUid: currentUid || "",
-        conditionReviewedByName: currentName,
-        issueResolvedAt: serverTimestamp(),
-        issueResolvedByUid: currentUid || "",
-        issueResolvedByName: currentName,
-        updatedAt: serverTimestamp(),
-        updatedByUid: currentUid || "",
-        updatedByName: currentName,
-      });
-    } else {
-      await updateDoc(assetRef, {
+      return {
+        assetRef,
+        payload: {
+          hasActiveIssue: false,
+          activeIssueTicketId: null,
+          activeIssueTicketNo: null,
+          condition: closeCondition,
+          conditionLabel: closeConditionLabel(closeCondition),
+          previousCondition: null,
+          previousConditionLabel: null,
+          conditionReviewedAt: serverTimestamp(),
+          conditionReviewedByUid: currentUid || "",
+          conditionReviewedByName: currentName,
+          lastResolvedIssueTicketId: ticket.id,
+          lastResolvedIssueTicketNo: ticket.ticketNumber || null,
+          issueResolvedAt: serverTimestamp(),
+          issueResolvedByUid: currentUid || "",
+          issueResolvedByName: currentName,
+          updatedAt: serverTimestamp(),
+          updatedByUid: currentUid || "",
+          updatedByName: currentName,
+        },
+      };
+    }
+
+    return {
+      assetRef,
+      payload: {
         hasActiveIssue: false,
         activeIssueTicketId: null,
         activeIssueTicketNo: null,
@@ -483,14 +758,16 @@ export default function IssueTicketDetailModal({
         conditionLabel: assetData.previousConditionLabel || "Baik",
         previousCondition: null,
         previousConditionLabel: null,
+        lastResolvedIssueTicketId: ticket.id,
+        lastResolvedIssueTicketNo: ticket.ticketNumber || null,
         issueResolvedAt: serverTimestamp(),
         issueResolvedByUid: currentUid || "",
         issueResolvedByName: currentName,
         updatedAt: serverTimestamp(),
         updatedByUid: currentUid || "",
         updatedByName: currentName,
-      });
-    }
+      },
+    };
   };
 
   const runAction = async (action: IssueActionDef) => {
@@ -530,10 +807,15 @@ export default function IssueTicketDetailModal({
 
     const updates = buildFieldUpdates(action, photoUrls);
 
-    // Section C — update ticket TERPISAH dari log/notifikasi: kalau ini
-    // gagal (mis. permission-denied), aksi dianggap gagal total. Kalau ini
-    // berhasil tapi log/notifikasi gagal, statusnya TETAP berhasil berubah.
+    // Section 6 — ticket dan kondisi aset ditulis dalam SATU writeBatch
+    // (bukan updateDoc terpisah + sync best-effort lagi) supaya kalau salah
+    // satu gagal, KEDUANYA gagal — tidak ada status ticket berubah tapi
+    // kondisi aset "nyangkut", atau sebaliknya. Reads (getDoc/getDocs di
+    // buildAssetConditionSyncPayload) WAJIB selesai dulu sebelum batch
+    // ditulis (writeBatch tidak bisa baca).
     try {
+      const assetSync = await buildAssetConditionSyncPayload(action);
+
       console.log("[IssueTicketDetailModal Action Debug] START update ticket", {
         action: action.key,
         ticketId: ticket.id,
@@ -541,11 +823,24 @@ export default function IssueTicketDetailModal({
         nextStatus: action.toStatus,
         uid: currentUid,
         payloadKeys: Object.keys(updates),
+        assetSyncApplied: !!assetSync,
+        assetPayloadKeys: assetSync ? Object.keys(assetSync.payload) : [],
       });
-      await updateDoc(ticketRef, updates);
+
+      const batch = writeBatch(db);
+      batch.update(ticketRef, updates);
+      if (assetSync) batch.update(assetSync.assetRef, assetSync.payload);
+      await batch.commit();
+
       console.log("[IssueTicketDetailModal Action Debug] SUCCESS update ticket");
     } catch (updateError) {
-      console.error("[IssueTicketDetailModal] gagal menjalankan aksi", action.key, updateError);
+      console.error("[IssueTicketDetailModal] gagal menjalankan aksi", {
+        action: action.key,
+        ticketId: ticket.id,
+        errorCode: (updateError as { code?: string })?.code,
+        errorMessage: (updateError as { message?: string })?.message,
+        rawError: updateError,
+      });
       setError("Gagal memperbarui laporan. Coba lagi.");
       setSaving(false);
       return;
@@ -591,16 +886,6 @@ export default function IssueTicketDetailModal({
       console.log("[IssueTicketDetailModal Action Debug] SUCCESS notify");
     } catch (notificationError) {
       console.warn("[IssueTicketDetailModal] gagal membuat notifikasi, update ticket tetap berhasil", notificationError);
-    }
-
-    try {
-      await syncAssetConditionAfterAction(action);
-      console.log("[IssueTicketDetailModal Action Debug] SUCCESS sync asset condition");
-    } catch (conditionError) {
-      console.warn(
-        "[IssueTicketDetailModal] gagal sinkronkan kondisi aset, update ticket tetap berhasil",
-        conditionError
-      );
     }
   };
 
@@ -759,16 +1044,7 @@ export default function IssueTicketDetailModal({
                   <p className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800">{ticket.description}</p>
                 </div>
 
-                {ticket.attachmentUrls && ticket.attachmentUrls.length > 0 && (
-                  <div className="mt-3">
-                    <p className="mb-1 text-xs text-slate-400">Lampiran Pelapor</p>
-                    {ticket.attachmentUrls.map((url, i) => (
-                      <a key={url} href={url} target="_blank" rel="noopener noreferrer" className="block text-sm text-blue-600 hover:underline">
-                        {ticket.attachmentFiles?.[i] || `Lampiran ${i + 1}`}
-                      </a>
-                    ))}
-                  </div>
-                )}
+                <ReporterAttachmentGallery ticket={ticket} />
 
                 {isQhse && !isClosed && (
                   <div className="mt-3 border-t border-slate-100 pt-3">

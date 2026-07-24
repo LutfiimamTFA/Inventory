@@ -73,6 +73,7 @@ export const ASSET_STATUS_LABEL: Record<AssetStatus, string> = {
   available: "Tersedia",
   borrowed: "Dipinjam",
   in_use: "Digunakan Tetap",
+  inspection_required: "Menunggu Pemeriksaan QHSE",
   maintenance: "Maintenance",
   broken: "Rusak",
   incomplete: "Tidak Lengkap",
@@ -85,6 +86,7 @@ export const ASSET_STATUS_HELPER: Record<AssetStatus, string> = {
   available: "Asset siap dipinjam/digunakan.",
   borrowed: "Asset sedang dipinjam staff.",
   in_use: "Asset dipakai tetap oleh orang/divisi tertentu.",
+  inspection_required: "Asset menunggu pemeriksaan QHSE setelah dilaporkan bermasalah.",
   maintenance: "Asset sedang dicek/diperbaiki.",
   broken: "Asset tidak layak pakai.",
   incomplete: "Asset kurang aksesoris/komponen.",
@@ -97,6 +99,7 @@ export const ASSET_STATUS_COLOR: Record<AssetStatus, string> = {
   available: "bg-emerald-50 text-emerald-700 border-emerald-200",
   borrowed: "bg-amber-50 text-amber-700 border-amber-200",
   in_use: "bg-blue-50 text-blue-700 border-blue-200",
+  inspection_required: "bg-amber-50 text-amber-700 border-amber-200",
   maintenance: "bg-purple-50 text-purple-700 border-purple-200",
   broken: "bg-red-50 text-red-700 border-red-200",
   incomplete: "bg-orange-50 text-orange-700 border-orange-200",
@@ -122,6 +125,7 @@ export const ASSET_USAGE_STATUS_LABEL: Record<AssetUsageStatus, string> = {
   maintenance: "Maintenance",
   unavailable: "Tidak Tersedia",
   fixed_at_location: "Tetap di Lokasi",
+  inspection_required: "Menunggu Pemeriksaan QHSE",
 };
 
 export const ASSET_USAGE_STATUS_COLOR: Record<AssetUsageStatus, string> = {
@@ -132,6 +136,7 @@ export const ASSET_USAGE_STATUS_COLOR: Record<AssetUsageStatus, string> = {
   maintenance: "bg-purple-50 text-purple-700 border-purple-200",
   unavailable: "bg-slate-100 text-slate-500 border-slate-200",
   fixed_at_location: "bg-slate-100 text-slate-600 border-slate-200",
+  inspection_required: "bg-amber-50 text-amber-700 border-amber-200",
 };
 
 // Section A — mode tracking aset (lihat AGENTS/spec "Perbaiki konsep Status
@@ -180,7 +185,7 @@ const ASSET_STATUS_AS_CONDITION: AssetStatus[] = [
   "inactive",
   "disposed",
 ];
-const ASSET_STATUS_AS_USAGE: AssetStatus[] = ["available", "borrowed", "in_use"];
+const ASSET_STATUS_AS_USAGE: AssetStatus[] = ["available", "borrowed", "in_use", "inspection_required"];
 
 export function getAssetConditionLabel(
   asset: Pick<Asset, "assetStatus" | "condition" | "hasActiveIssue" | "conditionLabel">
@@ -223,6 +228,56 @@ export function getAssetUsageBadge(
     label: ASSET_STATUS_LABEL[asset.assetStatus],
     colorClass: ASSET_STATUS_COLOR[asset.assetStatus],
   };
+}
+
+// Section 3/10 — SATU sumber kebenaran untuk "aset ini bermasalah atau
+// tidak", dipakai bareng oleh dashboard, summary card Assets, tabel Assets,
+// dan filter — supaya angkanya tidak pernah berbeda-beda per halaman.
+// hasActiveIssue (laporan staff yang belum divalidasi QHSE) didahulukan,
+// lalu kondisi/assetStatus final yang sudah jelas rusak/hilang/tidak
+// lengkap — TIDAK termasuk status pemakaian (available/borrowed/in_use).
+export function isProblemAsset(
+  asset: Pick<Asset, "hasActiveIssue" | "condition" | "assetStatus">
+): boolean {
+  const condition = String(asset.condition || "").toLowerCase();
+  const assetStatus = String(asset.assetStatus || "").toLowerCase();
+  return (
+    asset.hasActiveIssue === true ||
+    condition === "reported_issue" ||
+    condition === "minor_damage" ||
+    condition === "heavy_damage" ||
+    condition === "damaged" ||
+    condition === "broken" ||
+    condition === "lost" ||
+    condition === "incomplete" ||
+    assetStatus === "broken" ||
+    assetStatus === "lost" ||
+    assetStatus === "incomplete"
+  );
+}
+
+// Status tiket kendala yang dianggap MASIH AKTIF (belum final) — dipakai
+// untuk fallback query tiket aktif suatu aset (AssetIssueWarningCard) dan
+// untuk menentukan tiket mana yang jadi "active ticket" berikutnya kalau
+// tiket yang sedang ditutup ternyata bukan satu-satunya tiket aktif aset itu.
+const ACTIVE_ISSUE_TICKET_STATUSES = [
+  "reported",
+  "laporan_masuk",
+  "assigned",
+  "accepted",
+  "in_progress",
+  "need_more_info",
+  "under_review",
+  "waiting_qhse_review",
+  "waiting_reporter_confirmation",
+  "reporter_confirmed",
+  "needs_follow_up",
+  "revision_requested",
+  "external_coordination",
+];
+
+export function isIssueTicketActive(status: string | null | undefined): boolean {
+  return ACTIVE_ISSUE_TICKET_STATUSES.includes(String(status || ""));
 }
 
 export const BORROWING_STATUS_LABEL: Record<BorrowingStatus, string> = {
@@ -1033,7 +1088,7 @@ export function normalizeAssetUsageStatus(asset: BorrowStatusAsset): NormalizedB
   const rawStatus = String(asset.currentUsageStatus || asset.assetStatus || "").toLowerCase();
 
   const borrowedKeywords = ["borrowed", "dipinjam", "sedang_dipinjam", "in_use", "used", "temporary_used_by_other"];
-  const maintenanceKeywords = ["maintenance", "perbaikan", "rusak", "broken"];
+  const maintenanceKeywords = ["maintenance", "inspection_required", "perbaikan", "rusak", "broken"];
   const availableKeywords = ["available", "tersedia", "ready", "aktif"];
 
   if (borrowedKeywords.includes(rawStatus)) return "borrowed";

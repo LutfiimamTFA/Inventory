@@ -1,11 +1,11 @@
 "use client";
 
 import { useState } from "react";
-import { collection, doc, getDoc, serverTimestamp, updateDoc, writeBatch } from "firebase/firestore";
+import { doc, getDoc, serverTimestamp, updateDoc } from "firebase/firestore";
 import { X, UploadCloud, Check } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
-import { Asset, IssueImpactLevel, IssueSymptomType } from "@/lib/types";
+import { Asset, AssetBorrowing, IssueImpactLevel, IssueSymptomType } from "@/lib/types";
 import {
   generateTicketNumber,
   generateQueueNumber,
@@ -13,21 +13,15 @@ import {
   writeAssetIssueLog,
   fetchActiveUsersByRoles,
 } from "@/lib/firestore-helpers";
+import { createAssetIssueTicket } from "@/lib/assets/create-asset-issue-ticket";
 import { uploadToDrive } from "@/lib/drive-upload";
 import { createAssetNotification } from "@/lib/notifications";
-
-const SYMPTOM_OPTIONS: IssueSymptomType[] = [
-  "Lemot / Lambat",
-  "Memori / Storage Penuh",
-  "Tidak Menyala",
-  "Tidak Bisa Digunakan",
-  "Error Aplikasi / Sistem",
-  "Koneksi Bermasalah",
-  "Fisik Rusak",
-  "Tidak Lengkap",
-  "Hilang",
-  "Lainnya",
-];
+import {
+  getAssetIssueReportContext,
+  getAssetIssueSourceFields,
+  ISSUE_SYMPTOM_OPTIONS,
+  isIssueEvidenceRequired,
+} from "@/lib/asset-issue-reporting";
 
 const IMPACT_OPTIONS: IssueImpactLevel[] = [
   "Masih Bisa Dipakai",
@@ -39,10 +33,16 @@ const IMPACT_OPTIONS: IssueImpactLevel[] = [
 export default function ReportIssueModal({
   asset,
   open,
+  activeBorrowing = null,
+  allowQrPhysicalObservation = false,
+  sourceQrScanLogId = null,
   onClose,
 }: {
   asset: Asset;
   open: boolean;
+  activeBorrowing?: AssetBorrowing | null;
+  allowQrPhysicalObservation?: boolean;
+  sourceQrScanLogId?: string | null;
   onClose: () => void;
 }) {
   const { assetUser, firebaseUser } = useAuth();
@@ -53,6 +53,25 @@ export default function ReportIssueModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [ticketNumber, setTicketNumber] = useState<string | null>(null);
+  const evidenceRequiredBySymptom = isIssueEvidenceRequired(symptomType);
+  const currentUidForUi = firebaseUser?.uid || assetUser?.uid || "";
+  const currentEmailForUi = firebaseUser?.email || assetUser?.email || "";
+  const currentNameForUi = assetUser?.name || firebaseUser?.displayName || firebaseUser?.email || "User";
+  const reportContextForUi = getAssetIssueReportContext({
+    user: currentUidForUi
+      ? {
+          uid: currentUidForUi,
+          name: currentNameForUi,
+          email: currentEmailForUi,
+          role: assetUser?.role || "staff",
+        }
+      : null,
+    asset,
+    activeBorrowing,
+    allowQrPhysicalObservation,
+    sourceQrScanLogId,
+  });
+  const photoRequired = evidenceRequiredBySymptom || reportContextForUi.requiresEvidence;
 
   if (!open) return null;
 
@@ -67,9 +86,11 @@ export default function ReportIssueModal({
   };
 
   const handleSubmit = async () => {
+    if (submitting) return;
+
     setError("");
     if (!symptomType) {
-      setError("Gejala kendala wajib dipilih.");
+      setError("Jenis kendala wajib dipilih.");
       return;
     }
     if (!impactLevel) {
@@ -78,6 +99,10 @@ export default function ReportIssueModal({
     }
     if (!description.trim()) {
       setError("Catatan kendala wajib diisi.");
+      return;
+    }
+    if (photoRequired && !file) {
+      setError("Foto/video bukti wajib diunggah untuk laporan ini.");
       return;
     }
 
@@ -95,6 +120,30 @@ export default function ReportIssueModal({
       setError("Sesi login tidak ditemukan. Silakan login ulang.");
       return;
     }
+
+    const reportContext = getAssetIssueReportContext({
+      user: {
+        uid: userUid,
+        name: currentUserName,
+        email: userEmail,
+        role: assetUser?.role || "staff",
+      },
+      asset,
+      activeBorrowing,
+      allowQrPhysicalObservation,
+      sourceQrScanLogId,
+    });
+
+    if (!reportContext.canReport) {
+      setError(reportContext.reason || "Anda belum memiliki hubungan yang jelas dengan aset ini.");
+      return;
+    }
+
+    const issueSourceFields = getAssetIssueSourceFields({
+      context: reportContext,
+      asset,
+      activeBorrowing,
+    });
 
     setSubmitting(true);
     setError("");
@@ -192,63 +241,40 @@ export default function ReportIssueModal({
       status: "reported" as const,
       statusLabel: "Laporan Masuk",
       staffStatusLabel: "Laporan Dikirim",
+      ...issueSourceFields,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
       updatedByUid: userUid,
       updatedByName: currentUserName,
     };
 
-    // Section A/B/E — INI SATU-SATUNYA langkah yang boleh menggagalkan
-    // submit. Ticket + kondisi sementara asset ("Dilaporkan Bermasalah")
-    // ditulis dalam SATU writeBatch supaya tidak ada kondisi asset yang
-    // "nyangkut" tanpa tiket, atau sebaliknya. Log/notifikasi di bawah
-    // bersifat best-effort (try/catch masing-masing) supaya kegagalannya
-    // TIDAK membuat laporan yang sudah tersimpan malah dilaporkan gagal.
-    const ticketRef = doc(collection(db, "asset_issue_tickets"));
-    const assetIssuePayload = {
-      hasActiveIssue: true,
-      activeIssueTicketId: ticketRef.id,
-      activeIssueTicketNo: ticketNum,
-
-      condition: "reported_issue" as const,
-      conditionLabel: "Dilaporkan Bermasalah",
-
-      // Section A — kalau asset KEBETULAN sudah "reported_issue" (mis. laporan
-      // kedua sebelum yang pertama selesai direview), jangan snapshot
-      // "reported_issue" itu sendiri sebagai previousCondition — pakai yang
-      // sudah tersimpan sebelumnya, supaya nanti tetap bisa dikembalikan ke
-      // kondisi asli.
-      previousCondition:
-        asset.condition && asset.condition !== "reported_issue" ? asset.condition : asset.previousCondition || "good",
-      previousConditionLabel:
-        asset.conditionLabel && asset.conditionLabel !== "Dilaporkan Bermasalah"
-          ? asset.conditionLabel
-          : asset.previousConditionLabel || "Baik",
-
-      issueReportedAt: serverTimestamp(),
-      issueReportedByUid: userUid,
-      issueReportedByName: currentUserName,
-
-      lastIssueSymptomLabel: symptomType || "",
-      lastIssueNote: description.trim(),
-      lastIssueImpactLabel: impactLevel || "Sedang",
-
-      updatedAt: serverTimestamp(),
-      updatedByUid: userUid,
-      updatedByName: currentUserName,
-    };
+    // Section A/B/E/2 — INI SATU-SATUNYA langkah yang boleh menggagalkan
+    // submit, lewat service bersama createAssetIssueTicket (dipakai juga
+    // oleh Buat Laporan tanpa QR) supaya ticket + kondisi sementara aset
+    // ("Dilaporkan Bermasalah") SELALU ditulis dalam satu writeBatch, tidak
+    // ada kondisi aset yang "nyangkut" tanpa tiket atau sebaliknya.
+    // Log/notifikasi di bawah bersifat best-effort (try/catch masing-
+    // masing) supaya kegagalannya TIDAK membuat laporan yang sudah
+    // tersimpan malah dilaporkan gagal.
+    let ticketRef: { id: string };
     try {
       console.log("[Asset Issue Report] START create ticket + update asset condition", {
         assetId: asset.id,
         assetCode: asset.assetCode,
         userUid,
-        ticketPayloadKeys: Object.keys(ticketPayload),
-        assetPayloadKeys: Object.keys(assetIssuePayload),
+        payloadKeys: Object.keys(ticketPayload),
       });
-      const batch = writeBatch(db);
-      batch.set(ticketRef, ticketPayload);
-      batch.update(doc(db, "assets", asset.id), assetIssuePayload);
-      await batch.commit();
+      const result = await createAssetIssueTicket({
+        ticketPayload,
+        ticketNumber: ticketNum,
+        asset,
+        userUid,
+        userName: currentUserName,
+        symptomLabel: symptomType || "",
+        note: description.trim(),
+        impactLabel: impactLevel || "Sedang",
+      });
+      ticketRef = { id: result.ticketId };
       console.log("[Asset Issue Report] SUCCESS create ticket + update asset condition", ticketRef.id);
 
       // Section B — verifikasi TERBACA (bukan cuma "commit tidak error"),
@@ -391,15 +417,15 @@ export default function ReportIssueModal({
 
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1.5">
-                Gejala Kendala <span className="text-red-500">*</span>
+                Jenis Kendala <span className="text-red-500">*</span>
               </label>
               <select
                 value={symptomType}
                 onChange={(e) => setSymptomType(e.target.value as IssueSymptomType)}
                 className="input cursor-pointer"
               >
-                <option value="">Pilih gejala</option>
-                {SYMPTOM_OPTIONS.map((s) => (
+                <option value="">Pilih jenis kendala</option>
+                {ISSUE_SYMPTOM_OPTIONS.map((s) => (
                   <option key={s} value={s}>
                     {s}
                   </option>
@@ -440,7 +466,7 @@ export default function ReportIssueModal({
 
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1.5">
-                Upload Foto/Video (opsional)
+                Upload Foto/Video {photoRequired ? <span className="text-red-500">*</span> : <span className="text-slate-400">(opsional)</span>}
               </label>
               <label className="file-drop">
                 <UploadCloud size={20} className="text-slate-400" />

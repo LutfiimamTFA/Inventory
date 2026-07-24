@@ -15,18 +15,27 @@ import {
 } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
-import { Asset } from "@/lib/types";
+import { Asset, AssetBorrowing } from "@/lib/types";
 import { isAssetInMyPicLocation } from "@/lib/locations";
 import { repairBrokenBorrowState } from "@/lib/borrow-actions";
+import { getAssetIssueReportContext } from "@/lib/asset-issue-reporting";
 import {
-  ASSET_STATUS_COLOR,
-  ASSET_STATUS_LABEL,
   TRACKING_MODE_LABEL,
+  formatExpectedReturn,
   getAssetConditionLabel,
   hasBrokenBorrowState,
   isBorrowedByMe,
   isBorrowedByOther,
 } from "@/lib/utils";
+import {
+  detectAssetDataAnomalies,
+  getActiveIssueSummary,
+  getAssetUsageColor,
+  getAssetUsageLabel,
+  getCurrentAssetHolder,
+  getCurrentAssetHolderDisplayText,
+  pickLatestActiveBorrowing,
+} from "@/lib/assets/asset-status";
 import Badge from "@/components/Badge";
 import ReportIssueModal from "@/components/ReportIssueModal";
 import { BorrowModal, ReturnModal } from "@/components/BorrowReturnModal";
@@ -58,6 +67,10 @@ function AssetActionContent() {
   const [returnOpen, setReturnOpen] = useState(false);
   const [showFullDetail, setShowFullDetail] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
+  // Section 1/4 — borrowing AKTIF untuk aset ini, sumber utama status
+  // pemakaian & pemegang (lihat lib/assets/asset-status.ts) — bukan cuma
+  // baca field mentah di dokumen assets yang bisa tidak sinkron.
+  const [activeBorrowings, setActiveBorrowings] = useState<AssetBorrowing[]>([]);
 
   // Section K — diekstrak jadi fungsi sendiri supaya bisa dipanggil ULANG
   // setelah Pinjam/Kembalikan sukses (refresh status asset), TANPA perlu
@@ -132,6 +145,29 @@ function AssetActionContent() {
     }
   }, [code, fetchAssetByCode]);
 
+  // Section 4 — begitu asset diketahui, ambil SEMUA asset_borrowings yang
+  // menunjuk ke asset ini (assetId) — bukan cuma percaya field currentHolder*
+  // di dokumen assets, yang bisa telat/tidak sinkron dari borrowing yang
+  // sebenarnya masih aktif.
+  useEffect(() => {
+    if (!asset?.id) {
+      Promise.resolve().then(() => setActiveBorrowings([]));
+      return;
+    }
+    let cancelled = false;
+    getDocs(query(collection(db, "asset_borrowings"), where("assetId", "==", asset.id)))
+      .then((snap) => {
+        if (cancelled) return;
+        setActiveBorrowings(snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetBorrowing)));
+      })
+      .catch((error) => {
+        console.error("[Asset Action] gagal memuat asset_borrowings", { assetId: asset.id, error });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [asset?.id]);
+
   if (loading || (!firebaseUser && !code)) {
     return (
       <PageShell>
@@ -183,7 +219,37 @@ function AssetActionContent() {
   const brokenBorrowState = hasBrokenBorrowState(asset);
   const isAvailableToBorrow =
     asset.isBorrowable && !isFixedLocation && !borrowedByMe && !borrowedByOther && !brokenBorrowState;
-  const holderName = asset.currentHolderName || asset.currentBorrowerName || asset.custodianName;
+
+  // Section 1/2 — SATU sumber untuk status pemakaian + pemegang, lewat
+  // lib/assets/asset-status.ts, supaya badge dan pesan warning tidak lagi
+  // bisa saling bertentangan (akar bug: badge sebelumnya baca assetStatus
+  // mentah, warning baca currentUsageStatus — dua field yang bisa beda).
+  const activeBorrowing = pickLatestActiveBorrowing(activeBorrowings);
+  const quickReportContext = getAssetIssueReportContext({
+    user: assetUser?.uid
+      ? {
+          uid: assetUser.uid,
+          name: assetUser.name || "",
+          email: assetUser.email || "",
+          role: role || assetUser.role || "staff",
+        }
+      : null,
+    asset,
+    activeBorrowing,
+    allowQrPhysicalObservation: true,
+  });
+  const canReportIssue = quickReportContext.canReport;
+  const reportIssueLabel =
+    quickReportContext.reportSource === "qr_physical_observation"
+      ? "Saya Menemukan Kendala"
+      : "Laporkan Kendala";
+  const usageLabel = getAssetUsageLabel(asset, activeBorrowing);
+  const usageColor = getAssetUsageColor(asset, activeBorrowing);
+  const holder = getCurrentAssetHolder(asset, activeBorrowing);
+  const holderDisplayText = getCurrentAssetHolderDisplayText(holder);
+  const activeIssue = getActiveIssueSummary(asset);
+  const dataAnomalies = detectAssetDataAnomalies(asset, activeBorrowings);
+  const canSeeAnomalies = role === "super_admin" || role === "asset_admin";
 
   const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
   const isLocationPicOwner = isLocationPicScoped && isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid);
@@ -216,7 +282,7 @@ function AssetActionContent() {
     if (borrowedByOther) {
       setToast({
         type: "error",
-        message: `Asset sedang dipinjam oleh ${holderName || "user lain"}.`,
+        message: `Asset sedang dipinjam oleh ${holder.name || "user lain"}.`,
       });
       return;
     }
@@ -255,28 +321,48 @@ function AssetActionContent() {
               <p className="font-mono text-xs text-slate-400">{asset.assetCode}</p>
               <h2 className="truncate text-lg font-bold text-slate-900">{asset.assetName}</h2>
             </div>
-            <Badge label={ASSET_STATUS_LABEL[asset.assetStatus]} colorClass={ASSET_STATUS_COLOR[asset.assetStatus]} />
+            {/* Section 3 — Status Pemakaian TERPISAH dari Kondisi Aset (Row di
+                bawah) — badge ini SELALU lewat getAssetUsageLabel/Color, bukan
+                baca assetStatus mentah, supaya tidak lagi bisa bertentangan
+                dengan pesan "dipinjam oleh user lain" di bawah. */}
+            <Badge label={usageLabel} colorClass={usageColor} />
           </div>
 
-          {(asset.hasActiveIssue === true || asset.condition === "reported_issue") && (
+          {activeIssue.hasIssue && (
             <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-amber-800">
-              <p className="font-semibold text-sm">Asset sedang dilaporkan bermasalah</p>
-              <p className="text-sm mt-0.5">
-                Laporan {asset.activeIssueTicketNo || "-"} sedang menunggu review QHSE.
-              </p>
-              {asset.lastIssueSymptomLabel && (
-                <p className="text-xs mt-1">Gejala: {asset.lastIssueSymptomLabel}</p>
-              )}
-              {asset.lastIssueNote && <p className="text-xs mt-0.5">Catatan: {asset.lastIssueNote}</p>}
+              <p className="font-semibold text-sm">Asset Dilaporkan Bermasalah</p>
+              <p className="text-sm mt-0.5">Laporan {activeIssue.ticketNo || "-"} sedang menunggu review QHSE.</p>
+              {activeIssue.symptomLabel && <p className="text-xs mt-1">Gejala: {activeIssue.symptomLabel}</p>}
+              {activeIssue.note && <p className="text-xs mt-0.5">Catatan: &ldquo;{activeIssue.note}&rdquo;</p>}
             </div>
           )}
 
+          {/* Section 13 — anomali data HANYA untuk Asset Admin/QHSE, bahasa
+              netral (bukan "korupsi data"), tidak pernah memblokir staff. */}
+          {canSeeAnomalies &&
+            dataAnomalies.map((anomaly) => (
+              <div
+                key={anomaly.code}
+                className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700"
+              >
+                <p className="font-semibold">{anomaly.title}</p>
+                <p className="mt-0.5">{anomaly.message}</p>
+              </div>
+            ))}
+
           <div className="mt-4 space-y-2 text-sm text-slate-600">
             <Row label="Lokasi" value={asset.location || asset.locationText || "-"} />
-            <Row label="Kondisi" value={getAssetConditionLabel(asset)} />
+            <Row label="Kondisi Aset" value={getAssetConditionLabel(asset)} />
             {asset.areaPicName && <Row label="PIC Operasional" value={asset.areaPicName} />}
-            {!isFixedLocation && (
-              <Row label="Pemegang Saat Ini" value={holderName || "Belum tercatat"} />
+            {!isFixedLocation && <Row label="Pemegang Saat Ini" value={holderDisplayText} />}
+            {!isFixedLocation && activeBorrowing?.estimatedReturnAt && (
+              <Row label="Estimasi Kembali" value={formatExpectedReturn(activeBorrowing.estimatedReturnAt)} />
+            )}
+            {/* Section 2 — sistem TAHU ada pemegang tapi namanya belum
+                ke-resolve (uid ada, nama kosong di semua field fallback) —
+                cuma tampil untuk Asset Admin/QHSE, bukan noise buat staff. */}
+            {!isFixedLocation && canSeeAnomalies && holder.hasHolderSignal && !holder.name && (
+              <p className="text-right text-[11px] text-amber-600">Perlu sinkronisasi data pemegang</p>
             )}
           </div>
 
@@ -308,7 +394,7 @@ function AssetActionContent() {
           {!brokenBorrowState && borrowedByOther && (
             <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
               <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-              <span>Asset sedang dipinjam oleh {holderName || "user lain"}.</span>
+              <span>Asset sedang dipinjam oleh {holder.name || "user lain"}.</span>
             </div>
           )}
 
@@ -352,12 +438,14 @@ function AssetActionContent() {
               <ActionButton icon={ArrowRightLeft} label="Pinjam Asset" onClick={handleBorrowClick} />
             )}
 
-            <ActionButton
-              icon={AlertTriangle}
-              label="Laporkan Kendala"
-              tone="warning"
-              onClick={() => setReportOpen(true)}
-            />
+            {canReportIssue && (
+              <ActionButton
+                icon={AlertTriangle}
+                label={reportIssueLabel}
+                tone="warning"
+                onClick={() => setReportOpen(true)}
+              />
+            )}
           </div>
 
           {/* Section N/Q — scan ulang HANYA lewat tombol ini, tidak pernah
@@ -373,7 +461,13 @@ function AssetActionContent() {
         </div>
       </div>
 
-      <ReportIssueModal asset={asset} open={reportOpen} onClose={() => setReportOpen(false)} />
+      <ReportIssueModal
+        asset={asset}
+        open={reportOpen}
+        activeBorrowing={activeBorrowing}
+        allowQrPhysicalObservation
+        onClose={() => setReportOpen(false)}
+      />
       <BorrowModal
         asset={asset}
         open={borrowOpen}
@@ -388,9 +482,9 @@ function AssetActionContent() {
         asset={asset}
         open={returnOpen}
         onClose={() => setReturnOpen(false)}
-        onDone={() => {
+        onDone={(message) => {
           setReturnOpen(false);
-          setToast({ type: "success", message: "Asset berhasil dikembalikan." });
+          setToast({ type: "success", message: message || "Asset berhasil dikembalikan." });
           refreshAsset();
         }}
       />

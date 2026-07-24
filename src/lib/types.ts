@@ -10,6 +10,7 @@ export type AssetStatus =
   | "available"
   | "borrowed"
   | "in_use"
+  | "inspection_required"
   | "maintenance"
   | "broken"
   | "incomplete"
@@ -254,7 +255,12 @@ export type AssetUsageStatus =
   | "borrowed"
   | "maintenance"
   | "unavailable"
-  | "fixed_at_location";
+  | "fixed_at_location"
+  // Aset baru saja dikembalikan dalam kondisi bermasalah (Ada Kendala/
+  // Rusak/Tidak Lengkap) — BUKAN "available" (belum tentu aman dipakai
+  // lagi) dan BUKAN "borrowed" (sudah tidak dipegang siapa pun) — menunggu
+  // QHSE menentukan kondisi final lewat alur review tiket kendala.
+  | "inspection_required";
 
 export interface AssetCategory {
   id: string;
@@ -386,13 +392,17 @@ export interface EmployeeProfile {
 
 export type IssueSymptomType =
   | "Lemot / Lambat"
+  | "Storage Penuh"
   | "Memori / Storage Penuh"
   | "Tidak Menyala"
   | "Tidak Bisa Digunakan"
+  | "Error Sistem"
   | "Error Aplikasi / Sistem"
+  | "Rusak Fisik"
   | "Koneksi Bermasalah"
   | "Fisik Rusak"
   | "Tidak Lengkap"
+  | "Aksesori Hilang"
   | "Hilang"
   | "Lainnya";
 
@@ -511,7 +521,7 @@ export interface AssetIssueTicket {
   queueNumber: string;
 
   reportType?: IssueReportType;
-  source?: "manual_web" | "staff_report" | "maintenance_work_order" | "maintenance_finding";
+  source?: "manual_web" | "staff_report" | "maintenance_work_order" | "maintenance_finding" | "return_flow";
   title?: string;
   severity?: IssueSeverity;
   statusLabel?: string;
@@ -576,6 +586,15 @@ export interface AssetIssueTicket {
   attachmentUrls?: string[];
   attachmentFiles?: string[];
   photoUrls?: string[];
+
+  reportSource?: string | null;
+  reporterRelationship?: string | null;
+  sourceBorrowingId?: string | null;
+  sourceQrScanLogId?: string | null;
+  holderUidAtReport?: string | null;
+  holderNameAtReport?: string | null;
+  usageStatusAtReport?: string | null;
+  conditionAtReport?: string | null;
 
   priority: IssuePriority;
   status: IssueTicketStatus;
