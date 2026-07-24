@@ -272,30 +272,114 @@ export function pickLatestActiveBorrowing<T extends { borrowedAt?: unknown; crea
   })[0];
 }
 
-// Section 2 — foto ASLI aset (bukan logo QHSE) untuk Aksi Cepat. Urutan
-// fallback field PERSIS seperti diminta: assetPhotoUrl (alias legacy yang
-// mungkin dipakai import lama) -> photoUrl (URL langsung) -> imageUrl
-// (alias legacy lain) -> photoDriveFileId/driveFileId (lewat proxy
-// /api/drive-image, sama seperti Asset Detail page) -> assetPhotoFileId
-// (alias legacy Drive file id). Berhenti di kandidat pertama yang ada.
+// Section 1/2/3/4 — foto ASLI aset (bukan logo QHSE) untuk halaman Detail
+// Aset & Aksi Cepat setelah Scan QR. Root cause bug lama: field fileId
+// (photoDriveFileId/driveFileId/assetPhotoFileId/dst.) baru dicek KALAU
+// tidak ada field URL sama sekali — padahal banyak data lama sebenarnya
+// menyimpan link Google Drive MENTAH (drive.google.com/file/d/...) di
+// field URL itu, yang tidak pernah bisa dipakai langsung sebagai <img src>
+// (Drive menolak hotlink halaman view-nya). Akibatnya foto gagal dimuat
+// lalu dianggap "belum tersedia" padahal filenya ADA.
+//
+// Urutan baru: (1) SEMUA field fileId dicek LEBIH DULU — ini paling andal
+// karena selalu lewat proxy /api/drive-image (server-side, pakai credential
+// server, sama di localhost maupun Vercel, TIDAK PERNAH link Drive mentah).
+// (2) Baru field URL — kalau URL itu ternyata link Google Drive, fileId-nya
+// diekstrak dan tetap dipakai lewat proxy yang sama; kalau bukan link Drive
+// (URL gambar biasa), dipakai apa adanya.
 export interface AssetPhotoSrc {
   src: string | null;
   isDriveProxy: boolean;
+  fileId: string | null;
+  fieldUsed: string | null;
+}
+
+// Pola URL Google Drive yang didukung:
+//   drive.google.com/file/d/FILE_ID/view
+//   drive.google.com/open?id=FILE_ID
+//   drive.google.com/uc?id=FILE_ID
+function extractDriveFileIdFromUrl(url: string): string | null {
+  const pathMatch = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+  if (pathMatch?.[1]) return pathMatch[1];
+  const queryMatch = url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  if (queryMatch?.[1]) return queryMatch[1];
+  return null;
+}
+
+function firstNonEmptyString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
 }
 
 export function resolveAssetPhotoSrc(asset: Asset): AssetPhotoSrc {
   const a = asset as unknown as Record<string, unknown>;
-  const directUrl =
-    (a.assetPhotoUrl as string) || asset.photoUrl || (a.imageUrl as string) || null;
-  if (directUrl) return { src: directUrl, isDriveProxy: false };
 
-  const driveFileId =
-    asset.photoDriveFileId || (a.driveFileId as string) || (a.assetPhotoFileId as string) || null;
-  if (driveFileId) {
-    return { src: `/api/drive-image?fileId=${encodeURIComponent(driveFileId)}`, isDriveProxy: true };
+  // Section 1/6 — cek SEMUA kemungkinan field fileId dulu, jangan langsung
+  // simpulkan "tidak ada foto" hanya karena field URL kosong.
+  const fileIdFields: [string, unknown][] = [
+    ["assetPhotoFileId", a.assetPhotoFileId],
+    ["photoDriveFileId", asset.photoDriveFileId],
+    ["driveFileId", a.driveFileId],
+    ["photoFileId", a.photoFileId],
+    ["imageFileId", a.imageFileId],
+  ];
+  for (const [field, value] of fileIdFields) {
+    const fileId = firstNonEmptyString(value);
+    if (fileId) {
+      const src = `/api/drive-image?fileId=${encodeURIComponent(fileId)}`;
+      // Section 7 — log sementara untuk debugging "foto tidak tampil".
+      console.log("[Asset Photo] fileId field ditemukan", { assetId: asset.id, field, fileId, previewUrl: src });
+      return { src, isDriveProxy: true, fileId, fieldUsed: field };
+    }
   }
 
-  return { src: null, isDriveProxy: false };
+  // Section 2/3 — field URL: kalau ternyata link Google Drive, EKSTRAK
+  // fileId dan tetap pakai proxy (JANGAN PERNAH pakai link Drive mentah
+  // sebagai <img src> di frontend).
+  const urlFields: [string, unknown][] = [
+    ["assetPhotoUrl", a.assetPhotoUrl],
+    ["photoUrl", asset.photoUrl],
+    ["imageUrl", a.imageUrl],
+    ["thumbnailUrl", a.thumbnailUrl ?? asset.photoThumbnailUrl],
+  ];
+  for (const [field, value] of urlFields) {
+    const url = firstNonEmptyString(value);
+    if (!url) continue;
+
+    if (/drive\.google\.com/i.test(url)) {
+      const fileId = extractDriveFileIdFromUrl(url);
+      if (fileId) {
+        const src = `/api/drive-image?fileId=${encodeURIComponent(fileId)}`;
+        console.log("[Asset Photo] fileId diekstrak dari URL Drive", {
+          assetId: asset.id,
+          field,
+          fileId,
+          previewUrl: src,
+        });
+        return { src, isDriveProxy: true, fileId, fieldUsed: field };
+      }
+      // Link Drive tapi fileId tidak bisa diekstrak — jangan pernah dipakai
+      // mentah, lanjut ke kandidat berikutnya.
+      console.warn("[Asset Photo] URL Drive ditemukan tapi fileId gagal diekstrak", { assetId: asset.id, field, url });
+      continue;
+    }
+
+    console.log("[Asset Photo] URL gambar langsung ditemukan", { assetId: asset.id, field, url });
+    return { src: url, isDriveProxy: false, fileId: null, fieldUsed: field };
+  }
+
+  console.log("[Asset Photo] tidak ada field foto ditemukan sama sekali", { assetId: asset.id });
+  return { src: null, isDriveProxy: false, fileId: null, fieldUsed: null };
+}
+
+// Section 4 — helper terpusat yang diminta: SATU fungsi yang selalu
+// mengembalikan URL proxy yang sama (relatif, tanpa origin) baik di
+// localhost maupun Vercel — tidak pernah hardcode host, tidak pernah link
+// Google Drive mentah.
+export function getAssetPhotoPreviewUrl(asset: Asset): string | null {
+  return resolveAssetPhotoSrc(asset).src;
 }
 
 export interface AssetVerificationIndicator {

@@ -38,6 +38,7 @@ import ConfirmModal from "@/components/ConfirmModal";
 import { useAuth } from "@/lib/auth-context";
 import { getResolvedPersonDisplay, useEmployeeDirectory } from "@/lib/employeeDirectory";
 import { isAssetInMyPicLocation } from "@/lib/locations";
+import { getAssetPhotoPreviewUrl } from "@/lib/assets/asset-status";
 import { Asset, AssetBorrowing, AssetIssueTicket, AssetLog } from "@/lib/types";
 import {
   ASSET_USAGE_STATUS_COLOR,
@@ -279,11 +280,11 @@ export default function AssetDetailPage() {
     );
   }
 
-  console.debug("[Asset Photo] drive file id:", asset.photoDriveFileId);
-  const photoImageSrc = asset.photoDriveFileId
-    ? `/api/drive-image?fileId=${asset.photoDriveFileId}`
-    : null;
-  console.debug("[Asset Photo] image src:", photoImageSrc);
+  // Section 1/4/6 — pakai helper terpusat (SAMA dengan Aksi Cepat Scan QR):
+  // cek SEMUA field fileId dulu, baru field URL (ekstrak fileId kalau
+  // ternyata link Drive mentah) — jangan langsung simpulkan "belum ada
+  // foto" hanya karena satu field kosong.
+  const photoImageSrc = getAssetPhotoPreviewUrl(asset);
 
   const handleDeactivate = async () => {
     setDeactivating(true);
@@ -929,15 +930,20 @@ export default function AssetDetailPage() {
                 src={photoImageSrc}
                 alt={asset.photoFileName || "Foto asset"}
                 className="w-full rounded-xl object-cover"
+                onLoad={() => {
+                  console.log("[Asset Photo] berhasil dimuat", { assetId: asset.id, previewUrl: photoImageSrc });
+                }}
                 onError={() => {
-                  console.debug("[Asset Photo] image load failed:", photoImageSrc);
+                  console.error("[Asset Photo] gagal dimuat dari proxy", { assetId: asset.id, previewUrl: photoImageSrc });
                   setPhotoImgError(true);
                 }}
               />
             ) : (
+              // Section 8 — BEDAKAN "belum pernah diunggah" (photoImageSrc
+              // kosong) dari "gagal dimuat" (src ada tapi <img> error).
               <EmptyState
                 icon={ImageIcon}
-                title={photoImgError ? "Foto belum dapat ditampilkan" : "Belum ada foto"}
+                title={photoImageSrc && photoImgError ? "Foto aset gagal dimuat." : "Belum ada foto"}
                 description={asset.photoFileName}
               />
             )}

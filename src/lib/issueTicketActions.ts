@@ -217,6 +217,9 @@ export function isIssueTicketClosed(status: IssueTicketStatus): boolean {
 // Section E — urutan step timeline visual. reporter_confirmed digabung
 // tampil sebagai bagian dari step "Menunggu Konfirmasi Pelapor" supaya
 // timeline tidak terlalu panjang, tapi tetap "aktif" beda dari waiting.
+// PIC Lokasi TIDAK PERNAH punya step sendiri di sini — workflow
+// verifikasi/approval PIC Lokasi dibatalkan, laporan tetap mengalir
+// langsung Pelapor -> QHSE -> Tim Terkait -> Pelapor -> Selesai.
 export const ISSUE_TIMELINE_STEPS: { key: IssueTicketStatus | "created"; label: string }[] = [
   { key: "created", label: "Laporan Dibuat" },
   { key: "under_review", label: "Ditinjau QHSE" },

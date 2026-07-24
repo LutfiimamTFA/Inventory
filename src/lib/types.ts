@@ -759,6 +759,19 @@ export interface AssetIssueTicket {
 
   createdAt: unknown;
   updatedAt: unknown;
+
+  // ── PIC Lokasi (penanggung jawab AREA, BUKAN penanggung jawab teknis/
+  // pemegang aset) ────────────────────────────────────────────────────
+  // Snapshot diambil SEKALI saat ticket dibuat dari asset_locations/{locationId}
+  // (ticket.locationId, fallback asset.locationId) — TIDAK dari
+  // asset.picUid/operationalPicUid/currentHolderUid/currentBorrowerUid/
+  // borrowedByUid. Field ini HANYA untuk informasi/notifikasi PIC Lokasi —
+  // TIDAK ADA workflow verifikasi/approval PIC Lokasi (dibatalkan): PIC
+  // tidak mengonfirmasi laporan, tidak mengubah status tiket, tidak
+  // menutup laporan.
+  locationPicUid?: string | null;
+  locationPicName?: string | null;
+  locationPicEmail?: string | null;
 }
 
 // Log alur laporan kendala staff — collection asset_issue_ticket_logs,
@@ -1264,6 +1277,7 @@ export type NotificationType =
   | "asset_damage_reported"
   | "asset_issue_reported"
   | "asset_mismatch_reported"
+  | "location_pic_coordination"
   | "asset_created"
   | "asset_updated"
   | "asset_status_changed"

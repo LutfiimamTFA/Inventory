@@ -50,6 +50,7 @@ import {
   formatDateTime,
   formatExpectedReturn,
   getAssetConditionLabel,
+  hasActiveIssueTicket,
   isBorrowingLate,
 } from "@/lib/utils";
 import { handoverTemporary, returnToCustodian } from "@/lib/custodian-actions";
@@ -933,7 +934,8 @@ function ScanPageContent() {
     asset &&
     (asset.currentUsageStatus || asset.assetStatus) === "available" &&
     asset.isBorrowable &&
-    !isBorrowedByMe;
+    !isBorrowedByMe &&
+    !hasActiveIssueTicket(asset);
   const usedBySomeoneElse =
     asset &&
     isUsageCandidate(asset) &&
@@ -1597,6 +1599,21 @@ function ScanPageContent() {
                               Laporkan Kendala
                             </button>
                           )}
+                          {/* Section — aset sudah punya laporan aktif: jangan
+                              tawarkan "Laporkan Kendala" lagi (cegah laporan
+                              ganda), cukup arahkan ke laporan yang sudah ada. */}
+                          {!canReportRow && hasActiveIssueTicket(a) && a.activeIssueTicketId && (
+                            <a
+                              href={
+                                role === "super_admin" || role === "asset_admin"
+                                  ? `/maintenance?tab=staff-reports&ticketId=${a.activeIssueTicketId}`
+                                  : `/my-reports?ticketId=${a.activeIssueTicketId}`
+                              }
+                              className="text-sm font-medium text-amber-600 hover:underline"
+                            >
+                              Lihat Laporan Aktif
+                            </a>
+                          )}
                           {/* Staff hanya boleh kembalikan barang yang dia pinjam
                               sendiri — TIDAK BOLEH ambil alih/mengembalikan
                               punya orang lain. */}
@@ -1758,6 +1775,18 @@ function ScanPageContent() {
                       >
                         Laporkan Kendala
                       </button>
+                    )}
+                    {!canReportRow && hasActiveIssueTicket(a) && a.activeIssueTicketId && (
+                      <a
+                        href={
+                          role === "super_admin" || role === "asset_admin"
+                            ? `/maintenance?tab=staff-reports&ticketId=${a.activeIssueTicketId}`
+                            : `/my-reports?ticketId=${a.activeIssueTicketId}`
+                        }
+                        className="block w-full rounded-xl border border-amber-200 px-3 py-2 text-center text-sm font-medium text-amber-700 hover:bg-amber-50"
+                      >
+                        Lihat Laporan Aktif
+                      </a>
                     )}
                     {mineBorrowed && (
                       <button
@@ -2199,7 +2228,8 @@ function AssetQuickDetailModal({
   const canBorrow =
     (asset.currentUsageStatus || asset.assetStatus) === "available" &&
     asset.isBorrowable &&
-    !isBorrowedByMe;
+    !isBorrowedByMe &&
+    !hasActiveIssueTicket(asset);
   const canHandoverTemporary =
     asset.usageType === "assigned_daily" &&
     asset.currentUsageStatus !== "temporary_used_by_other" &&
@@ -2337,6 +2367,21 @@ function AssetQuickDetailModal({
             >
               Lapor Kendala
             </button>
+          )}
+          {/* Section — aset sudah punya laporan aktif: jangan tawarkan
+              "Lapor Kendala" lagi (cegah laporan ganda), arahkan ke laporan
+              yang sudah ada. */}
+          {!canReportIssue && hasActiveIssueTicket(asset) && asset.activeIssueTicketId && (
+            <a
+              href={
+                isManager
+                  ? `/maintenance?tab=staff-reports&ticketId=${asset.activeIssueTicketId}`
+                  : `/my-reports?ticketId=${asset.activeIssueTicketId}`
+              }
+              className="rounded-xl border border-amber-200 bg-amber-50 text-amber-700 px-4 py-2 text-sm font-medium hover:bg-amber-100"
+            >
+              Lihat Laporan Aktif
+            </a>
           )}
           {isManager && (
             <button

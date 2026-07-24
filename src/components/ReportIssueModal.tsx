@@ -1,8 +1,9 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { doc, getDoc, serverTimestamp, updateDoc } from "firebase/firestore";
-import { X, UploadCloud, Check } from "lucide-react";
+import { collection, doc, getDoc, getDocs, query, serverTimestamp, updateDoc, where } from "firebase/firestore";
+import { AlertTriangle, X, UploadCloud, Check } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { Asset, AssetBorrowing, IssueImpactLevel, IssueSymptomType } from "@/lib/types";
@@ -16,7 +17,10 @@ import {
 import { createAssetIssueTicket } from "@/lib/assets/create-asset-issue-ticket";
 import { uploadToDrive } from "@/lib/drive-upload";
 import { createAssetNotification } from "@/lib/notifications";
+import { fetchLocationPicSnapshot } from "@/lib/locations";
+import { hasActiveIssueTicket, isIssueTicketActive } from "@/lib/utils";
 import {
+  canOverrideActiveIssueTicket,
   getAssetIssueReportContext,
   getAssetIssueSourceFields,
   ISSUE_SYMPTOM_OPTIONS,
@@ -45,7 +49,8 @@ export default function ReportIssueModal({
   sourceQrScanLogId?: string | null;
   onClose: () => void;
 }) {
-  const { assetUser, firebaseUser } = useAuth();
+  const router = useRouter();
+  const { assetUser, firebaseUser, role } = useAuth();
   const [symptomType, setSymptomType] = useState<IssueSymptomType | "">("");
   const [impactLevel, setImpactLevel] = useState<IssueImpactLevel | "">("");
   const [description, setDescription] = useState("");
@@ -53,10 +58,17 @@ export default function ReportIssueModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [ticketNumber, setTicketNumber] = useState<string | null>(null);
+  // Section — Asset Admin/QHSE bisa membuat laporan KEDUA pada aset yang
+  // sudah punya tiket aktif, TAPI hanya lewat konfirmasi eksplisit di sini
+  // (bukan default) bahwa masalahnya memang berbeda.
+  const [duplicateOverrideConfirmed, setDuplicateOverrideConfirmed] = useState(false);
   const evidenceRequiredBySymptom = isIssueEvidenceRequired(symptomType);
   const currentUidForUi = firebaseUser?.uid || assetUser?.uid || "";
   const currentEmailForUi = firebaseUser?.email || assetUser?.email || "";
   const currentNameForUi = assetUser?.name || firebaseUser?.displayName || firebaseUser?.email || "User";
+  const canOverride = canOverrideActiveIssueTicket(role || assetUser?.role);
+  const assetHasActiveIssue = hasActiveIssueTicket(asset);
+  const blockedByActiveIssue = assetHasActiveIssue && !(duplicateOverrideConfirmed && canOverride);
   const reportContextForUi = getAssetIssueReportContext({
     user: currentUidForUi
       ? {
@@ -70,8 +82,10 @@ export default function ReportIssueModal({
     activeBorrowing,
     allowQrPhysicalObservation,
     sourceQrScanLogId,
+    allowDuplicateOverride: duplicateOverrideConfirmed,
   });
   const photoRequired = evidenceRequiredBySymptom || reportContextForUi.requiresEvidence;
+  const isActiveIssueReporter = !!currentUidForUi && asset.issueReportedByUid === currentUidForUi;
 
   if (!open) return null;
 
@@ -82,8 +96,15 @@ export default function ReportIssueModal({
     setFile(null);
     setError("");
     setTicketNumber(null);
+    setDuplicateOverrideConfirmed(false);
     onClose();
   };
+
+  const activeTicketLink = asset.activeIssueTicketId
+    ? canOverride
+      ? `/maintenance?tab=staff-reports&ticketId=${asset.activeIssueTicketId}`
+      : `/my-reports?ticketId=${asset.activeIssueTicketId}`
+    : null;
 
   const handleSubmit = async () => {
     if (submitting) return;
@@ -132,11 +153,57 @@ export default function ReportIssueModal({
       activeBorrowing,
       allowQrPhysicalObservation,
       sourceQrScanLogId,
+      allowDuplicateOverride: duplicateOverrideConfirmed,
     });
 
     if (!reportContext.canReport) {
       setError(reportContext.reason || "Anda belum memiliki hubungan yang jelas dengan aset ini.");
       return;
+    }
+
+    // Section — validasi ULANG di submit (bukan cuma di tampilan): baca
+    // ulang dokumen asset TERBARU dari Firestore (prop `asset` bisa basi
+    // kalau modal sudah lama terbuka), lalu — sebagai jaring pengaman kedua
+    // — coba query tiket aktif berdasarkan assetId. Query collection ini
+    // bisa permission-denied untuk staff biasa (rules asset_issue_tickets
+    // membatasi baca ke tiket miliknya sendiri) — itu SENGAJA ditangkap dan
+    // diabaikan (non-fatal), karena field hasActiveIssue/activeIssueTicketId
+    // pada dokumen asset (yang semua orang boleh baca) sudah jadi sumber
+    // kebenaran utama.
+    if (asset.id && !duplicateOverrideConfirmed) {
+      try {
+        const freshAssetSnap = await getDoc(doc(db, "assets", asset.id));
+        const freshAsset = freshAssetSnap.exists() ? (freshAssetSnap.data() as Record<string, unknown>) : {};
+        const freshHasActiveIssue =
+          freshAsset.hasActiveIssue === true ||
+          freshAsset.condition === "reported_issue" ||
+          freshAsset.assetStatus === "inspection_required" ||
+          Boolean(freshAsset.activeIssueTicketId);
+
+        let hasActiveTicketInCollection = false;
+        if (!freshHasActiveIssue) {
+          try {
+            const ticketsSnap = await getDocs(
+              query(collection(db, "asset_issue_tickets"), where("assetId", "==", asset.id))
+            );
+            hasActiveTicketInCollection = ticketsSnap.docs.some((d) => isIssueTicketActive(d.data().status));
+          } catch (queryErr) {
+            console.warn(
+              "[Asset Issue Report] gagal query tiket aktif berdasarkan assetId (non-fatal, dilewati)",
+              queryErr
+            );
+          }
+        }
+
+        if (freshHasActiveIssue || hasActiveTicketInCollection) {
+          setError(
+            "Aset ini sudah memiliki laporan aktif. Silakan buka laporan tersebut untuk menambahkan informasi atau bukti."
+          );
+          return;
+        }
+      } catch (err) {
+        console.warn("[Asset Issue Report] gagal validasi ulang status aset (non-fatal, lanjut submit)", err);
+      }
     }
 
     const issueSourceFields = getAssetIssueSourceFields({
@@ -203,6 +270,16 @@ export default function ReportIssueModal({
     const locationId =
       asset.locationId || asset.areaId || asset.roomId || asset.floorId || asset.buildingId || "asset-location";
 
+    // Section 1 — PIC LOKASI (penanggung jawab AREA) diambil dari master
+    // asset_locations/{locationId}, BUKAN dari asset.picUid/operationalPicUid/
+    // currentHolderUid/currentBorrowerUid/borrowedByUid — lihat
+    // lib/locations.ts fetchLocationPicSnapshot. Kegagalan fetch tidak boleh
+    // menggagalkan laporan, cukup fallback ke "belum ditentukan".
+    const locationPicSnapshot = await fetchLocationPicSnapshot(locationId).catch((err) => {
+      console.warn("[Asset Issue Report] gagal mengambil PIC lokasi (non-fatal)", { locationId, err });
+      return { locationId, locationExists: false, locationPicUid: null, locationPicName: null, locationPicEmail: null };
+    });
+
     const ticketPayload = {
       ticketNumber: ticketNum,
       queueNumber: queueNum,
@@ -242,6 +319,12 @@ export default function ReportIssueModal({
       statusLabel: "Laporan Masuk",
       staffStatusLabel: "Laporan Dikirim",
       ...issueSourceFields,
+      // Section 8 — locationPicUid/Name/Email disimpan HANYA untuk info dan
+      // notifikasi (lihat blok notifikasi di bawah) — TIDAK ADA field
+      // approval/verifikasi PIC Lokasi apa pun di sini.
+      locationPicUid: locationPicSnapshot.locationPicUid,
+      locationPicName: locationPicSnapshot.locationPicName,
+      locationPicEmail: locationPicSnapshot.locationPicEmail,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
       updatedByUid: userUid,
@@ -372,6 +455,32 @@ export default function ReportIssueModal({
       console.warn("[Asset Issue Report] gagal kirim notifikasi QHSE (non-fatal)", ticketRef.id, err);
     }
 
+    // Section 6/8 — notifikasi PIC Lokasi bersifat INFORMASI SAJA (tanpa
+    // tombol konfirmasi, tidak menghambat workflow QHSE) — TERPISAH dari
+    // notifikasi QHSE di atas. Tidak dikirim kalau pelapor adalah PIC
+    // Lokasi itu sendiri (sudah tahu, karena mereka sendiri yang melapor).
+    if (locationPicSnapshot.locationPicUid && locationPicSnapshot.locationPicUid !== userUid) {
+      try {
+        await createAssetNotification({
+          recipientUid: locationPicSnapshot.locationPicUid,
+          recipientName: locationPicSnapshot.locationPicName || locationPicSnapshot.locationPicEmail || "",
+          recipientRole: "location_pic",
+          title: "Laporan baru terdapat di lokasi tanggung jawab Anda.",
+          message: `Laporan ${ticketNum} (${ticketPayload.title}) pada ${asset.assetName} di ${locationText}, dilaporkan oleh ${currentUserName}. Status: ${ticketPayload.statusLabel}.`,
+          type: "location_pic_coordination",
+          priority,
+          linkUrl: `/assets/${asset.id}`,
+          relatedType: "ticket",
+          relatedId: ticketRef.id,
+          relatedNumber: ticketNum,
+          createdByUid: userUid,
+          createdByName: currentUserName,
+        });
+      } catch (err) {
+        console.warn("[Asset Issue Report] gagal kirim notifikasi PIC Lokasi (non-fatal)", ticketRef.id, err);
+      }
+    }
+
     setTicketNumber(ticketNum);
     setSubmitting(false);
   };
@@ -408,12 +517,84 @@ export default function ReportIssueModal({
               Tutup
             </button>
           </div>
+        ) : blockedByActiveIssue ? (
+          // Section — cegah laporan ganda: kalau aset sudah punya tiket
+          // aktif, tampilkan info tiket itu + "Lihat Laporan Aktif" (dan
+          // "Tambahkan Bukti" kalau user adalah pelapornya) alih-alih form
+          // laporan baru. Hanya Asset Admin/QHSE yang bisa membuka form
+          // lewat konfirmasi eksplisit di bawah.
+          <div className="space-y-4">
+            <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2">
+              <p className="text-sm font-medium text-slate-800">{asset.assetName}</p>
+              <p className="text-xs text-slate-400">{asset.assetCode}</p>
+            </div>
+
+            <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-800">
+              <div className="flex items-start gap-2">
+                <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+                <div className="min-w-0">
+                  <p className="font-semibold text-sm">{asset.conditionLabel || "Dilaporkan Bermasalah"}</p>
+                  {asset.lastIssueSymptomLabel && <p className="text-sm mt-1">{asset.lastIssueSymptomLabel}</p>}
+                  {asset.activeIssueTicketNo && (
+                    <p className="font-mono text-xs mt-1">{asset.activeIssueTicketNo}</p>
+                  )}
+                  {asset.lastIssueNote && (
+                    <p className="text-xs mt-2 text-amber-700">Catatan: &ldquo;{asset.lastIssueNote}&rdquo;</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                {activeTicketLink && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      resetAndClose();
+                      router.push(activeTicketLink);
+                    }}
+                    className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-800 hover:bg-amber-100"
+                  >
+                    Lihat Laporan Aktif
+                  </button>
+                )}
+                {activeTicketLink && isActiveIssueReporter && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      resetAndClose();
+                      router.push(activeTicketLink);
+                    }}
+                    className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-800 hover:bg-amber-100"
+                  >
+                    Tambahkan Bukti
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {canOverride && (
+              <button
+                type="button"
+                onClick={() => setDuplicateOverrideConfirmed(true)}
+                className="text-xs font-medium text-slate-400 hover:text-slate-600 underline"
+              >
+                Laporkan sebagai masalah berbeda (khusus Asset Admin/QHSE)
+              </button>
+            )}
+          </div>
         ) : (
           <div className="space-y-4">
             <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2">
               <p className="text-sm font-medium text-slate-800">{asset.assetName}</p>
               <p className="text-xs text-slate-400">{asset.assetCode}</p>
             </div>
+
+            {duplicateOverrideConfirmed && (
+              <div className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+                Anda melaporkan ini sebagai masalah <strong>berbeda</strong> dari tiket aktif yang sudah ada. Jelaskan
+                perbedaannya di catatan kendala di bawah.
+              </div>
+            )}
 
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1.5">

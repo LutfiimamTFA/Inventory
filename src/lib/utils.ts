@@ -260,7 +260,7 @@ export function isProblemAsset(
 // untuk fallback query tiket aktif suatu aset (AssetIssueWarningCard) dan
 // untuk menentukan tiket mana yang jadi "active ticket" berikutnya kalau
 // tiket yang sedang ditutup ternyata bukan satu-satunya tiket aktif aset itu.
-const ACTIVE_ISSUE_TICKET_STATUSES = [
+export const ACTIVE_ISSUE_TICKET_STATUSES = [
   "reported",
   "laporan_masuk",
   "assigned",
@@ -278,6 +278,23 @@ const ACTIVE_ISSUE_TICKET_STATUSES = [
 
 export function isIssueTicketActive(status: string | null | undefined): boolean {
   return ACTIVE_ISSUE_TICKET_STATUSES.includes(String(status || ""));
+}
+
+// Helper terpusat — SATU-SATUNYA tempat yang menentukan "aset ini sudah
+// punya laporan kendala aktif" untuk keperluan tombol "Laporkan Kendala"
+// (mencegah laporan ganda). Dipakai oleh getAssetIssueReportContext (lib/
+// asset-issue-reporting.ts) supaya SEMUA tempat tombol ini muncul — tabel
+// Assets/Scan QR, halaman detail aset, My Borrowings, modal pengembalian —
+// otomatis ikut ter-gate tanpa perlu diubah satu-satu.
+export function hasActiveIssueTicket(
+  asset: Pick<Asset, "hasActiveIssue" | "condition" | "assetStatus" | "activeIssueTicketId">
+): boolean {
+  return (
+    asset.hasActiveIssue === true ||
+    asset.condition === "reported_issue" ||
+    asset.assetStatus === "inspection_required" ||
+    Boolean(asset.activeIssueTicketId)
+  );
 }
 
 export const BORROWING_STATUS_LABEL: Record<BorrowingStatus, string> = {
@@ -1023,6 +1040,7 @@ export const NOTIFICATION_TYPE_LABEL: Record<NotificationType, string> = {
   asset_damage_reported: "Kerusakan Dilaporkan",
   asset_issue_reported: "Kendala Aset Dilaporkan",
   asset_mismatch_reported: "Ketidaksesuaian Aset Dilaporkan",
+  location_pic_coordination: "Koordinasi PIC Lokasi",
   asset_created: "Asset Baru",
   asset_updated: "Asset Diperbarui",
   asset_status_changed: "Status Asset Berubah",

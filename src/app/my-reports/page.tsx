@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import { collection, onSnapshot, orderBy, query, where } from "firebase/firestore";
 import { ClipboardCheck, ClipboardPlus } from "lucide-react";
 import { db } from "@/lib/firebase";
@@ -19,6 +20,7 @@ import PageHeader from "@/components/PageHeader";
 import Badge from "@/components/Badge";
 import EmptyState from "@/components/EmptyState";
 import IssueTicketDetailModal from "@/components/IssueTicketDetailModal";
+import { Toast, ToastState } from "@/components/Toast";
 
 function reportTypeLabel(ticket: AssetIssueTicket) {
   return ticket.reportType ? ISSUE_REPORT_TYPE_LABEL[ticket.reportType] : "Kendala Asset";
@@ -29,10 +31,32 @@ function reportTypeColor(ticket: AssetIssueTicket) {
 }
 
 export default function MyReportsPage() {
+  return (
+    <Suspense fallback={null}>
+      <MyReportsContent />
+    </Suspense>
+  );
+}
+
+function MyReportsContent() {
   const { firebaseUser, assetUser, role, loading } = useAuth();
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
   const [detailTarget, setDetailTarget] = useState<AssetIssueTicket | null>(null);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const [toast, setToast] = useState<ToastState | null>(null);
+
+  // Section 5 — pesan sukses ditampilkan DI SINI (bukan di halaman form)
+  // supaya tetap terlihat setelah redirect dari /staff-reports/new, bukan
+  // cuma toast sekilas yang hilang begitu halaman berpindah. Query param
+  // dibersihkan dari URL supaya tidak muncul lagi kalau halaman di-refresh.
+  useEffect(() => {
+    if (searchParams.get("submitted") !== "1") return;
+    queueMicrotask(() => setToast({ type: "success", message: "Laporan berhasil dikirim." }));
+    router.replace("/my-reports");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   useEffect(() => {
     if (!authReady || !assetUser?.uid) return;
@@ -130,6 +154,8 @@ export default function MyReportsPage() {
           onClose={() => setDetailTarget(null)}
         />
       )}
+
+      <Toast toast={toast} onClose={() => setToast(null)} />
     </ProtectedLayout>
   );
 }

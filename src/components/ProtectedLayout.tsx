@@ -30,11 +30,14 @@ import { AppRole } from "@/lib/types";
 import { getDefaultRouteForRole, ROLE_LABEL } from "@/lib/roles";
 import NotificationBell from "@/components/NotificationBell";
 
+type NavGroup = "OPERASIONAL" | "PENANGANAN" | "DATA MASTER" | "LAPORAN" | "LAINNYA";
+
 interface NavItem {
   href: string;
   label: string;
   icon: React.ComponentType<{ size?: number; className?: string }>;
   roles: AppRole[];
+  group: NavGroup;
   // Section D — item tetap tampil untuk role di luar `roles` di atas kalau
   // user adalah PIC Lokasi (role "location_pic" ATAU staff/role lain yang
   // ditunjuk PIC di Master Lokasi — lihat isLocationPicRole di
@@ -43,90 +46,123 @@ interface NavItem {
   picBucketAllowed?: boolean;
 }
 
+// Section 2 — urutan grup tetap, header grup HANYA tampil kalau minimal
+// satu item di dalamnya terlihat untuk role yang sedang login (lihat
+// visibleNav/groupedNav di bawah) — supaya tidak ada judul grup kosong.
+const NAV_GROUP_ORDER: NavGroup[] = ["OPERASIONAL", "PENANGANAN", "DATA MASTER", "LAPORAN", "LAINNYA"];
+
+// Section — hak dasar karyawan (Scan QR, My Borrowings, Buat Laporan,
+// Laporan Saya) berlaku untuk SEMUA role internal yang masih aktif —
+// role khusus (it_team/asset_finance/location_pic/asset_admin/super_admin)
+// MENAMBAH akses di atas ini, tidak pernah menghapusnya. Jangan pernah
+// mempersempit array ini jadi cuma ["staff"] lagi — itulah akar bug
+// sebelumnya (role khusus tanpa sengaja menggantikan, bukan menambah, hak
+// dasar karyawan).
+const BASIC_EMPLOYEE_ROLES: AppRole[] = [
+  "staff",
+  "it_team",
+  "asset_finance",
+  "location_pic",
+  "asset_admin",
+  "super_admin",
+];
+
 const NAV_ITEMS: NavItem[] = [
   {
     href: "/dashboard",
-    label: "Dashboard",
+    label: "Dasbor",
     icon: LayoutDashboard,
-    roles: ["super_admin", "asset_admin", "asset_finance", "location_pic"],
+    group: "OPERASIONAL",
+    // Section 4 — PIC Lokasi TIDAK punya Dashboard khusus (workflow
+    // verifikasi/approval PIC dibatalkan) — menu PIC Lokasi cukup 5 item:
+    // Aset Lokasi Saya, Scan QR, My Borrowings, Buat Laporan, Laporan Saya.
+    roles: ["super_admin", "asset_admin", "asset_finance"],
   },
   {
     href: "/assets",
-    label: "Assets",
+    label: "Aset",
     icon: Package,
+    group: "OPERASIONAL",
     roles: ["super_admin", "asset_admin", "asset_finance", "location_pic"],
     picBucketAllowed: true,
   },
   {
-    href: "/categories",
-    label: "Categories",
-    icon: Tags,
-    roles: ["super_admin", "asset_admin"],
-  },
-  {
     href: "/borrowings",
-    label: "Borrowings",
+    label: "Peminjaman",
     icon: ClipboardList,
+    group: "OPERASIONAL",
     roles: ["super_admin", "asset_admin"],
   },
   {
     href: "/scan",
-    label: "Scan QR",
+    label: "Pindai QR",
     icon: QrCode,
-    roles: ["super_admin", "asset_admin", "it_team", "staff", "asset_finance", "location_pic"],
-  },
-  {
-    href: "/staff-reports/new",
-    label: "Buat Laporan",
-    icon: ClipboardPlus,
-    roles: ["staff"],
+    group: "OPERASIONAL",
+    roles: BASIC_EMPLOYEE_ROLES,
   },
   {
     href: "/my-borrowings",
-    label: "My Borrowings",
+    label: "Peminjaman Saya",
     icon: History,
-    roles: ["super_admin", "asset_admin", "it_team", "location_pic"],
+    group: "OPERASIONAL",
+    roles: BASIC_EMPLOYEE_ROLES,
   },
   {
     href: "/maintenance",
-    label: "Maintenance & Kendala",
+    label: "Pemeliharaan & Kendala",
     icon: Wrench,
+    group: "PENANGANAN",
+    // Section 3 — PIC Lokasi tidak menangani maintenance teknis sama
+    // sekali — menu ini eksklusif untuk it_team/asset_admin(QHSE)/super_admin.
     roles: ["super_admin", "asset_admin", "it_team"],
   },
   {
     href: "/workflow-board",
-    label: "Workflow Board",
+    label: "Alur Pekerjaan",
     icon: Columns3,
+    group: "PENANGANAN",
     roles: ["super_admin", "asset_admin", "it_team"],
   },
   {
+    href: "/categories",
+    label: "Kategori Aset",
+    icon: Tags,
+    group: "DATA MASTER",
+    roles: ["super_admin", "asset_admin"],
+  },
+  {
     href: "/locations",
-    label: "Master Lokasi",
+    label: "Data Lokasi",
     icon: MapPin,
-    roles: ["super_admin", "asset_admin", "location_pic"],
+    group: "DATA MASTER",
+    roles: ["super_admin", "asset_admin"],
   },
   {
     href: "/my-reports",
     label: "Laporan Saya",
     icon: ClipboardCheck,
-    roles: ["staff", "asset_finance", "location_pic"],
+    group: "LAPORAN",
+    roles: BASIC_EMPLOYEE_ROLES,
   },
   {
     href: "/reports",
-    label: "Reports",
+    label: "Rekap Laporan",
     icon: FileBarChart,
+    group: "LAPORAN",
     roles: ["super_admin", "asset_admin", "asset_finance"],
   },
   {
     href: "/access",
     label: "User Access",
     icon: Users,
+    group: "LAINNYA",
     roles: ["super_admin"],
   },
   {
     href: "/settings",
     label: "Settings",
     icon: Settings,
+    group: "LAINNYA",
     // Section D/J — Settings HANYA untuk Super Admin. Sebelumnya semua role
     // bisa lihat menu ini padahal isinya cuma pesan "akses terbatas" untuk
     // non-super-admin — membingungkan, bukan berguna.
@@ -187,6 +223,12 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
     // /notifications diakses lewat lonceng topbar, bukan lewat sidebar, tapi
     // tetap harus lolos guard untuk semua role yang sudah login.
     if (pathname.startsWith("/notifications")) return;
+    // Section 1/7/8 — "Buat Laporan" sengaja TIDAK punya menu sidebar
+    // sendiri lagi (dihapus supaya tidak duplikat dengan "Laporan Saya"),
+    // tapi rute-nya TETAP harus bisa diakses oleh semua karyawan aktif
+    // lewat tombol "Buat Laporan" di halaman /my-reports — jadi harus
+    // lolos guard ini juga, sama seperti /notifications.
+    if (pathname.startsWith("/staff-reports/new")) return;
     const allowed = NAV_ITEMS.some(
       (item) =>
         (item.roles.includes(role) || (item.picBucketAllowed && isLocationPicScoped)) &&
@@ -208,11 +250,26 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
     );
   }
 
+  const PIC_LABEL_OVERRIDE: Record<string, string> = {
+    "/assets": "Aset Lokasi Saya",
+  };
   const visibleNav = NAV_ITEMS.filter(
     (item) => item.roles.includes(role) || (item.picBucketAllowed && isLocationPicScoped)
+  ).map((item) =>
+    // Section 5 — PIC Lokasi cuma melihat aset di lokasi tanggung jawabnya
+    // (lihat isAssetInMyPicLocation di halaman /assets), jadi label menu ini
+    // disesuaikan supaya tidak terkesan menampilkan seluruh aset perusahaan.
+    isLocationPicScoped && PIC_LABEL_OVERRIDE[item.href] ? { ...item, label: PIC_LABEL_OVERRIDE[item.href] } : item
   );
   const currentNav = visibleNav.find((item) => pathname.startsWith(item.href));
   const isStaff = role === "staff";
+  // Section 2 — kelompokkan menu yang terlihat per grup, urutan grup tetap
+  // (NAV_GROUP_ORDER), header grup dilewati kalau tidak ada item di
+  // dalamnya untuk role ini (jangan tampilkan judul grup kosong).
+  const groupedNav = NAV_GROUP_ORDER.map((group) => ({
+    group,
+    items: visibleNav.filter((item) => item.group === group),
+  })).filter((g) => g.items.length > 0);
 
   function renderSidebar(isCollapsed: boolean) {
     return (
@@ -237,42 +294,46 @@ export default function ProtectedLayout({ children }: { children: ReactNode }) {
           )}
         </div>
 
-        <nav className="flex-1 overflow-y-auto py-3 px-3 space-y-1">
-          {!isCollapsed && (
-            <p className="px-3 text-[10px] font-semibold tracking-wider text-slate-400 uppercase mb-2">
-              Menu Utama
-            </p>
-          )}
-          {visibleNav.map((item) => {
-            const active = pathname.startsWith(item.href);
-            const Icon = item.icon;
-            return (
-              <Link
-                key={item.href}
-                href={item.href}
-                onClick={() => setMobileOpen(false)}
-                title={isCollapsed ? item.label : undefined}
-                className={`group flex items-center rounded-xl py-2.5 text-sm font-medium transition-all cursor-pointer ${
-                  isCollapsed ? "justify-center px-0" : "gap-3 px-3"
-                } ${
-                  active
-                    ? "bg-gradient-to-r from-blue-50 to-teal-50 text-blue-700 shadow-sm"
-                    : "text-slate-700 hover:bg-slate-100 active:bg-slate-200"
-                }`}
-              >
-                <Icon
-                  size={18}
-                  className={`shrink-0 ${active ? "text-blue-600" : "text-slate-500 group-hover:text-slate-700"}`}
-                />
-                {!isCollapsed && (
-                  <>
-                    <span className="flex-1 truncate">{item.label}</span>
-                    {active && <ChevronRight size={15} className="text-blue-600 shrink-0" />}
-                  </>
-                )}
-              </Link>
-            );
-          })}
+        <nav className="flex-1 overflow-y-auto py-3 px-3 space-y-4">
+          {groupedNav.map(({ group, items }) => (
+            <div key={group} className="space-y-1">
+              {!isCollapsed && (
+                <p className="px-3 text-[10px] font-semibold tracking-wider text-slate-400 uppercase mb-2">
+                  {group}
+                </p>
+              )}
+              {items.map((item) => {
+                const active = pathname.startsWith(item.href);
+                const Icon = item.icon;
+                return (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    onClick={() => setMobileOpen(false)}
+                    title={isCollapsed ? item.label : undefined}
+                    className={`group flex items-center rounded-xl py-2.5 text-sm font-medium transition-all cursor-pointer ${
+                      isCollapsed ? "justify-center px-0" : "gap-3 px-3"
+                    } ${
+                      active
+                        ? "bg-gradient-to-r from-blue-50 to-teal-50 text-blue-700 shadow-sm"
+                        : "text-slate-700 hover:bg-slate-100 active:bg-slate-200"
+                    }`}
+                  >
+                    <Icon
+                      size={18}
+                      className={`shrink-0 ${active ? "text-blue-600" : "text-slate-500 group-hover:text-slate-700"}`}
+                    />
+                    {!isCollapsed && (
+                      <>
+                        <span className="flex-1 truncate">{item.label}</span>
+                        {active && <ChevronRight size={15} className="text-blue-600 shrink-0" />}
+                      </>
+                    )}
+                  </Link>
+                );
+              })}
+            </div>
+          ))}
         </nav>
 
         <div className="border-t border-slate-200 p-3">

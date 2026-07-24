@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -137,19 +137,19 @@ const INCOMING_SUB_FILTERS: { key: IncomingSubFilterKey; label: string; statuses
   { key: "all_active", label: "Semua Aktif", statuses: ACTIVE_ISSUE_STATUSES },
   { key: "reported", label: "Laporan Masuk", statuses: ["reported"] },
   { key: "under_review", label: "Ditinjau QHSE", statuses: ["under_review"] },
-  { key: "need_more_info", label: "Butuh Info", statuses: ["need_more_info"] },
+  { key: "need_more_info", label: "Butuh Informasi", statuses: ["need_more_info"] },
   { key: "assigned", label: "Menunggu Tim", statuses: ["assigned"] },
   { key: "in_progress", label: "Sedang Ditangani", statuses: ["in_progress"] },
   { key: "external_coordination", label: "Koordinasi Eksternal", statuses: ["external_coordination"] },
   { key: "waiting_confirmation", label: "Menunggu Konfirmasi", statuses: ["waiting_reporter_confirmation", "reporter_confirmed"] },
-  { key: "needs_follow_up", label: "Butuh Tindakan Lanjutan", statuses: ["needs_follow_up"] },
+  { key: "needs_follow_up", label: "Perlu Tindak Lanjut", statuses: ["needs_follow_up"] },
 ];
 
 const TABS: { key: TabKey; label: string; roles: AppRole[] }[] = [
-  { key: "incoming", label: "Laporan Kendala Staff", roles: ["super_admin", "asset_admin"] },
-  { key: "schedule", label: "Maintenance Rutin", roles: ["asset_admin", "super_admin", "it_team"] },
+  { key: "incoming", label: "Laporan Kendala", roles: ["super_admin", "asset_admin"] },
+  { key: "schedule", label: "Pemeliharaan Rutin", roles: ["asset_admin", "super_admin", "it_team"] },
   { key: "technician", label: "Antrian Tim IT", roles: ["super_admin", "it_team"] },
-  { key: "follow_up", label: "Butuh Tindakan Lanjutan", roles: ["super_admin", "asset_admin", "it_team"] },
+  { key: "follow_up", label: "Perlu Tindak Lanjut", roles: ["super_admin", "asset_admin", "it_team"] },
   { key: "my_tasks", label: "Tugas Kendala Saya", roles: ["super_admin", "it_team"] },
   { key: "history", label: "Riwayat", roles: ["super_admin", "asset_admin", "it_team"] },
 ];
@@ -554,6 +554,10 @@ function MaintenancePageContent() {
   const [assetActivityLogs, setAssetActivityLogs] = useState<HistoryLogRecord[]>([]);
   const [issueTicketLogs, setIssueTicketLogs] = useState<HistoryLogRecord[]>([]);
   const [activeTab, setActiveTab] = useState<TabKey>("incoming");
+  // Section 4/5 — ringkasan compact by default (4 card utama) supaya tabel
+  // laporan langsung terlihat tanpa scroll jauh; ringkasan lengkap (jadwal
+  // rutin + card korektif lain) disembunyikan di panel yang bisa dibuka.
+  const [showFullSummary, setShowFullSummary] = useState(false);
   const [incomingSubFilter, setIncomingSubFilter] = useState<IncomingSubFilterKey>("all_active");
   const [detailTarget, setDetailTarget] = useState<AssetIssueTicket | null>(null);
   const [woDetailTarget, setWoDetailTarget] = useState<MaintenanceWorkOrder | null>(null);
@@ -575,6 +579,9 @@ function MaintenancePageContent() {
   const tabParam = searchParams.get("tab");
   const ticketIdParam = searchParams.get("ticketId");
   const workOrderIdParam = searchParams.get("workOrderId");
+  // Section 6 — PIC Lokasi TIDAK punya akses halaman ini sama sekali (lihat
+  // /location-confirmations untuk ruang kerja PIC Lokasi) — menu &
+  // route guard di ProtectedLayout sudah mengecualikan role ini.
   const canViewMaintenancePage =
     authReady && (role === "super_admin" || role === "asset_admin" || role === "it_team");
   const currentAssetUser = assetUser;
@@ -1380,6 +1387,38 @@ function MaintenancePageContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canViewMaintenancePage, overdueWorkOrders.map((w) => w.id).join(",")]);
 
+  // Section 4 — 4 card utama yang SELALU terlihat (tidak perlu buka
+  // "Ringkasan Lengkap"): representasi paling penting dari kondisi laporan
+  // kendala saat ini. "Laporan Aktif" = seluruh laporan staff yang belum
+  // selesai (staffReports sudah dihitung dari status aktif, lihat
+  // getMaintenanceSummaryCounts di lib/reports.ts).
+  const mainSummary = [
+    {
+      label: "Laporan Aktif",
+      value: summaryCounts.corrective.staffReports,
+      icon: Inbox,
+      color: "bg-blue-50 text-blue-600",
+    },
+    {
+      label: "Menunggu Peninjauan QHSE",
+      value: summaryCounts.corrective.waitingReview,
+      icon: Wrench,
+      color: "bg-purple-50 text-purple-600",
+    },
+    {
+      label: "Sedang Ditangani",
+      value: summaryCounts.corrective.inProgress,
+      icon: Wrench,
+      color: "bg-indigo-50 text-indigo-600",
+    },
+    {
+      label: "Perlu Tindak Lanjut",
+      value: summaryCounts.corrective.followUpCount,
+      icon: AlertOctagon,
+      color: "bg-red-50 text-red-600",
+    },
+  ];
+
   // Dua kelompok kartu terpisah — jadwal rutin TIDAK BOLEH ikut dihitung di
   // kartu manapun milik Laporan Kendala/Korektif (khususnya "Dalam Antrian"
   // versi lama, sekarang dihapus total).
@@ -1450,7 +1489,7 @@ function MaintenancePageContent() {
       color: "bg-indigo-50 text-indigo-600",
     },
     {
-      label: "Butuh Tindakan Lanjutan",
+      label: "Perlu Tindak Lanjut",
       value: summaryCounts.corrective.followUpCount,
       icon: AlertOctagon,
       color: "bg-red-50 text-red-600",
@@ -1483,11 +1522,15 @@ function MaintenancePageContent() {
         }
       />
 
-      <div className="mb-2">
-        <p className="text-xs font-semibold text-slate-500 mb-2">Maintenance Rutin</p>
-        <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-          {routineSummary.map((s) => (
-            <div key={s.label} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+      {/* Section 3/4/5 — ringkasan RINGKAS: maksimal 4 card utama supaya
+          tinggi area ini tetap ~180-220px dan tabel laporan langsung
+          terlihat di layar pertama. Sisanya (jadwal rutin + card korektif
+          lain) dipindah ke panel "Lihat Ringkasan Lengkap" yang bisa
+          dibuka-tutup, bukan dihapus. */}
+      <div className="mb-3">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {mainSummary.map((s) => (
+            <div key={s.label} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-3.5">
               <div className={`h-8 w-8 rounded-lg flex items-center justify-center mb-2 ${s.color}`}>
                 <s.icon size={16} />
               </div>
@@ -1496,27 +1539,54 @@ function MaintenancePageContent() {
             </div>
           ))}
         </div>
-      </div>
 
-      <div className="mb-6">
-        <p className="text-xs font-semibold text-slate-500 mb-2">Laporan Kendala / Korektif</p>
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-          {correctiveSummary.map((s) => (
-            <div key={s.label} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
-              <div className={`h-8 w-8 rounded-lg flex items-center justify-center mb-2 ${s.color}`}>
-                <s.icon size={16} />
+        <button
+          type="button"
+          onClick={() => setShowFullSummary((prev) => !prev)}
+          className="mt-2 flex items-center gap-1 text-xs font-medium text-blue-600 hover:underline cursor-pointer"
+        >
+          <ChevronDown size={14} className={`transition-transform ${showFullSummary ? "rotate-180" : ""}`} />
+          {showFullSummary ? "Sembunyikan Ringkasan Lengkap" : "Lihat Ringkasan Lengkap"}
+        </button>
+
+        {showFullSummary && (
+          <div className="mt-3 space-y-3">
+            <div>
+              <p className="text-xs font-semibold text-slate-500 mb-2">Maintenance Rutin</p>
+              <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
+                {routineSummary.map((s) => (
+                  <div key={s.label} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                    <div className={`h-8 w-8 rounded-lg flex items-center justify-center mb-2 ${s.color}`}>
+                      <s.icon size={16} />
+                    </div>
+                    <p className="text-xl font-semibold text-slate-900">{s.value}</p>
+                    <p className="text-xs text-slate-500">{s.label}</p>
+                  </div>
+                ))}
               </div>
-              <p className="text-xl font-semibold text-slate-900">{s.value}</p>
-              <p className="text-xs text-slate-500">{s.label}</p>
             </div>
-          ))}
-        </div>
+            <div>
+              <p className="text-xs font-semibold text-slate-500 mb-2">Laporan Kendala / Korektif</p>
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                {correctiveSummary.map((s) => (
+                  <div key={s.label} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                    <div className={`h-8 w-8 rounded-lg flex items-center justify-center mb-2 ${s.color}`}>
+                      <s.icon size={16} />
+                    </div>
+                    <p className="text-xl font-semibold text-slate-900">{s.value}</p>
+                    <p className="text-xs text-slate-500">{s.label}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Section A — tab utama dikembalikan (Laporan Kendala Staff,
           Maintenance Rutin, Tugas Saya, Butuh Tindakan Lanjutan, Riwayat,
           + Antrian Tim IT) — TIDAK diganti oleh Kanban. */}
-      <div className="flex items-center gap-1 mb-4 border-b border-slate-200 overflow-x-auto">
+      <div className="flex items-center gap-1 mb-3 border-b border-slate-200 overflow-x-auto">
         {visibleTabs.map((t) => {
           const badgeCount = tabBadgeCount[t.key];
           return (
@@ -1524,7 +1594,7 @@ function MaintenancePageContent() {
               key={t.key}
               type="button"
               onClick={() => handleTabClick(t.key)}
-              className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium whitespace-nowrap cursor-pointer border-b-2 -mb-px transition-colors ${
+              className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium whitespace-nowrap cursor-pointer border-b-2 -mb-px transition-colors ${
                 activeTab === t.key
                   ? "border-blue-600 text-blue-700"
                   : "border-transparent text-slate-500 hover:text-slate-700"
@@ -1912,13 +1982,16 @@ function MaintenancePageContent() {
           ) : (
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
               {activeTab === "incoming" && (
-                <div className="flex flex-wrap gap-2 border-b border-slate-100 px-4 py-3">
+                // Section 7 — filter status TEPAT di atas tabel, scroll
+                // horizontal di layar kecil supaya semua pilihan tetap bisa
+                // dijangkau tanpa memecah baris.
+                <div className="flex gap-2 overflow-x-auto border-b border-slate-100 px-4 py-3">
                   {INCOMING_SUB_FILTERS.map((f) => (
                     <button
                       key={f.key}
                       type="button"
                       onClick={() => setIncomingSubFilter(f.key)}
-                      className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+                      className={`shrink-0 whitespace-nowrap rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
                         incomingSubFilter === f.key
                           ? "border-slate-800 bg-slate-800 text-white"
                           : "border-slate-200 text-slate-600 hover:bg-slate-50"
@@ -1935,10 +2008,13 @@ function MaintenancePageContent() {
               title="Belum ada ticket pada tab ini"
             />
           ) : (
-            <div className="overflow-x-auto">
+            // Section 8/9 — tinggi tabel menyesuaikan viewport (desktop),
+            // scroll terjadi DI DALAM area tabel, header tetap sticky supaya
+            // kolom tetap terlihat saat scroll.
+            <div className="overflow-auto md:max-h-[calc(100vh-360px)]">
               <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50/60">
+                <thead className="sticky top-0 z-10">
+                  <tr className="text-left text-slate-500 border-b border-slate-200 bg-slate-50">
                     <th className="px-4 py-3 font-semibold">Nomor Laporan</th>
                     <th className="px-4 py-3 font-semibold">Judul</th>
                     <th className="px-4 py-3 font-semibold">Jenis Laporan</th>
@@ -1974,6 +2050,14 @@ function MaintenancePageContent() {
                       <td className="px-4 py-3 text-slate-600">
                         <p>{t.locationText || t.assetLocation || "-"}</p>
                         <p className="text-xs text-slate-400">{t.detailArea || "-"}</p>
+                        {/* Section 5/8 — PIC Lokasi di sini HANYA info kontak
+                            (bukan penanggung jawab teknis di kolom lain),
+                            tanpa status/aksi konfirmasi apa pun. */}
+                        {t.locationPicName && (
+                          <p className="mt-1 text-[11px] text-slate-400">
+                            PIC Lokasi: <span className="font-medium text-slate-600">{t.locationPicName}</span>
+                          </p>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-slate-600">{t.reportedByName}</td>
                       <td className="px-4 py-3">
@@ -2063,14 +2147,14 @@ function MaintenancePageContent() {
 
 // Badge status tabel — kalau overdue/jatuh tempo hari ini, tampilkan badge
 // derived (merah/kuning) tapi tetap sertakan status asli kecil di sebelahnya
-// supaya tidak ambigu, mis. "Terlambat · Dibuat oleh QHSE".
+// supaya tidak ambigu, mis. "Terlambat Â· Dibuat oleh QHSE".
 function WorkOrderStatusBadge({ workOrder }: { workOrder: MaintenanceWorkOrder }) {
   const display = getDisplayStatus(workOrder);
   return (
     <div className="flex items-center gap-1.5 flex-wrap">
       <Badge label={display.label} colorClass={display.colorClass} />
       {(display.overdue || display.dueToday) && display.subLabel && (
-        <span className="text-xs text-slate-400">· {display.subLabel}</span>
+        <span className="text-xs text-slate-400">Â· {display.subLabel}</span>
       )}
     </div>
   );

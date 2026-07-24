@@ -27,6 +27,7 @@ import {
 } from "@/lib/firestore-helpers";
 import { uploadToDrive } from "@/lib/drive-upload";
 import { createAssetNotification } from "@/lib/notifications";
+import { fetchLocationPicSnapshot } from "@/lib/locations";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
 import Badge from "@/components/Badge";
@@ -269,6 +270,21 @@ export default function NewStaffReportPage() {
       queueNumber = `Q-${fallbackSuffix}`;
     }
 
+    // Section 1 — PIC LOKASI (penanggung jawab AREA) diambil dari master
+    // asset_locations/{locationId}, BUKAN dari asset.picUid/operationalPicUid/
+    // currentHolderUid/currentBorrowerUid/borrowedByUid — lihat
+    // lib/locations.ts fetchLocationPicSnapshot. Berlaku juga untuk laporan
+    // umum tanpa aset (locationId dari LocationCascadeFields).
+    const locationPicSnapshot = await fetchLocationPicSnapshot(selectedLocationId).catch((err) => {
+      console.warn("[NewStaffReportPage] gagal mengambil PIC lokasi (non-fatal)", { selectedLocationId, err });
+      return {
+        locationId: selectedLocationId,
+        locationExists: false,
+        locationPicUid: null,
+        locationPicName: null,
+        locationPicEmail: null,
+      };
+    });
     const ticketPayload = cleanFirestoreData({
       ticketNumber,
       queueNumber,
@@ -306,6 +322,11 @@ export default function NewStaffReportPage() {
       statusLabel: "Laporan Masuk",
       staffStatusLabel: ISSUE_STATUS_STAFF_LABEL.reported,
       ...issueSourceFields,
+      // Section 8 — locationPicUid/Name/Email disimpan HANYA untuk info dan
+      // notifikasi — TIDAK ADA field approval/verifikasi PIC Lokasi apa pun.
+      locationPicUid: locationPicSnapshot.locationPicUid,
+      locationPicName: locationPicSnapshot.locationPicName,
+      locationPicEmail: locationPicSnapshot.locationPicEmail,
       assignedTeam: null,
       assignedToUid: null,
       assignedToName: null,
@@ -431,9 +452,39 @@ export default function NewStaffReportPage() {
       console.warn("[NewStaffReportPage] gagal membuat notifikasi QHSE, laporan tetap berhasil", notificationError);
     }
 
+    // Section 6/8 — notifikasi PIC Lokasi bersifat INFORMASI SAJA (tanpa
+    // tombol konfirmasi, tidak menghambat workflow QHSE) — TERPISAH dari
+    // notifikasi QHSE di atas. Tidak dikirim kalau pelapor adalah PIC
+    // Lokasi itu sendiri.
+    if (locationPicSnapshot.locationPicUid && locationPicSnapshot.locationPicUid !== reporterUid) {
+      try {
+        await createAssetNotification({
+          recipientUid: locationPicSnapshot.locationPicUid,
+          recipientName: locationPicSnapshot.locationPicName || locationPicSnapshot.locationPicEmail || "",
+          recipientRole: "location_pic",
+          title: "Laporan baru terdapat di lokasi tanggung jawab Anda.",
+          message: `Laporan ${ticketNumber} (${title.trim()}) ${
+            reportAsset ? `pada ${reportAsset.assetName} ` : ""
+          }di ${selectedLocationText}, dilaporkan oleh ${reporterName}. Status: Laporan Masuk.`,
+          type: "location_pic_coordination",
+          priority,
+          linkUrl: reportAsset ? `/assets/${reportAsset.id}` : "/assets",
+          relatedType: "ticket",
+          relatedId: ticketRef.id,
+          relatedNumber: ticketNumber,
+          createdByUid: reporterUid,
+          createdByName: reporterName,
+        });
+      } catch (err) {
+        console.warn("[NewStaffReportPage] gagal kirim notifikasi PIC Lokasi (non-fatal)", ticketRef.id, err);
+      }
+    }
+
     setSubmitting(false);
-    setToast({ type: "success", message: `Laporan ${ticketNumber} berhasil dikirim.` });
-    window.setTimeout(() => router.push("/my-reports"), 650);
+    // Section 5 — pesan sukses ditampilkan di /my-reports (bukan di sini)
+    // supaya tetap terlihat setelah redirect, bukan cuma toast sekilas yang
+    // hilang begitu halaman berpindah.
+    router.push("/my-reports?submitted=1");
   };
 
   return (

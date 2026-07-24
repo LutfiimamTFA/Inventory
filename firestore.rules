@@ -612,6 +612,10 @@ service cloud.firestore {
     // Tim IT. Staff hanya boleh membuat tiket miliknya sendiri
     // dan membaca semua tiket (dibatasi query "reportedByUid == uid" di client
     // untuk /my-reports); status/diagnosa hanya boleh diubah oleh manager.
+    // Section 8 — PIC Lokasi TIDAK punya jalur update/read khusus di sini
+    // sama sekali (workflow verifikasi/approval PIC Lokasi dibatalkan) —
+    // locationPicUid/Name/Email hanya field informasi/notifikasi, diisi saat
+    // create, tidak pernah diubah lewat rules ini.
     match /asset_issue_tickets/{ticketId} {
       // READ dibuka untuk siapa saja yang login (isSignedIn()), TERMASUK
       // staff HRP fallback yang belum punya dokumen asset_users sama sekali

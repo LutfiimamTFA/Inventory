@@ -503,8 +503,14 @@ function AssetActionContent() {
             assetName={asset.assetName}
             loaded={photoLoaded}
             failed={photoFailed}
-            onLoad={() => setPhotoLoaded(true)}
-            onError={() => setPhotoFailed(true)}
+            onLoad={() => {
+              console.log("[Asset Photo] berhasil dimuat", { assetId: asset.id, previewUrl: photo.src });
+              setPhotoLoaded(true);
+            }}
+            onError={() => {
+              console.error("[Asset Photo] gagal dimuat dari proxy", { assetId: asset.id, previewUrl: photo.src });
+              setPhotoFailed(true);
+            }}
             onPreview={() => photo.src && !photoFailed && setPhotoPreviewOpen(true)}
             canManage={canSeeAnomalies}
             onCompletePhoto={() => router.push(`/assets/${asset.id}/edit`)}
@@ -894,7 +900,12 @@ function AssetPhotoBlock({
         ) : (
           <div className="flex h-full w-full flex-col items-center justify-center gap-1.5 px-4 text-center">
             <ImageIcon size={28} className="text-slate-300" />
-            <p className="text-xs text-slate-400">Foto verifikasi aset belum tersedia.</p>
+            {/* Section 8 — BEDAKAN "belum pernah diunggah" (photo.src kosong)
+                dari "gagal dimuat" (src ada tapi <img> error, mis. proxy
+                Drive gagal) — jangan disamakan supaya tidak menyesatkan. */}
+            <p className="text-xs text-slate-400">
+              {photo.src && failed ? "Foto aset gagal dimuat." : "Foto verifikasi aset belum tersedia."}
+            </p>
           </div>
         )}
       </div>

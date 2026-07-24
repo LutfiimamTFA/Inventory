@@ -1,5 +1,6 @@
 import { Asset, AssetBorrowing, AssetUser, IssueSymptomType } from "@/lib/types";
 import { isActiveBorrowing } from "@/lib/assets/asset-status";
+import { hasActiveIssueTicket } from "@/lib/utils";
 
 type BorrowingLike =
   | AssetBorrowing
@@ -129,20 +130,41 @@ function blockedContext(reason: string): AssetIssueReportContext {
   };
 }
 
+// Role yang boleh membuat laporan KEDUA pada aset yang sudah punya laporan
+// aktif — HANYA lewat konfirmasi eksplisit bahwa masalahnya berbeda
+// (allowDuplicateOverride), tidak pernah otomatis/diam-diam.
+export function canOverrideActiveIssueTicket(role?: string | null): boolean {
+  return role === "super_admin" || role === "asset_admin";
+}
+
 export function getAssetIssueReportContext({
   user,
   asset,
   activeBorrowing,
   allowQrPhysicalObservation = false,
   sourceQrScanLogId = null,
+  allowDuplicateOverride = false,
 }: {
   user: ReportUser;
   asset: Asset;
   activeBorrowing?: BorrowingLike;
   allowQrPhysicalObservation?: boolean;
   sourceQrScanLogId?: string | null;
+  // Section — hanya diisi true kalau Asset Admin/QHSE sudah mengonfirmasi
+  // eksplisit lewat modal (lihat ReportIssueModal) bahwa laporan ini
+  // memang masalah BERBEDA dari tiket aktif yang sudah ada.
+  allowDuplicateOverride?: boolean;
 }): AssetIssueReportContext {
   if (!user?.uid) return blockedContext("Sesi login tidak ditemukan.");
+
+  // Section — cegah laporan ganda: kalau aset sudah punya tiket kendala
+  // aktif, "Laporkan Kendala" tidak pernah ditawarkan (di SEMUA tempat yang
+  // memanggil fungsi ini — tabel Assets/Scan QR, detail aset, My
+  // Borrowings, modal pengembalian) kecuali Asset Admin/QHSE sudah
+  // mengonfirmasi eksplisit bahwa ini masalah berbeda.
+  if (hasActiveIssueTicket(asset) && !(allowDuplicateOverride && canOverrideActiveIssueTicket(user.role))) {
+    return blockedContext("Aset ini sudah memiliki laporan kendala aktif.");
+  }
 
   if (user.role === "super_admin") {
     return {
@@ -230,6 +252,14 @@ export function canReportAssetIssue(
   activeBorrowing?: BorrowingLike
 ): boolean {
   return getAssetIssueReportContext({ user, asset, activeBorrowing }).canReport;
+}
+
+// Section — dipakai UI (tombol "Laporkan Kendala") untuk membedakan "tidak
+// berhak melapor" dari "sudah ada laporan aktif" supaya pesan/aksi yang
+// ditampilkan tepat (Lihat Laporan Aktif / Tambahkan Bukti), bukan cuma
+// tombol yang hilang tanpa penjelasan.
+export function getAssetActiveIssueBlockReason(asset: Asset): string | null {
+  return hasActiveIssueTicket(asset) ? "Aset ini sudah memiliki laporan kendala aktif." : null;
 }
 
 export function getAssetIssueSourceFields({

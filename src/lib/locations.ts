@@ -1,3 +1,5 @@
+import { doc, getDoc } from "firebase/firestore";
+import { db } from "@/lib/firebase";
 import { Asset, AssetLocationNode, LocationType } from "@/lib/types";
 import type { LocationSelection } from "@/components/LocationCascadeFields";
 
@@ -146,6 +148,52 @@ export function countAssetsAtLocation(
         return a.areaId === node.id;
     }
   }).length;
+}
+
+// Section 1 — PIC LOKASI (penanggung jawab AREA dari master asset_locations)
+// TIDAK SAMA dengan PIC barang/operasional aset (areaPicUid di dokumen
+// assets, resolveAreaPic di atas) — dua konsep beda yang kebetulan mirip
+// nama. Untuk koordinasi laporan kendala, PIC Lokasi WAJIB diambil langsung
+// dari dokumen asset_locations/{locationId} (locationId ticket, fallback
+// locationId asset), BUKAN dari asset.picUid/operationalPicUid/
+// currentHolderUid/currentBorrowerUid/borrowedByUid. Dukung dua kemungkinan
+// nama field master lokasi (picUid/picName/picEmail ATAU
+// locationPicUid/locationPicName/locationPicEmail) supaya tetap kompatibel
+// kalau skema penamaan berbeda dari yang sudah ada di AssetLocationNode.
+export interface LocationPicSnapshot {
+  locationId: string | null;
+  locationExists: boolean;
+  locationPicUid: string | null;
+  locationPicName: string | null;
+  locationPicEmail: string | null;
+}
+
+export async function fetchLocationPicSnapshot(
+  locationId: string | null | undefined
+): Promise<LocationPicSnapshot> {
+  if (!locationId) {
+    return { locationId: null, locationExists: false, locationPicUid: null, locationPicName: null, locationPicEmail: null };
+  }
+  try {
+    const snap = await getDoc(doc(db, "asset_locations", locationId));
+    if (!snap.exists()) {
+      return { locationId, locationExists: false, locationPicUid: null, locationPicName: null, locationPicEmail: null };
+    }
+    const data = snap.data() as Record<string, unknown>;
+    const uid = (data.picUid as string) || (data.locationPicUid as string) || null;
+    const name = (data.picName as string) || (data.locationPicName as string) || null;
+    const email = (data.picEmail as string) || (data.locationPicEmail as string) || null;
+    return {
+      locationId,
+      locationExists: true,
+      locationPicUid: uid || null,
+      locationPicName: name || null,
+      locationPicEmail: email || null,
+    };
+  } catch (error) {
+    console.warn("[Location PIC] gagal mengambil PIC lokasi dari asset_locations", { locationId, error });
+    return { locationId, locationExists: false, locationPicUid: null, locationPicName: null, locationPicEmail: null };
+  }
 }
 
 // Section B — PIC Lokasi harus melihat asset berdasarkan LOKASI, bukan

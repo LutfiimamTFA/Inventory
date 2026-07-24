@@ -22,7 +22,7 @@ export const DEFAULT_ROUTE_BY_ROLE: Record<AppRole, string> = {
   super_admin: "/dashboard",
   asset_admin: "/dashboard",
   asset_finance: "/assets",
-  location_pic: "/dashboard",
+  location_pic: "/assets",
   it_team: "/maintenance",
   staff: "/scan",
 };

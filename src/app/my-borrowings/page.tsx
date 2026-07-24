@@ -10,6 +10,7 @@ import { Asset, AssetBorrowing } from "@/lib/types";
 import {
   formatDateTimeLong,
   formatExpectedReturn,
+  hasActiveIssueTicket,
   isBorrowingLate,
   toDisplayDate,
 } from "@/lib/utils";
@@ -299,6 +300,7 @@ export default function MyBorrowingsPage() {
                 key={asset.id}
                 asset={asset}
                 borrowing={activeBorrowingByAssetId.get(asset.id)}
+                isManager={role === "super_admin" || role === "asset_admin"}
                 onReturn={() => setReturnTarget(asset)}
                 onReport={() => setReportTarget(asset)}
               />
@@ -349,11 +351,13 @@ export default function MyBorrowingsPage() {
 function ActiveBorrowCard({
   asset,
   borrowing,
+  isManager,
   onReturn,
   onReport,
 }: {
   asset: Asset;
   borrowing?: AssetBorrowing;
+  isManager: boolean;
   onReturn: () => void;
   onReport: () => void;
 }) {
@@ -362,6 +366,15 @@ function ActiveBorrowCard({
   const borrowedAt = borrowing?.borrowedAt || asset.currentUsageStartedAt;
   const expectedReturnAt = borrowing?.estimatedReturnAt || asset.currentUsageExpectedReturnAt;
   const late = isBorrowingLate({ currentUsageExpectedReturnAt: expectedReturnAt });
+  // Section — cegah laporan ganda: aset yang sudah punya tiket kendala
+  // aktif tidak lagi menawarkan "Laporkan Kendala", cukup arahkan ke
+  // laporan yang sudah ada.
+  const hasIssue = hasActiveIssueTicket(asset);
+  const activeTicketLink = asset.activeIssueTicketId
+    ? isManager
+      ? `/maintenance?tab=staff-reports&ticketId=${asset.activeIssueTicketId}`
+      : `/my-reports?ticketId=${asset.activeIssueTicketId}`
+    : null;
 
   return (
     <div className="rounded-2xl border border-slate-200 p-4">
@@ -404,6 +417,17 @@ function ActiveBorrowCard({
         </p>
       )}
 
+      {hasIssue && (
+        <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-amber-800">
+          <p className="font-semibold text-xs">{asset.conditionLabel || "Dilaporkan Bermasalah"}</p>
+          {asset.lastIssueSymptomLabel && <p className="text-xs mt-0.5">{asset.lastIssueSymptomLabel}</p>}
+          {asset.activeIssueTicketNo && <p className="font-mono text-[11px] mt-0.5">{asset.activeIssueTicketNo}</p>}
+          {asset.lastIssueNote && (
+            <p className="text-[11px] mt-1 text-amber-700">Catatan: &ldquo;{asset.lastIssueNote}&rdquo;</p>
+          )}
+        </div>
+      )}
+
       <div className="mt-3 flex flex-wrap gap-2">
         <button
           type="button"
@@ -420,14 +444,25 @@ function ActiveBorrowCard({
           <Eye size={13} />
           Lihat Detail
         </Link>
-        <button
-          type="button"
-          onClick={onReport}
-          className="inline-flex items-center gap-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700 hover:bg-amber-100"
-        >
-          <AlertTriangle size={13} />
-          Laporkan Kendala
-        </button>
+        {!hasIssue && (
+          <button
+            type="button"
+            onClick={onReport}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700 hover:bg-amber-100"
+          >
+            <AlertTriangle size={13} />
+            Laporkan Kendala
+          </button>
+        )}
+        {hasIssue && activeTicketLink && (
+          <Link
+            href={activeTicketLink}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700 hover:bg-amber-100"
+          >
+            <AlertTriangle size={13} />
+            Lihat Laporan Aktif
+          </Link>
+        )}
       </div>
     </div>
   );

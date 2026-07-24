@@ -1021,6 +1021,11 @@ export default function IssueTicketDetailModal({
                     label="Asset Terkait"
                     value={ticket.assetName ? `${ticket.assetName} (${ticket.assetCode || "-"})` : "Tidak terkait asset tertentu"}
                   />
+                  {/* Section 5/8 — PIC Lokasi (penanggung jawab AREA, snapshot
+                      dari master asset_locations) di sini HANYA informasi
+                      kontak, tidak ada status/aksi konfirmasi apa pun — PIC
+                      Lokasi tidak berpartisipasi dalam alur laporan ini. */}
+                  {ticket.locationPicName && <Info label="PIC Lokasi" value={ticket.locationPicName} />}
                 </div>
               </Card>
 
