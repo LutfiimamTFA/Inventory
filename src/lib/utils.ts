@@ -932,6 +932,18 @@ export function getAssetActionUrl(assetCode: string): string {
   return `${getAppBaseUrl()}/asset-action?code=${encodeURIComponent(assetCode)}`;
 }
 
+// Helper terpusat — SATU-SATUNYA tempat yang menentukan payload QR & tujuan
+// scan untuk sebuah asset. Semua tempat yang merender/mencetak/mendownload
+// QR (tabel Assets, modal QR, halaman Detail Asset, Bulk QR Label) WAJIB
+// memakai fungsi ini supaya isi QR dan URL tujuan setelah scan selalu sama,
+// stabil untuk asset yang sama (tidak acak tiap render), dan tetap
+// kompatibel dengan QR lama yang cuma berisi assetCode polos (lihat
+// extractAssetCodeFromQr + fallback lookup di /scan dan /asset-action).
+export function getAssetQrTarget(asset: { assetCode?: string; qrCodeValue?: string; id: string }): string {
+  const code = asset.assetCode || asset.qrCodeValue || asset.id;
+  return getAssetActionUrl(code);
+}
+
 // Section D — info kecil di modal cetak QR supaya admin tahu label yang
 // akan dicetak itu memang bisa dibuka kamera HP atau cuma untuk testing.
 export function getQrDomainNotice(baseUrl: string): { tone: "warning" | "info" | "success"; message: string } {
@@ -1009,6 +1021,8 @@ export const NOTIFICATION_TYPE_LABEL: Record<NotificationType, string> = {
   asset_borrowed: "Asset Dipinjam",
   asset_returned: "Asset Dikembalikan",
   asset_damage_reported: "Kerusakan Dilaporkan",
+  asset_issue_reported: "Kendala Aset Dilaporkan",
+  asset_mismatch_reported: "Ketidaksesuaian Aset Dilaporkan",
   asset_created: "Asset Baru",
   asset_updated: "Asset Diperbarui",
   asset_status_changed: "Status Asset Berubah",

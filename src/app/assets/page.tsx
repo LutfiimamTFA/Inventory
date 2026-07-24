@@ -817,25 +817,25 @@ export default function AssetsPage() {
                             <Pencil size={15} />
                           </Link>
                         )}
+                        {(canManage || isLocationPicScoped) && (
+                          <button
+                            type="button"
+                            onClick={() => setQrLabelTarget(a)}
+                            title="Lihat/Unduh QR"
+                            className="p-1.5 rounded-lg cursor-pointer transition-colors hover:bg-slate-100 text-slate-500"
+                          >
+                            <QrCode size={15} />
+                          </button>
+                        )}
                         {canManage && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => setQrLabelTarget(a)}
-                              title="QR Label / Cetak Stiker"
-                              className="p-1.5 rounded-lg cursor-pointer transition-colors hover:bg-slate-100 text-slate-500"
-                            >
-                              <QrCode size={15} />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setDeactivateTarget(a)}
-                              title="Nonaktifkan Asset"
-                              className="p-1.5 rounded-lg cursor-pointer transition-colors hover:bg-red-50 text-slate-500 hover:text-red-600"
-                            >
-                              <Power size={15} />
-                            </button>
-                          </>
+                          <button
+                            type="button"
+                            onClick={() => setDeactivateTarget(a)}
+                            title="Nonaktifkan Asset"
+                            className="p-1.5 rounded-lg cursor-pointer transition-colors hover:bg-red-50 text-slate-500 hover:text-red-600"
+                          >
+                            <Power size={15} />
+                          </button>
                         )}
                       </div>
                     </td>

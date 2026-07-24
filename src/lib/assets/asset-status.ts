@@ -272,6 +272,57 @@ export function pickLatestActiveBorrowing<T extends { borrowedAt?: unknown; crea
   })[0];
 }
 
+// Section 2 — foto ASLI aset (bukan logo QHSE) untuk Aksi Cepat. Urutan
+// fallback field PERSIS seperti diminta: assetPhotoUrl (alias legacy yang
+// mungkin dipakai import lama) -> photoUrl (URL langsung) -> imageUrl
+// (alias legacy lain) -> photoDriveFileId/driveFileId (lewat proxy
+// /api/drive-image, sama seperti Asset Detail page) -> assetPhotoFileId
+// (alias legacy Drive file id). Berhenti di kandidat pertama yang ada.
+export interface AssetPhotoSrc {
+  src: string | null;
+  isDriveProxy: boolean;
+}
+
+export function resolveAssetPhotoSrc(asset: Asset): AssetPhotoSrc {
+  const a = asset as unknown as Record<string, unknown>;
+  const directUrl =
+    (a.assetPhotoUrl as string) || asset.photoUrl || (a.imageUrl as string) || null;
+  if (directUrl) return { src: directUrl, isDriveProxy: false };
+
+  const driveFileId =
+    asset.photoDriveFileId || (a.driveFileId as string) || (a.assetPhotoFileId as string) || null;
+  if (driveFileId) {
+    return { src: `/api/drive-image?fileId=${encodeURIComponent(driveFileId)}`, isDriveProxy: true };
+  }
+
+  return { src: null, isDriveProxy: false };
+}
+
+export interface AssetVerificationIndicator {
+  key: string;
+  label: string;
+  ok: boolean;
+}
+
+// Section 4 — indikator kelengkapan identitas fisik aset, dipakai untuk
+// blok "Identitas Aset Terverifikasi" di Aksi Cepat. "Pernah diverifikasi"
+// HANYA true kalau sudah pernah ada "Konfirmasi Aset Sesuai" (verificationStatus
+// === "verified") — scan QR semata tidak pernah mengubah nilai ini.
+export function getAssetVerificationIndicators(asset: Asset): AssetVerificationIndicator[] {
+  const photo = resolveAssetPhotoSrc(asset);
+  return [
+    { key: "photo", label: "Foto aset tersedia", ok: !!photo.src },
+    { key: "code", label: "Kode aset sesuai", ok: !!asset.assetCode },
+    { key: "serial", label: "Nomor seri tercatat", ok: !!asset.serialNumber },
+    { key: "tag", label: "Tag fisik aktif", ok: !!asset.qrTagId },
+    { key: "verified", label: "Pernah diverifikasi", ok: asset.verificationStatus === "verified" },
+  ];
+}
+
+export function isAssetIdentityIncomplete(asset: Asset): boolean {
+  return getAssetVerificationIndicators(asset).some((i) => !i.ok);
+}
+
 // Re-export supaya konsumen tidak perlu import dari dua tempat.
 export { ASSET_STATUS_LABEL, ASSET_STATUS_COLOR };
 export type { AssetIssueTicket };

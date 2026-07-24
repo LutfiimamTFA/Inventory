@@ -492,7 +492,14 @@ export function ReturnModal({
         ticketNum = await generateTicketNumber();
         queueNum = await generateQueueNumber();
       } catch (err) {
-        console.warn("[Return Asset] gagal generate nomor tiket, memakai fallback", err);
+        const e = err as { code?: string; message?: string; name?: string };
+        console.warn("[Return Asset] gagal generate nomor tiket, memakai fallback", {
+          collection: "asset_counters",
+          documentId: "asset_issue_tickets",
+          errorCode: e?.code,
+          errorMessage: e?.message,
+          errorName: e?.name,
+        });
         const fallbackSuffix = Date.now();
         ticketNum = `TKT-${new Date().getFullYear()}-${fallbackSuffix}`;
         queueNum = `Q-${fallbackSuffix}`;
@@ -791,33 +798,72 @@ export function ReturnModal({
     // writeBatch). Kegagalan di sini TIDAK membatalkan pengembalian yang
     // sudah tersimpan.
     if (isProblem && ticketRef) {
+      const ticketDocId = ticketRef.id;
       try {
         const qhseUsers = await fetchActiveUsersByRoles(["asset_admin", "super_admin"]);
-        updateDoc(doc(db, "asset_issue_tickets", ticketRef.id), {
+        updateDoc(doc(db, "asset_issue_tickets", ticketDocId), {
           unreadByUids: qhseUsers.map((u) => u.uid),
-        }).catch((err) => console.warn("[Return Asset] gagal set unreadByUids (non-fatal)", err));
+        }).catch((err) => {
+          const e = err as { code?: string; message?: string; name?: string };
+          console.warn("[Return Asset] gagal set unreadByUids (non-fatal)", {
+            collection: "asset_issue_tickets",
+            documentId: ticketDocId,
+            errorCode: e?.code,
+            errorMessage: e?.message,
+            errorName: e?.name,
+          });
+        });
 
+        // Section 4/5 — SATU notifikasi per recipient dibungkus try/catch
+        // SENDIRI (bukan Promise.all satu try/catch besar) supaya kalau
+        // salah satu recipient gagal, recipient lain tetap kebagian
+        // notifikasi, dan log-nya jelas menyebut recipientUid mana yang
+        // gagal — bukan cuma "gagal kirim notifikasi" tanpa detail.
         await Promise.all(
-          qhseUsers.map((qhse) =>
-            createAssetNotification({
-              recipientUid: qhse.uid,
-              recipientName: qhse.name || qhse.email,
-              recipientRole: qhse.role,
-              title: "Laporan Kendala Baru",
-              message: `${currentUserName} mengembalikan ${asset.assetName} dengan kendala.`,
-              type: "ticket_created",
-              priority: IMPACT_TO_PRIORITY[impactLevel as IssueImpactLevel],
-              linkUrl: `/maintenance?tab=staff-reports&ticketId=${ticketRef!.id}`,
-              relatedType: "ticket",
-              relatedId: ticketRef!.id,
-              relatedNumber: ticketNum,
-              createdByUid: userUid,
-              createdByName: currentUserName,
-            })
-          )
+          qhseUsers.map(async (qhse) => {
+            try {
+              await createAssetNotification({
+                recipientUid: qhse.uid,
+                recipientName: qhse.name || qhse.email,
+                recipientRole: qhse.role,
+                title: "Laporan Kendala Baru",
+                message: `${currentUserName} mengembalikan ${asset.assetName} dengan kendala.`,
+                type: "asset_issue_reported",
+                priority: IMPACT_TO_PRIORITY[impactLevel as IssueImpactLevel],
+                linkUrl: `/maintenance?tab=staff-reports&ticketId=${ticketDocId}`,
+                relatedType: "ticket",
+                relatedId: ticketDocId,
+                relatedNumber: ticketNum,
+                createdByUid: userUid,
+                createdByName: currentUserName,
+                assetId: asset.id,
+                ticketId: ticketDocId,
+                ticketNumber: ticketNum,
+              });
+            } catch (err) {
+              const e = err as { code?: string; message?: string; name?: string };
+              console.error("[Return Asset] gagal kirim notifikasi QHSE (non-fatal)", {
+                collection: "asset_notifications",
+                recipientUid: qhse.uid,
+                assetId: asset.id,
+                ticketId: ticketDocId,
+                errorCode: e?.code,
+                errorMessage: e?.message,
+                errorName: e?.name,
+                rawError: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err,
+              });
+            }
+          })
         );
       } catch (err) {
-        console.warn("[Return Asset] gagal kirim notifikasi QHSE (non-fatal)", ticketRef.id, err);
+        const e = err as { code?: string; message?: string; name?: string };
+        console.error("[Return Asset] gagal memuat daftar penerima notifikasi QHSE (non-fatal)", {
+          collection: "asset_users",
+          ticketId: ticketDocId,
+          errorCode: e?.code,
+          errorMessage: e?.message,
+          errorName: e?.name,
+        });
       }
     }
 

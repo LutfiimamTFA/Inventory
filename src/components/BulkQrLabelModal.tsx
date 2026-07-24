@@ -5,7 +5,7 @@ import { QRCodeSVG } from "qrcode.react";
 import { Download, Printer, X, ChevronLeft, ChevronRight } from "lucide-react";
 import { toPng } from "html-to-image";
 import { Asset } from "@/lib/types";
-import { getAppBaseUrl, getAssetActionUrl, getQrDomainNotice } from "@/lib/utils";
+import { getAppBaseUrl, getAssetQrTarget, getQrDomainNotice } from "@/lib/utils";
 
 const LABEL_SIZES = {
   "50x30": { label: "50mm x 30mm", width: 50, height: 30 },
@@ -89,7 +89,7 @@ function BulkLabelCell({
 }) {
   // Section C — sama seperti QrLabelModal: QR berisi URL /asset-action
   // penuh, bukan lagi kode asset polos.
-  const qrValue = getAssetActionUrl(asset.assetCode || asset.qrCodeValue || asset.id);
+  const qrValue = getAssetQrTarget(asset);
   return (
     <div
       className="border border-dashed border-slate-300 rounded flex items-center justify-center overflow-hidden"

@@ -51,6 +51,7 @@ import {
   getAssetConditionLabel,
   getAssetUsageBadge,
   getQrImageSettings,
+  getAssetQrTarget,
 } from "@/lib/utils";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import Badge from "@/components/Badge";
@@ -206,8 +207,19 @@ export default function AssetDetailPage() {
     return () => unsub();
   }, [authReady, id]);
 
+  // Section 1 — query LIST seluruh asset_issue_tickets berdasarkan assetId
+  // HANYA untuk role yang memang boleh baca semua tiket (rules
+  // asset_issue_tickets membatasi baca ke tiket miliknya sendiri untuk role
+  // lain) — dipakai HANYA di panel "Asset Report Summary" yang sudah
+  // di-gate `canManage` di bawah, jadi staff/PIC/Tim IT tidak pernah perlu
+  // list ini sama sekali (ringkasan laporan kendala aktif untuk mereka
+  // sudah cukup dari field asset.hasActiveIssue/activeIssueTicketNo/
+  // lastIssueSymptomLabel/lastIssueNote, tanpa query collection terpisah).
   useEffect(() => {
-    if (!authReady) return;
+    if (!authReady || !canManage) {
+      Promise.resolve().then(() => setTickets([]));
+      return;
+    }
     const q = query(collection(db, "asset_issue_tickets"), where("assetId", "==", id));
     const unsub = onSnapshot(
       q,
@@ -220,7 +232,7 @@ export default function AssetDetailPage() {
       }
     );
     return () => unsub();
-  }, [authReady, id]);
+  }, [authReady, canManage, id]);
 
   // Daftar KARYAWAN AKTIF untuk dropdown "Pilih Custodian"/"Serahkan
   // Sementara ke" — dimuat sekali saja saat salah satu modal dibuka pertama
@@ -937,7 +949,7 @@ export default function AssetDetailPage() {
                 <div className="p-3 rounded-xl border border-slate-200 bg-slate-50">
                   <QRCodeSVG
                     id="asset-qr-svg"
-                    value={asset.qrCodeValue}
+                    value={getAssetQrTarget(asset)}
                     size={160}
                     level="H"
                     includeMargin

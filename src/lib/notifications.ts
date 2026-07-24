@@ -26,6 +26,13 @@ export async function createAssetNotification(params: {
   oldData?: Record<string, unknown>;
   newData?: Record<string, unknown>;
   changeSummary?: string[];
+  // Field tambahan opsional untuk notifikasi terkait aset/tiket spesifik
+  // (mis. laporan kendala dari alur Kembalikan Aset) — disimpan sebagai
+  // field TERPISAH di dokumen notifikasi, bukan cuma dilipat ke relatedId,
+  // supaya query/filter di masa depan bisa langsung pakai assetId/ticketId.
+  assetId?: string;
+  ticketId?: string;
+  ticketNumber?: string;
 }): Promise<string> {
   // Selalu dibersihkan dari `undefined` — addDoc melempar error kalau ada
   // field bernilai undefined (mis. createdByUid tidak diisi caller).
@@ -34,10 +41,25 @@ export async function createAssetNotification(params: {
     isRead: false,
   }) as Record<string, unknown>;
 
-  const ref = await addDoc(collection(db, "asset_notifications"), {
-    ...payload,
-    createdAt: serverTimestamp(),
-  });
+  let ref;
+  try {
+    ref = await addDoc(collection(db, "asset_notifications"), {
+      ...payload,
+      createdAt: serverTimestamp(),
+    });
+  } catch (error) {
+    const err = error as { code?: string; message?: string; name?: string };
+    console.error("[Notifications] gagal membuat notifikasi", {
+      collection: "asset_notifications",
+      recipientUid: params.recipientUid,
+      type: params.type,
+      errorCode: err?.code,
+      errorMessage: err?.message,
+      errorName: err?.name,
+      rawError: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : error,
+    });
+    throw error;
+  }
 
   // Trigger web push secara best-effort (fire-and-forget). Kegagalan push
   // tidak boleh mengganggu flow utama (ticket/work order tetap tersimpan),

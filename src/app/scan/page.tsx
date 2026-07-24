@@ -5,7 +5,9 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   collection,
+  doc,
   DocumentData,
+  getDoc,
   getDocs,
   limit,
   onSnapshot,
@@ -49,7 +51,6 @@ import {
   formatExpectedReturn,
   getAssetConditionLabel,
   isBorrowingLate,
-  isIssueTicketActive,
 } from "@/lib/utils";
 import { handoverTemporary, returnToCustodian } from "@/lib/custodian-actions";
 import { EmployeeOption, fetchActiveEmployeeOptions } from "@/lib/firestore-helpers";
@@ -875,18 +876,34 @@ function ScanPageContent() {
     // Scan HANYA membaca data — tidak ada write/ubah status di sini sama
     // sekali, perubahan status hanya lewat aksi eksplisit (Pinjam/
     // Kembalikan/Lapor Kendala/Ubah Status admin) di bawah.
-    const q = query(
-      collection(db, "assets"),
-      where("qrCodeValue", "==", trimmed),
-      limit(1)
+    // Section 6 — fallback berlapis supaya QR lama tetap bisa dipakai:
+    // qrCodeValue (== assetCode saat ini) -> qrTagId -> assetId (getDoc
+    // langsung berdasarkan id dokumen).
+    const codeSnap = await getDocs(
+      query(collection(db, "assets"), where("qrCodeValue", "==", trimmed), limit(1))
     );
-    const snap = await getDocs(q);
-    if (snap.empty) {
+    let found: Asset | null = null;
+    if (!codeSnap.empty) {
+      const d = codeSnap.docs[0];
+      found = { id: d.id, ...d.data() } as Asset;
+    } else {
+      const tagSnap = await getDocs(
+        query(collection(db, "assets"), where("qrTagId", "==", trimmed), limit(1))
+      );
+      if (!tagSnap.empty) {
+        const d = tagSnap.docs[0];
+        found = { id: d.id, ...d.data() } as Asset;
+      } else {
+        const byId = await getDoc(doc(db, "assets", trimmed));
+        if (byId.exists()) {
+          found = { id: byId.id, ...byId.data() } as Asset;
+        }
+      }
+    }
+    if (!found) {
       setNotFound(true);
       return;
     }
-    const d = snap.docs[0];
-    const found = { id: d.id, ...d.data() } as Asset;
     setAssetLookupSource(source);
     setAsset(found);
     pushScanHistory(found);
@@ -2068,41 +2085,44 @@ function AssetIssueWarningCard({
 }: {
   asset: Pick<
     Asset,
-    "id" | "hasActiveIssue" | "condition" | "activeIssueTicketNo" | "lastIssueSymptomLabel" | "lastIssueNote"
+    | "hasActiveIssue"
+    | "condition"
+    | "activeIssueTicketId"
+    | "activeIssueTicketNo"
+    | "lastIssueSymptomLabel"
+    | "lastIssueNote"
   >;
 }) {
   const hasIssueFromAssetDoc = asset.hasActiveIssue === true || asset.condition === "reported_issue";
 
-  // Section 5 — fallback untuk data lama: kalau dokumen assets belum
-  // punya hasActiveIssue/condition ter-sinkron (mis. tiketnya dibuat
-  // sebelum fitur ini ada), cari langsung tiket aktif untuk aset ini
-  // supaya warning TETAP muncul. Dokumen asset tetap sumber UTAMA — query
-  // ini cuma jalan kalau dokumen asset sendiri belum menandakan ada issue.
+  // Section 2 — dokumen asset (hasActiveIssue/lastIssueSymptomLabel/
+  // lastIssueNote/activeIssueTicketNo) SELALU sumber utama, sudah cukup
+  // untuk render warning ini TANPA baca collection asset_issue_tickets sama
+  // sekali. getDoc SATU DOKUMEN (bukan query list assetId) cuma dipakai
+  // sebagai fallback data lama yang belum sinkron, dan HANYA kalau
+  // activeIssueTicketId memang ada — kalau tidak ada, jangan menjalankan
+  // request apa pun ke collection ini (list assetId untuk staff biasa akan
+  // permission-denied karena rules asset_issue_tickets membatasi baca ke
+  // tiket miliknya sendiri).
   const [fallbackTicket, setFallbackTicket] = useState<AssetIssueTicket | null>(null);
   useEffect(() => {
-    if (hasIssueFromAssetDoc || !asset.id) {
+    if (hasIssueFromAssetDoc || !asset.activeIssueTicketId) {
       Promise.resolve().then(() => setFallbackTicket(null));
       return;
     }
     let cancelled = false;
-    getDocs(query(collection(db, "asset_issue_tickets"), where("assetId", "==", asset.id)))
+    getDoc(doc(db, "asset_issue_tickets", asset.activeIssueTicketId))
       .then((snap) => {
         if (cancelled) return;
-        const activeTickets = snap.docs
-          .map((d) => ({ id: d.id, ...d.data() } as AssetIssueTicket))
-          .filter((t) => isIssueTicketActive(t.status))
-          .sort((a, b) => {
-            const at = (a.createdAt as { toMillis?: () => number })?.toMillis?.() || 0;
-            const bt = (b.createdAt as { toMillis?: () => number })?.toMillis?.() || 0;
-            return bt - at;
-          });
-        setFallbackTicket(activeTickets[0] || null);
+        setFallbackTicket(snap.exists() ? ({ id: snap.id, ...snap.data() } as AssetIssueTicket) : null);
       })
-      .catch((err) => console.warn("[AssetIssueWarningCard] gagal fallback query tiket aktif", asset.id, err));
+      .catch((err) =>
+        console.warn("[AssetIssueWarningCard] gagal getDoc tiket aktif", asset.activeIssueTicketId, err)
+      );
     return () => {
       cancelled = true;
     };
-  }, [asset.id, hasIssueFromAssetDoc]);
+  }, [asset.activeIssueTicketId, hasIssueFromAssetDoc]);
 
   if (!hasIssueFromAssetDoc && !fallbackTicket) return null;
 

@@ -1,10 +1,11 @@
-import {
+﻿import {
   addDoc,
   collection,
   doc,
   getDocs,
   limit,
   query,
+  runTransaction,
   serverTimestamp,
   updateDoc,
   where,
@@ -148,18 +149,47 @@ export async function writeAssetUserLog(params: {
   });
 }
 
+// Section 3 — sebelumnya generateTicketNumber/generateQueueNumber MENGHITUNG
+// seluruh collection asset_issue_tickets lewat range query tanpa filter
+// kepemilikan — untuk staff biasa ini SELALU permission-denied (rules
+// asset_issue_tickets membatasi baca ke tiket miliknya sendiri, dan
+// Firestore menolak SELURUH query "list" kalau ada satu saja dokumen hasil
+// yang gagal rules). Sekarang pakai SATU dokumen counter
+// (asset_counters/asset_issue_tickets) yang dinaikkan via transaction —
+// tidak perlu baca/list collection tiket sama sekali. Kalau transaction
+// gagal (mis. rules asset_counters belum ditambahkan), tetap fallback ke
+// nomor berbasis waktu supaya user tidak pernah stuck.
+const TICKET_COUNTER_DOC_ID = "asset_issue_tickets";
+
 // Format: TKT-[TAHUN]-[NOMOR_URUT] mis. TKT-2026-0001
 export async function generateTicketNumber(): Promise<string> {
   const year = new Date().getFullYear();
   const prefix = `TKT-${year}-`;
-  const q = query(
-    collection(db, "asset_issue_tickets"),
-    where("ticketNumber", ">=", prefix),
-    where("ticketNumber", "<", prefix + "")
-  );
-  const snap = await getDocs(q);
-  const sequence = snap.size + 1;
-  return `${prefix}${String(sequence).padStart(4, "0")}`;
+  try {
+    const counterRef = doc(db, "asset_counters", TICKET_COUNTER_DOC_ID);
+    const sequence = await runTransaction(db, async (tx) => {
+      const snap = await tx.get(counterRef);
+      const data = snap.data();
+      const nextSeq = data?.ticketYear === year ? (Number(data?.lastTicketNumber) || 0) + 1 : 1;
+      tx.set(
+        counterRef,
+        { ticketYear: year, lastTicketNumber: nextSeq, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
+      return nextSeq;
+    });
+    return `${prefix}${String(sequence).padStart(4, "0")}`;
+  } catch (error) {
+    const err = error as { code?: string; message?: string; name?: string };
+    console.warn("[generateTicketNumber] counter transaction gagal, memakai fallback nomor berbasis waktu", {
+      collection: "asset_counters",
+      documentId: TICKET_COUNTER_DOC_ID,
+      errorCode: err?.code,
+      errorMessage: err?.message,
+      errorName: err?.name,
+    });
+    return `${prefix}${Date.now()}`;
+  }
 }
 
 // Format: Q-[YYYYMMDD]-[NOMOR] mis. Q-20260707-001
@@ -169,14 +199,31 @@ export async function generateQueueNumber(): Promise<string> {
     now.getDate()
   ).padStart(2, "0")}`;
   const prefix = `Q-${datePart}-`;
-  const q = query(
-    collection(db, "asset_issue_tickets"),
-    where("queueNumber", ">=", prefix),
-    where("queueNumber", "<", prefix + "")
-  );
-  const snap = await getDocs(q);
-  const sequence = snap.size + 1;
-  return `${prefix}${String(sequence).padStart(3, "0")}`;
+  try {
+    const counterRef = doc(db, "asset_counters", TICKET_COUNTER_DOC_ID);
+    const sequence = await runTransaction(db, async (tx) => {
+      const snap = await tx.get(counterRef);
+      const data = snap.data();
+      const nextSeq = data?.queueDateKey === datePart ? (Number(data?.lastQueueNumber) || 0) + 1 : 1;
+      tx.set(
+        counterRef,
+        { queueDateKey: datePart, lastQueueNumber: nextSeq, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
+      return nextSeq;
+    });
+    return `${prefix}${String(sequence).padStart(3, "0")}`;
+  } catch (error) {
+    const err = error as { code?: string; message?: string; name?: string };
+    console.warn("[generateQueueNumber] counter transaction gagal, memakai fallback nomor berbasis waktu", {
+      collection: "asset_counters",
+      documentId: TICKET_COUNTER_DOC_ID,
+      errorCode: err?.code,
+      errorMessage: err?.message,
+      errorName: err?.name,
+    });
+    return `${prefix}${Date.now()}`;
+  }
 }
 
 export const IMPACT_TO_PRIORITY: Record<IssueImpactLevel, IssuePriority> = {

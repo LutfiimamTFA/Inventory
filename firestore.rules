@@ -507,6 +507,20 @@ service cloud.firestore {
         && request.resource.data.get("updatedByUid", "") == request.auth.uid;
     }
 
+    // "Konfirmasi Aset Sesuai" (Aksi Cepat setelah Scan QR) — HANYA boleh
+    // mengubah 4 field verifikasi ini, dan lastVerifiedByUid WAJIB uid
+    // pemanggil sendiri. Siapa pun yang aktif (bukan cuma QHSE) boleh
+    // memverifikasi karena verifikasi fisik dilakukan di lapangan oleh
+    // siapa saja yang scan, bukan cuma Asset Admin.
+    function isAssetVerificationUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+
+      return isActiveAssetUser()
+        && changed.hasOnly(["verificationStatus", "lastVerifiedAt", "lastVerifiedByUid", "lastVerifiedByName"])
+        && request.resource.data.get("verificationStatus", "") == "verified"
+        && request.resource.data.get("lastVerifiedByUid", "") == request.auth.uid;
+    }
+
     match /assets/{assetId} {
       allow read: if isActiveAssetUser() || isLocationPicForAsset(resource.data);
       allow create: if isManager() || isLocationPicCreate() || isLocationPicCreateAsset();
@@ -516,7 +530,8 @@ service cloud.firestore {
         isLocationPicUpdate() ||
         isLocationPicAllowedAssetUpdate() ||
         isAssetBorrowAction() ||
-        isAssetIssueReportUpdate();
+        isAssetIssueReportUpdate() ||
+        isAssetVerificationUpdate();
       allow delete: if isSuperAdmin();
     }
 
@@ -731,6 +746,26 @@ service cloud.firestore {
           request.resource.data.recipientUid == resource.data.recipientUid &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly(["isRead", "status", "readAt", "updatedAt"]));
       allow delete: if isSuperAdmin();
+    }
+
+    // asset_qr_scan_logs: audit trail SETIAP kali QR asset dipindai (Aksi
+    // Cepat) — BUKAN verifikasi fisik, cuma catatan "QR ini pernah dibaca".
+    // Siapa pun yang aktif boleh menulis log scan miliknya sendiri; hanya
+    // QHSE/manajemen yang boleh membaca seluruh riwayat.
+    match /asset_qr_scan_logs/{logId} {
+      allow get, list: if canViewAssetMaintenance();
+      allow create: if isActiveAssetUser() && request.resource.data.scannedByUid == request.auth.uid;
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // asset_verification_logs: riwayat "Konfirmasi Aset Sesuai" (type
+    // verified) dan "Laporkan Ketidaksesuaian" (type mismatch) — terpisah
+    // dari asset_issue_tickets (laporan kerusakan) karena maknanya beda
+    // (identitas/kecocokan barang, bukan kondisi rusak).
+    match /asset_verification_logs/{logId} {
+      allow get, list: if canViewAssetMaintenance() || resource.data.performedByUid == request.auth.uid;
+      allow create: if isActiveAssetUser() && request.resource.data.performedByUid == request.auth.uid;
+      allow update, delete: if isSuperAdmin();
     }
 
     // asset_notification_tokens: token push milik masing-masing user, tidak

@@ -10,7 +10,7 @@ import {
   ASSET_STATUS_LABEL,
   CONDITION_LABEL,
   getAppBaseUrl,
-  getAssetActionUrl,
+  getAssetQrTarget,
   getQrDomainNotice,
 } from "@/lib/utils";
 import Badge from "@/components/Badge";
@@ -219,7 +219,7 @@ export default function QrLabelModal({
   // Section C — QR sekarang berisi URL /asset-action lengkap (domain
   // production dari NEXT_PUBLIC_APP_URL), bukan lagi kode asset polos,
   // supaya kamera bawaan HP bisa langsung membuka halaman aksi asset.
-  const qrValue = getAssetActionUrl(asset.assetCode || asset.qrCodeValue || asset.id);
+  const qrValue = getAssetQrTarget(asset);
   const domainNotice = getQrDomainNotice(getAppBaseUrl());
   const singleWidth = Math.round(resolvedLabelWidthMm * PX_PER_MM);
   const singleHeight = Math.round(resolvedLabelHeightMm * PX_PER_MM);

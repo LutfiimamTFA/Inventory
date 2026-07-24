@@ -242,6 +242,54 @@ export interface Asset {
   createdByName: string;
   createdAt: unknown;
   updatedAt: unknown;
+
+  // ── Verifikasi fisik aset (Aksi Cepat setelah Scan QR) ──────────────────
+  // qrTagId = nomor tag fisik yang ditempel di badan aset (BEDA dari
+  // assetCode/qrCodeValue yang isinya kode sistem) — opsional, aset lama
+  // belum tentu punya. verificationStatus HANYA berubah lewat "Konfirmasi
+  // Aset Sesuai" (lihat lib/assets/asset-verification.ts) — scan QR semata
+  // TIDAK PERNAH otomatis menandai aset terverifikasi (lihat Section 9 di
+  // asset-action/page.tsx).
+  qrTagId?: string | null;
+  verificationStatus?: "unverified" | "verified";
+  lastVerifiedAt?: unknown;
+  lastVerifiedByUid?: string | null;
+  lastVerifiedByName?: string | null;
+}
+
+// asset_qr_scan_logs — audit trail SETIAP kali QR asset dipindai (bukan
+// verifikasi fisik), dipakai untuk melihat siapa/kapan sebuah aset terakhir
+// discan tanpa menyimpulkan bahwa fisiknya sudah dicek langsung.
+export interface AssetQrScanLog {
+  id: string;
+  assetId: string;
+  assetCode: string;
+  qrTagId?: string | null;
+  scannedByUid: string;
+  scannedByName: string;
+  scannedAt: unknown;
+  usageStatusAtScan: string;
+  conditionAtScan: string;
+  holderUidAtScan?: string | null;
+  holderNameAtScan?: string | null;
+  location?: string | null;
+}
+
+// asset_verification_logs — riwayat verifikasi FISIK aset ("Konfirmasi Aset
+// Sesuai") maupun laporan ketidaksesuaian ("Laporkan Ketidaksesuaian"),
+// disimpan terpisah dari asset_issue_tickets (laporan kerusakan) karena
+// keduanya punya arti berbeda: identitas/kecocokan barang vs kondisi rusak.
+export interface AssetVerificationLog {
+  id: string;
+  assetId: string;
+  assetCode: string;
+  type: "verified" | "mismatch";
+  checklist?: Record<string, boolean>;
+  mismatchReasons?: string[];
+  note?: string;
+  performedByUid: string;
+  performedByName: string;
+  performedAt: unknown;
 }
 
 export type AssetUsageType = "shared_pool" | "assigned_daily";
@@ -1214,6 +1262,8 @@ export type NotificationType =
   | "asset_borrowed"
   | "asset_returned"
   | "asset_damage_reported"
+  | "asset_issue_reported"
+  | "asset_mismatch_reported"
   | "asset_created"
   | "asset_updated"
   | "asset_status_changed"
