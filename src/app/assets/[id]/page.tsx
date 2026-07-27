@@ -37,9 +37,9 @@ import {
 import ConfirmModal from "@/components/ConfirmModal";
 import { useAuth } from "@/lib/auth-context";
 import { getResolvedPersonDisplay, useEmployeeDirectory } from "@/lib/employeeDirectory";
-import { isAssetInMyPicLocation } from "@/lib/locations";
+import { fetchLocationPicSnapshot, isAssetInMyPicLocation } from "@/lib/locations";
 import { getAssetPhotoPreviewUrl } from "@/lib/assets/asset-status";
-import { Asset, AssetBorrowing, AssetIssueTicket, AssetLog } from "@/lib/types";
+import { Asset, AssetBorrowing, AssetIssueTicket, AssetLog, MaintenanceWorkOrder } from "@/lib/types";
 import {
   ASSET_USAGE_STATUS_COLOR,
   ASSET_USAGE_STATUS_LABEL,
@@ -50,9 +50,13 @@ import {
   formatDate,
   getAssetConditionColor,
   getAssetConditionLabel,
+  getAssetLogActionLabel,
   getAssetUsageBadge,
   getQrImageSettings,
   getAssetQrTarget,
+  TRACKING_MODE_LABEL,
+  WORK_ORDER_STATUS_COLOR,
+  WORK_ORDER_STATUS_LABEL,
 } from "@/lib/utils";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import Badge from "@/components/Badge";
@@ -74,6 +78,7 @@ export default function AssetDetailPage() {
   const [photoImgError, setPhotoImgError] = useState(false);
   const [borrowings, setBorrowings] = useState<AssetBorrowing[]>([]);
   const [logs, setLogs] = useState<AssetLog[]>([]);
+  const [maintenanceHistory, setMaintenanceHistory] = useState<MaintenanceWorkOrder[]>([]);
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
   const [deactivateOpen, setDeactivateOpen] = useState(false);
   const [deactivating, setDeactivating] = useState(false);
@@ -92,6 +97,11 @@ export default function AssetDetailPage() {
   const [usageSaving, setUsageSaving] = useState(false);
   const [usageError, setUsageError] = useState("");
   const [toast, setToast] = useState<ToastState | null>(null);
+  // Section 7 — PIC Lokasi WAJIB diambil dari dokumen asset_locations/
+  // {locationId} (master lokasi), BUKAN dari custodian/pemegang/PIC
+  // operasional/pembuat aset — reuse helper terpusat yang sama dengan alur
+  // laporan kendala (lib/locations.ts).
+  const [locationPic, setLocationPic] = useState<{ name: string | null; email: string | null } | null>(null);
 
   const canManage = role === "super_admin" || role === "asset_admin";
   // Finance/Bukti Pembelian: HANYA Super Admin & Asset Finance yang boleh
@@ -165,6 +175,60 @@ export default function AssetDetailPage() {
     const timer = window.setTimeout(() => router.replace("/assets"), 1200);
     return () => window.clearTimeout(timer);
   }, [authReady, asset, isLocationPicScoped, assignedPicLocations, assetUser?.uid, router]);
+
+  // Section 7 — PIC Lokasi dari master asset_locations/{locationId}, TIDAK
+  // PERNAH dari custodian/pemegang/PIC operasional/pembuat aset.
+  useEffect(() => {
+    if (!authReady || !asset?.locationId) {
+      queueMicrotask(() => setLocationPic(null));
+      return;
+    }
+    let cancelled = false;
+    fetchLocationPicSnapshot(asset.locationId).then((snap) => {
+      if (cancelled) return;
+      setLocationPic(
+        snap.locationPicUid ? { name: snap.locationPicName, email: snap.locationPicEmail } : null
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, asset?.locationId]);
+
+  // Section 6 — "Histori Pemeliharaan": asset_maintenance_work_orders rules
+  // membatasi baca ke canViewAssetMaintenance() (super_admin/asset_admin/
+  // it_team) — listener HARUS dilewati untuk role lain (termasuk PIC
+  // Lokasi/staff), bukan cuma disembunyikan di UI, supaya tidak memicu
+  // permission-denied.
+  const canViewMaintenanceHistory = role === "super_admin" || role === "asset_admin" || role === "it_team";
+  useEffect(() => {
+    if (!authReady || !canViewMaintenanceHistory) {
+      queueMicrotask(() => setMaintenanceHistory([]));
+      return;
+    }
+    const q = query(
+      collection(db, "asset_maintenance_work_orders"),
+      where("assetIds", "array-contains", id)
+    );
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        setMaintenanceHistory(
+          snap.docs
+            .map((d) => ({ id: d.id, ...d.data() } as MaintenanceWorkOrder))
+            .sort((a, b) => {
+              const at = (a.createdAt as { toMillis?: () => number })?.toMillis?.() || 0;
+              const bt = (b.createdAt as { toMillis?: () => number })?.toMillis?.() || 0;
+              return bt - at;
+            })
+        );
+      },
+      (error) => {
+        console.error("[AssetDetailPage Listener] asset_maintenance_work_orders error:", { id, error });
+      }
+    );
+    return () => unsub();
+  }, [authReady, canViewMaintenanceHistory, id]);
 
   useEffect(() => {
     if (!authReady) return;
@@ -361,6 +425,10 @@ export default function AssetDetailPage() {
     (!!custodianDisplayName &&
       custodianDisplayName !== "-" &&
       custodianDisplayName === currentHolderDisplayName);
+  // Section 8 — penanda "memang ada pemegang aktif" murni dari
+  // currentHolderUid/currentBorrowingId, TIDAK dari hasil resolve nama
+  // (yang bisa fallback ke custodian dan menyesatkan).
+  const hasActiveHolder = !!(asset.currentHolderUid || asset.currentBorrowingId);
 
   console.log("[Asset Detail Custodian]", {
     assetId: asset.id,
@@ -715,6 +783,26 @@ export default function AssetDetailPage() {
             )}
           </Section>
 
+          {canViewMaintenanceHistory && (
+            <Section title="Histori Pemeliharaan">
+              {maintenanceHistory.length === 0 ? (
+                <EmptyState icon={HistoryIcon} title="Belum ada riwayat pemeliharaan" />
+              ) : (
+                <div className="divide-y divide-slate-100">
+                  {maintenanceHistory.map((wo) => (
+                    <div key={wo.id} className="flex items-center justify-between gap-3 py-3 first:pt-0 last:pb-0 text-sm">
+                      <div className="min-w-0">
+                        <p className="font-medium text-slate-800 truncate">{wo.title}</p>
+                        <p className="text-xs text-slate-400">{formatDate(wo.createdAt)}</p>
+                      </div>
+                      <Badge label={WORK_ORDER_STATUS_LABEL[wo.status]} colorClass={WORK_ORDER_STATUS_COLOR[wo.status]} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Section>
+          )}
+
           <Section title="Log Aktivitas" anchorId="log-aktivitas">
             {logs.length === 0 ? (
               <EmptyState icon={HistoryIcon} title="Belum ada log aktivitas" />
@@ -723,7 +811,7 @@ export default function AssetDetailPage() {
                 {logs.map((l) => (
                   <div key={l.id} className="text-sm py-3 first:pt-0 last:pb-0">
                     <p className="text-slate-800">
-                      <span className="font-medium">{l.userName}</span> — {l.action}
+                      <span className="font-medium">{l.userName}</span> — {getAssetLogActionLabel(l.action)}
                     </p>
                     <p className="text-xs text-slate-400">
                       {formatDate(l.timestamp)} {l.detail && `· ${l.detail}`}
@@ -806,7 +894,9 @@ export default function AssetDetailPage() {
                   <Badge label="Aset Tetap Lokasi" colorClass="bg-slate-100 text-slate-600" />
                 </div>
                 <Info label="Lokasi" value={asset.locationText || asset.location} />
-                <Info label="PIC Lokasi" value={custodianDisplayName} sub={custodianDisplaySub} />
+                <Info label="Mode Tracking" value={asset.trackingModeLabel || (asset.trackingMode ? TRACKING_MODE_LABEL[asset.trackingMode] : "-")} />
+                <Info label="PIC Lokasi" value={locationPic?.name || "PIC Lokasi belum ditentukan"} />
+                <Info label="PIC Operasional" value={asset.responsiblePersonName || "-"} />
                 <Info label="Pemakaian" value="Tetap di Lokasi" />
                 <Info label="Kondisi Aset" value={getAssetConditionLabel(asset)} />
                 <Info label="Maintenance Terakhir" value={formatDate(asset.lastMaintenanceAt)} />
@@ -838,17 +928,23 @@ export default function AssetDetailPage() {
                   colorClass={ASSET_USAGE_STATUS_COLOR[asset.currentUsageStatus]}
                 />
               )}
-              {asset.areaPicName && (
-                <Info label="PIC Lokasi" value={asset.areaPicName} />
-              )}
+              <Info label="Mode Tracking" value={asset.trackingModeLabel || (asset.trackingMode ? TRACKING_MODE_LABEL[asset.trackingMode] : "-")} />
+              <Info label="PIC Lokasi" value={locationPic?.name || "PIC Lokasi belum ditentukan"} />
+              <Info label="PIC Operasional" value={asset.responsiblePersonName || "-"} />
+              <Info label="PIC / Custodian" value={custodianDisplayName} sub={custodianDisplaySub} />
               {custodianIsCurrentHolder ? (
                 <Info label="Pemegang Harian / Saat Ini" value={custodianDisplayName} sub={custodianDisplaySub} />
-              ) : (
+              ) : hasActiveHolder ? (
                 <>
-                  <Info label="Custodian / Pemegang Harian" value={custodianDisplayName} sub={custodianDisplaySub} />
                   <Info label="Pemegang Saat Ini" value={currentHolderDisplayName} sub={currentHolderDisplaySub} />
                   <p className="text-xs text-amber-600 font-medium">Sedang dipakai sementara</p>
                 </>
+              ) : (
+                // Section 8 — JANGAN tampilkan "Sedang dipakai sementara"
+                // kalau currentHolderUid DAN currentBorrowingId sama-sama
+                // kosong — itu bukan pemakaian sementara, cuma belum ada
+                // pemegang aktif sama sekali.
+                <Info label="Pemegang Saat Ini" value="Belum ada pemegang aktif." />
               )}
               {canManage && needsCustodianSync && (
                 <button

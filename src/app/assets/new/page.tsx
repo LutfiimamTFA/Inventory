@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { addDoc, collection, onSnapshot, serverTimestamp } from "firebase/firestore";
+import { addDoc, collection, doc, onSnapshot, serverTimestamp, setDoc } from "firebase/firestore";
 import { QRCodeSVG } from "qrcode.react";
 import { Wand2, Pencil } from "lucide-react";
 import { db } from "@/lib/firebase";
@@ -22,9 +22,11 @@ import {
 } from "@/lib/types";
 import { fetchHrpBrands, fetchHrpDivisions } from "@/lib/hrp";
 import {
+  cleanFirestoreData,
   EmployeeOption,
   fetchActiveEmployeeOptions,
   fetchActiveUsersByRoles,
+  formatAssetCode,
   generateAssetCode,
   isAssetCodeTaken,
   writeAssetLog,
@@ -142,6 +144,13 @@ export default function NewAssetPage() {
   const [error, setError] = useState("");
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [toast, setToast] = useState<ToastState | null>(null);
+  // Section 4/5 — SATU document ref dipakai sepanjang percobaan submit ini
+  // (termasuk kalau handleSubmit sempat terpanggil ulang sebelum berhasil).
+  // pendingAssetIdRef.current diisi SEKALI saat pertama kali submit dicoba,
+  // dan dipakai ulang kalau user sempat klik simpan lagi sebelum proses
+  // pertama selesai — supaya tidak pernah ada dua dokumen assets untuk satu
+  // percobaan yang sama (akar bug aset duplikat "testing bebe h").
+  const pendingAssetIdRef = useRef<string | null>(null);
 
   // A. Informasi Aset
   const [assetName, setAssetName] = useState("");
@@ -205,10 +214,25 @@ export default function NewAssetPage() {
   // Lokasi-lokasi yang JADI TANGGUNG JAWAB user ini secara langsung (bukan
   // turunannya) — dipakai PicLocationField untuk "Pilih Lokasi Tanggung
   // Jawab" kalau lebih dari satu, atau auto-select kalau cuma satu.
+  // Section 1 — cek SEMUA kemungkinan field PIC (picUid/picEmail dan alias
+  // legacy locationPicUid/locationPicEmail yang mungkin masih dipakai data
+  // lama) supaya PIC tidak "kehilangan" lokasinya hanya karena field yang
+  // terisi beda nama. PIC TIDAK BOLEH memilih lokasi lain di luar hasil ini
+  // — myPicLocations inilah satu-satunya sumber opsi untuk PicLocationField.
   const myPicLocations = useMemo(() => {
     if (!isLocationPicRole || !assetUser) return [];
-    return locations.filter((n) => n.picUid === assetUser.uid);
-  }, [locations, isLocationPicRole, assetUser]);
+    const uid = firebaseUser?.uid || assetUser.uid;
+    const email = firebaseUser?.email || assetUser.email;
+    return locations.filter((n) => {
+      const node = n as unknown as Record<string, unknown>;
+      return (
+        n.picUid === uid ||
+        node.locationPicUid === uid ||
+        (!!email && n.picEmail === email) ||
+        (!!email && node.locationPicEmail === email)
+      );
+    });
+  }, [locations, isLocationPicRole, assetUser, firebaseUser?.uid, firebaseUser?.email]);
   const scopedLocations = useMemo(() => {
     if (!isLocationPicRole) return locations;
     if (myPicLocations.length === 0) return [];
@@ -349,9 +373,31 @@ export default function NewAssetPage() {
   useEffect(() => {
     if (!autoCode || !category) return;
     let cancelled = false;
+    console.info("[Asset Create] stage=generate_asset_code START", { categoryCode: category.categoryCode });
     generateAssetCode(category.categoryCode)
       .then((code) => {
+        console.info("[Asset Create] stage=generate_asset_code SUCCESS", { assetCode: code });
         if (!cancelled) setAssetCode(code);
+      })
+      .catch((err) => {
+        // Section 6/7 — generateAssetCode TIDAK menulis ke asset_counters
+        // (hitung dari collection assets langsung), tapi query itu sendiri
+        // tetap bisa gagal (mis. permission-denied) — jangan biarkan
+        // pembuatan kode aset macet, pakai fallback berbasis waktu. Fallback
+        // TETAP lewat formatAssetCode (SATU fungsi format) supaya digitnya
+        // tidak pernah tergabung mentah — sequence fallback pakai 6 digit
+        // terakhir epoch ms, cukup unik dan tetap konsisten formatnya.
+        const e = err as { code?: string; message?: string };
+        console.error("[Asset Create] stage=generate_asset_code FAILED, pakai fallback", {
+          errorCode: e?.code,
+          errorMessage: e?.message,
+          collection: "assets",
+          categoryCode: category.categoryCode,
+        });
+        if (!cancelled) {
+          const fallbackSequence = Number(String(Date.now()).slice(-6));
+          setAssetCode(formatAssetCode(category.categoryCode, new Date().getFullYear(), fallbackSequence));
+        }
       })
       .finally(() => {
         if (!cancelled) setGeneratingCode(false);
@@ -391,6 +437,12 @@ export default function NewAssetPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    // Section 3 — cegah submit ganda: kalau proses sebelumnya masih
+    // berjalan (mis. user klik dua kali, atau klik lagi setelah pesan
+    // error yang sebenarnya keliru karena proses tambahan yang gagal),
+    // jangan mulai proses baru sama sekali.
+    if (saving) return;
+
     if (photoUploading || invoiceUploading) {
       setError("Tunggu proses upload file selesai sebelum menyimpan.");
       return;
@@ -427,18 +479,36 @@ export default function NewAssetPage() {
       return;
     }
 
-    console.debug("[Asset Photo] state before submit:", {
-      photoUrl: photo?.url,
-      photoThumbnailUrl: photo?.thumbnailUrl,
-      photoDriveFileId: photo?.fileId,
-      photoFileName: photo?.fileName,
-    });
-
     setSaving(true);
     setError("");
     setFieldErrors({});
+    // Section 2/7 — SATU sumber untuk uid/nama pembuat & pengubah, dipakai
+    // konsisten di seluruh payload (termasuk log aktivitas) DAN di log
+    // error kalau submit gagal — firebaseUser.uid DULU karena itu yang
+    // selalu sama dengan request.auth.uid yang dipakai rules, assetUser
+    // cuma pelengkap nama. Dideklarasikan di luar try supaya tetap bisa
+    // dipakai di blok catch.
+    const currentUserUid = firebaseUser?.uid || assetUser?.uid || "";
+    const currentUserName = assetUser?.name || firebaseUser?.email || "";
+    const picLocationId = isLocationPicRole ? selectedPicLocationId || null : null;
+    // Section 1 — dokumen `assets` dianggap berhasil dibuat SEGERA setelah
+    // setDoc() sukses. Proses tambahan (log aktivitas, notifikasi QHSE)
+    // TIDAK PERNAH boleh membuat halaman ini melapor "gagal" — itulah akar
+    // bug aset duplikat: dulu semuanya dalam satu try/catch, jadi kegagalan
+    // proses tambahan membuat pesan error muncul padahal dokumennya sudah
+    // tersimpan, lalu user submit ulang dan membuat dokumen KEDUA.
+    let assetCreated = false;
     try {
-      const codeTaken = await isAssetCodeTaken(assetCode.trim());
+      // Section 5 — idempotency: pakai assetRef yang SAMA kalau percobaan
+      // sebelumnya (dalam sesi form yang sama) sempat membuat ref tapi
+      // belum berhasil setDoc — jangan pernah generate id baru selama
+      // percobaan sebelumnya masih "gantung".
+      const assetRef = pendingAssetIdRef.current
+        ? doc(db, "assets", pendingAssetIdRef.current)
+        : doc(collection(db, "assets"));
+      pendingAssetIdRef.current = assetRef.id;
+
+      const codeTaken = await isAssetCodeTaken(assetCode.trim(), assetRef.id);
       if (codeTaken) {
         setFieldErrors({ assetCode: "Kode asset sudah digunakan." });
         setError("Kode asset sudah digunakan.");
@@ -446,6 +516,13 @@ export default function NewAssetPage() {
         return;
       }
 
+      // Section 8 — foto utama SUDAH terupload sebelum submit (lewat
+      // FileUploadField), tahap ini cuma memastikan hasil uploadnya
+      // dipakai di payload — tidak ada request upload baru di sini.
+      console.info("[Asset Create] stage=upload_photo", {
+        hasPhoto: !!photo?.fileId,
+        photoFileName: photo?.fileName || null,
+      });
       const photoFields = {
         photoUrl: photo?.url || null,
         photoThumbnailUrl: photo?.thumbnailUrl || null,
@@ -455,7 +532,6 @@ export default function NewAssetPage() {
         photoSize: photo?.size ?? null,
         photoUploadedAt: photo?.uploadedAt || null,
       };
-      console.debug("[Asset Save] payload photo fields:", photoFields);
 
       const assetLocationText = buildFullPath({
         buildingName: locationSelection.buildingName,
@@ -473,7 +549,7 @@ export default function NewAssetPage() {
         areaId: locationSelection.areaId,
       });
 
-      const docRef = await addDoc(collection(db, "assets"), {
+      const assetPayload = cleanFirestoreData({
         assetName: assetName.trim(),
         assetCode: assetCode.trim(),
         categoryId,
@@ -518,13 +594,11 @@ export default function NewAssetPage() {
         ...(isLocationPicRole
           ? {
               createdFromLocationPic: true,
-              createdByUid: firebaseUser?.uid || "",
-              createdByName: assetUser?.name || firebaseUser?.email || "",
               createdByRole: "location_pic",
-              locationPicUid: firebaseUser?.uid || "",
-              locationPicName: assetUser?.name || firebaseUser?.email || "",
+              locationPicUid: currentUserUid || "",
+              locationPicName: currentUserName || "",
               locationPicEmail: firebaseUser?.email || "",
-              allowedLocationPicUids: firebaseUser?.uid ? [firebaseUser.uid] : [],
+              allowedLocationPicUids: currentUserUid ? [currentUserUid] : [],
             }
           : {}),
         responsiblePersonUid: responsiblePersonUid || null,
@@ -608,49 +682,148 @@ export default function NewAssetPage() {
         currentBorrowerUid: null,
         currentBorrowerName: null,
 
-        createdByUid: assetUser?.uid,
-        createdByName: assetUser?.name,
+        createdByUid: currentUserUid,
+        createdByName: currentUserName,
+        updatedByUid: currentUserUid,
+        updatedByName: currentUserName,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
+      }) as Record<string, unknown>;
+
+      console.info("[Asset Create] stage=create_assets START", {
+        assetId: assetRef.id,
+        assetCode: assetPayload.assetCode,
+      });
+      await setDoc(assetRef, assetPayload);
+      assetCreated = true;
+      console.info("[Asset Create] stage=create_assets SUCCESS", {
+        assetId: assetRef.id,
+        assetCode: assetPayload.assetCode,
       });
 
-      await writeAssetLog({
-        assetId: docRef.id,
-        assetName: assetName.trim(),
-        assetCode: assetCode.trim(),
-        action: "create",
-        userUid: assetUser?.uid || "",
-        userName: assetUser?.name || "",
-        detail: "Aset dibuat",
+      // Section 2/6 — SEMUA proses di bawah ini bersifat TAMBAHAN. Mulai
+      // titik ini, aset SUDAH tersimpan — apa pun yang terjadi selanjutnya
+      // TIDAK PERNAH boleh membuat halaman ini menampilkan pesan gagal.
+      const additionalResults = await Promise.allSettled([
+        (async () => {
+          console.info("[Asset Create] stage=create_activity_log START", { assetId: assetRef.id });
+          await writeAssetLog({
+            assetId: assetRef.id,
+            assetName: assetName.trim(),
+            assetCode: assetCode.trim(),
+            action: "create",
+            userUid: currentUserUid,
+            userName: currentUserName,
+            detail: "Aset dibuat",
+          });
+          console.info("[Asset Create] stage=create_activity_log SUCCESS", { assetId: assetRef.id });
+        })(),
+        (async () => {
+          // Section 4/6 — log aktivitas KHUSUS saat aset dibuat oleh PIC
+          // Lokasi, payload PERSIS seperti diminta, ditulis ke asset_logs
+          // (bukan asset_activity_logs yang aksesnya dibatasi ke
+          // canViewAssetMaintenance, sementara PIC Lokasi tidak selalu
+          // punya akses itu). Section 6 — generateAssetCode di lib ini
+          // TIDAK menulis ke collection asset_counters sama sekali (nomor
+          // urut dihitung langsung dari collection assets), jadi tidak ada
+          // "update_counter" terpisah yang perlu dijalankan di sini.
+          if (!isLocationPicRole) return;
+          console.info("[Asset Create] stage=update_counter (log PIC Lokasi) START", { assetId: assetRef.id });
+          await addDoc(collection(db, "asset_logs"), {
+            assetId: assetRef.id,
+            locationId: picLocationId,
+            actorUid: currentUserUid,
+            createdByUid: currentUserUid,
+            action: "asset_created_by_location_pic",
+            timestamp: serverTimestamp(),
+          });
+          console.info("[Asset Create] stage=update_counter (log PIC Lokasi) SUCCESS", { assetId: assetRef.id });
+        })(),
+        (async () => {
+          console.info("[Asset Create] stage=create_notification START", { assetId: assetRef.id });
+          const notifyRecipients = (await fetchActiveUsersByRoles(["asset_admin", "super_admin"])).filter(
+            (u) => u.uid !== assetUser?.uid
+          );
+          await Promise.all(
+            notifyRecipients.map((recipient) =>
+              createAssetNotification({
+                recipientUid: recipient.uid,
+                recipientName: recipient.name,
+                recipientRole: recipient.role,
+                title: "Asset Baru Ditambahkan",
+                message: `${assetName.trim()} (${assetCode.trim()}) ditambahkan oleh ${assetUser?.name || "seseorang"}.`,
+                type: "asset_created",
+                priority: "low",
+                linkUrl: `/assets/${assetRef.id}`,
+                relatedType: "asset",
+                relatedId: assetRef.id,
+                relatedNumber: assetCode.trim(),
+                createdByUid: assetUser?.uid,
+                createdByName: assetUser?.name,
+              })
+            )
+          );
+          console.info("[Asset Create] stage=create_notification SUCCESS", { assetId: assetRef.id });
+        })(),
+      ]);
+
+      additionalResults.forEach((result, index) => {
+        if (result.status === "rejected") {
+          const OPERATION_LABELS = ["create_activity_log", "update_counter", "create_notification"];
+          console.warn("[Asset Create] proses tambahan gagal (non-fatal, aset tetap tersimpan)", {
+            operation: OPERATION_LABELS[index] || `operation_${index}`,
+            assetId: assetRef.id,
+            error: result.reason,
+          });
+        }
       });
 
-      const notifyRecipients = (await fetchActiveUsersByRoles(["asset_admin", "super_admin"])).filter(
-        (u) => u.uid !== assetUser?.uid
-      );
-      await Promise.all(
-        notifyRecipients.map((recipient) =>
-          createAssetNotification({
-            recipientUid: recipient.uid,
-            recipientName: recipient.name,
-            recipientRole: recipient.role,
-            title: "Asset Baru Ditambahkan",
-            message: `${assetName.trim()} (${assetCode.trim()}) ditambahkan oleh ${assetUser?.name || "seseorang"}.`,
-            type: "asset_created",
-            priority: "low",
-            linkUrl: `/assets/${docRef.id}`,
-            relatedType: "asset",
-            relatedId: docRef.id,
-            relatedNumber: assetCode.trim(),
-            createdByUid: assetUser?.uid,
-            createdByName: assetUser?.name,
-          })
-        )
-      );
-
-      setToast({ type: "success", message: "Asset berhasil ditambahkan." });
-      router.push(`/assets/${docRef.id}`);
+      // Section 8 — PIC Lokasi diarahkan balik ke "Aset Lokasi Saya"
+      // (/assets, sudah menampilkan label itu untuk role ini — lihat
+      // ProtectedLayout), BUKAN ke halaman detail aset seperti Admin/QHSE.
+      // Pesan sukses dibawa lewat query param supaya tetap terlihat setelah
+      // redirect (pola sama dengan /my-reports?submitted=1).
+      console.info("[Asset Create] stage=redirect", { assetId: assetRef.id, isLocationPicRole });
+      if (isLocationPicRole) {
+        router.push("/assets?created=1");
+      } else {
+        setToast({ type: "success", message: "Asset berhasil ditambahkan." });
+        router.push(`/assets/${assetRef.id}`);
+      }
     } catch (err) {
-      console.error(err);
+      // Section 6 — kalau assetCreated sudah true, dokumen assets SUDAH
+      // tersimpan sebelum error ini terjadi (pasti dari salah satu proses
+      // tambahan yang lolos dari Promise.allSettled-nya sendiri, mis. error
+      // sinkron yang tidak sempat ketangkap) — jangan pernah tampilkan
+      // pesan gagal, tetap anggap berhasil dan redirect.
+      if (assetCreated) {
+        console.warn("[Asset Create] aset sudah tersimpan, hanya proses tambahan yang gagal", err);
+        if (isLocationPicRole) {
+          router.push("/assets?created=1");
+        } else {
+          setToast({ type: "success", message: "Asset berhasil ditambahkan." });
+          router.push(`/assets/${pendingAssetIdRef.current}`);
+        }
+        setSaving(false);
+        return;
+      }
+
+      // Section 7 — error log LENGKAP (bukan cuma console.error(err) polos)
+      // supaya gagal simpan aset bisa ditelusuri: field mana, lokasi mana,
+      // dan siapa yang submit.
+      const e = err as { code?: string; message?: string };
+      console.error("[Asset Create] stage=create_assets FAILED", {
+        errorCode: e?.code,
+        errorMessage: e?.message,
+        collection: "assets",
+        documentId: pendingAssetIdRef.current,
+        payloadKeys: [
+          "assetName", "assetCode", "categoryId", "locationId", "locationText",
+          "createdByUid", "createdByName", "updatedByUid", "updatedByName",
+        ],
+        locationId: picLocationId,
+        currentUserUid,
+      });
       setError("Gagal menyimpan aset. Coba lagi.");
       setToast({ type: "error", message: "Gagal menyimpan aset. Coba lagi." });
     } finally {

@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   collection,
   doc,
@@ -51,10 +52,34 @@ import EmptyState from "@/components/EmptyState";
 import ConfirmModal from "@/components/ConfirmModal";
 import QrLabelModal from "@/components/QrLabelModal";
 import BulkQrLabelModal from "@/components/BulkQrLabelModal";
+import { Toast, ToastState } from "@/components/Toast";
 
 export default function AssetsPage() {
+  return (
+    <Suspense fallback={null}>
+      <AssetsPageContent />
+    </Suspense>
+  );
+}
+
+function AssetsPageContent() {
   const { firebaseUser, assetUser, role, loading, isLocationPicRole, assignedPicLocations } = useAuth();
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const [pageToast, setPageToast] = useState<ToastState | null>(null);
+
+  // Section 8 — pesan sukses "Aset berhasil ditambahkan pada lokasi
+  // tanggung jawab Anda." dibawa lewat query param dari /assets/new supaya
+  // tetap terlihat setelah redirect (pola sama dengan /my-reports?submitted=1).
+  useEffect(() => {
+    if (searchParams.get("created") !== "1") return;
+    queueMicrotask(() =>
+      setPageToast({ type: "success", message: "Aset berhasil ditambahkan pada lokasi tanggung jawab Anda." })
+    );
+    router.replace("/assets");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
   // Section C — staff yang ditunjuk PIC di Master Lokasi (isLocationPicRole
   // dari auth-context) diperlakukan SAMA seperti role "location_pic"
   // literal untuk seluruh halaman ini, tanpa mengubah role backend-nya.
@@ -90,6 +115,12 @@ export default function AssetsPage() {
   // lokasinya sendiri di form create/edit), TAPI TIDAK boleh nonaktifkan/
   // hapus aset atau pakai aksi bulk — itu tetap khusus canManage.
   const canCreateOrEditAsset = canManage || isLocationPicScoped;
+  // Section 3 — tombol "Tambah Aset" HANYA untuk PIC Lokasi yang benar-benar
+  // punya minimal satu lokasi tanggung jawab (assignedPicLocations dari
+  // auth-context) — kalau isLocationPicScoped true tapi belum ditetapkan
+  // sebagai PIC lokasi manapun, tombolnya disembunyikan (bukan ditampilkan
+  // lalu macet di form /assets/new).
+  const canCreateNewAsset = canManage || (isLocationPicScoped && assignedPicLocations.length > 0);
   // Section E — kolom "Nilai Asset" (harga beli) HANYA untuk Super
   // Admin/Asset Finance. Asset Admin/QHSE, Staff, Tim IT tidak boleh melihat
   // nominal harga sama sekali.
@@ -399,18 +430,26 @@ export default function AssetsPage() {
                 Bulk QR Label
               </button>
             )}
-            {canCreateOrEditAsset && (
+            {canCreateNewAsset && (
               <Link
                 href="/assets/new"
                 className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-teal-500 text-white px-4 py-2.5 text-sm font-medium hover:brightness-105 shadow-md shadow-blue-900/20"
               >
                 <Plus size={16} />
-                Create Asset
+                Tambah Aset
               </Link>
             )}
           </>
         }
       />
+
+      {/* Section 3 — PIC Lokasi TANPA lokasi tanggung jawab tidak melihat
+          tombol Tambah Aset sama sekali — beri tahu kenapa. */}
+      {isLocationPicScoped && !canManage && assignedPicLocations.length === 0 && (
+        <p className="-mt-4 mb-4 text-xs font-medium text-amber-600">
+          Anda belum ditetapkan sebagai PIC lokasi.
+        </p>
+      )}
 
       {/* Section E — badge mode PIC Lokasi, supaya Daniel dkk langsung sadar
           daftar ini sudah disaring ke lokasi tanggung jawabnya, bukan bug
@@ -667,7 +706,7 @@ export default function AssetsPage() {
                   className="inline-flex items-center gap-2 rounded-xl bg-slate-900 text-white px-4 py-2 text-sm font-medium hover:bg-slate-800"
                 >
                   <Plus size={16} />
-                  Create Asset
+                  Tambah Aset
                 </Link>
               )
             }
@@ -808,7 +847,7 @@ export default function AssetsPage() {
                             <Pencil size={15} />
                           </Link>
                         )}
-                        {canCreateOrEditAsset && (
+                        {(canManage || (isLocationPicScoped && isAssetInMyPicLocation(a, assignedPicLocations, firebaseUser?.uid))) && (
                           <Link
                             href={`/assets/${a.id}/edit`}
                             title="Edit Asset"
@@ -974,7 +1013,7 @@ export default function AssetsPage() {
                       {isFinanceComplete(a) ? "Edit Finance" : "Lengkapi Finance"}
                     </Link>
                   )}
-                  {canCreateOrEditAsset && (
+                  {(canManage || (isLocationPicScoped && isAssetInMyPicLocation(a, assignedPicLocations, firebaseUser?.uid))) && (
                     <Link
                       href={`/assets/${a.id}/edit`}
                       className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
@@ -1024,6 +1063,8 @@ export default function AssetsPage() {
           onClose={() => setBulkModalOpen(false)}
         />
       )}
+
+      <Toast toast={pageToast} onClose={() => setPageToast(null)} />
     </ProtectedLayout>
   );
 }

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
+  addDoc,
   collection,
   doc,
   getDoc,
@@ -36,7 +37,7 @@ import {
   writeAssetLog,
 } from "@/lib/firestore-helpers";
 import { buildChangeMessage, buildChangeSummary, createAssetNotification } from "@/lib/notifications";
-import { buildFullPath, getDescendantIds, resolveAreaPic, resolveLocationSelectionForNode } from "@/lib/locations";
+import { buildFullPath, getDescendantIds, resolveAreaPic } from "@/lib/locations";
 import {
   ASSET_STATUS_HELPER,
   ASSET_STATUS_LABEL,
@@ -52,7 +53,6 @@ import Toggle from "@/components/Toggle";
 import CurrencyInput from "@/components/CurrencyInput";
 import SearchableSelect, { SearchableSelectItem } from "@/components/SearchableSelect";
 import LocationCascadeFields, { LocationSelection } from "@/components/LocationCascadeFields";
-import PicLocationField from "@/components/PicLocationField";
 import FileUploadField from "@/components/FileUploadField";
 import { Toast, ToastState } from "@/components/Toast";
 
@@ -341,12 +341,6 @@ export default function EditAssetPage() {
     });
   }, [isLocationPicRole, myPicLocations, selectedPicLocationId, form.areaId, form.roomId, form.floorId, form.buildingId]);
 
-  const handlePicLocationSelect = (nodeId: string) => {
-    setSelectedPicLocationId(nodeId);
-    if (!nodeId) return;
-    handleLocationSelectionChange(resolveLocationSelectionForNode(locations, nodeId));
-  };
-
   const category = useMemo(
     () => categories.find((c) => c.id === form.categoryId),
     [categories, form.categoryId]
@@ -460,6 +454,189 @@ export default function EditAssetPage() {
       } finally {
         setSaving(false);
       }
+    }
+
+    // Section 1/2/3 — PIC Lokasi HANYA boleh mengubah data fisik + PIC
+    // Operasional/Custodian aset di lokasinya sendiri (lihat
+    // firestore.rules isLocationPicAssetUpdate) — jalur submit ini WAJIB
+    // terpisah dan mengirim payload MINIMAL (bukan seluruh object aset
+    // lewat spread data lama) supaya tidak pernah mengirim field
+    // locationId/finance/status peminjaman/kendala yang bikin updateDoc
+    // kena "Missing or insufficient permissions".
+    if (isLocationPicRole && role !== "super_admin" && role !== "asset_admin") {
+      if (!isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid)) {
+        setError("Anda hanya dapat mengelola asset pada lokasi yang menjadi tanggung jawab Anda.");
+        return;
+      }
+      if (!form.assetName?.trim()) {
+        setFieldErrors({ assetName: "Nama aset wajib diisi." });
+        setError("Lengkapi field yang wajib diisi.");
+        return;
+      }
+      // Section 4 — aset dengan PIC Operasional ("assigned_pic") WAJIB
+      // punya PIC/Custodian terisi; aset bersama ("shared_borrowable")
+      // boleh kosong. "fixed_location" tidak pernah punya custodian sama
+      // sekali (di luar validasi ini).
+      if (trackingMode === "assigned_pic" && !form.responsiblePersonUid) {
+        setFieldErrors({ responsiblePersonUid: "Pilih PIC/Custodian untuk aset tetap." });
+        setError("Pilih PIC/Custodian untuk aset tetap.");
+        return;
+      }
+
+      setSaving(true);
+      setError("");
+      setFieldErrors({});
+
+      const currentUserUid = firebaseUser?.uid || assetUser?.uid || "";
+      const currentUserName = assetUser?.name || firebaseUser?.email || "";
+      const currentUserEmail = firebaseUser?.email || "";
+      // Section 1/3 — trackingMode BARU (dari dropdown, bukan asset.trackingMode
+      // lama) — inilah bug yang diperbaiki: cabang PIC Lokasi sebelumnya
+      // TIDAK PERNAH mengirim trackingMode/trackingModeLabel sama sekali,
+      // jadi perubahan di dropdown selalu hilang begitu disimpan.
+      const custodianName =
+        trackingMode === "fixed_location" ? null : responsiblePerson?.name || form.responsiblePersonName || null;
+      const custodianEmail =
+        trackingMode === "fixed_location" ? null : responsiblePerson?.email || form.responsiblePersonEmail || null;
+      const custodianUid = trackingMode === "fixed_location" ? null : form.responsiblePersonUid || null;
+
+      const updatePayload = {
+        assetName: form.assetName?.trim(),
+        subCategory: form.subCategory || "",
+        brand: form.brand || "",
+        model: form.model || "",
+        serialNumber: form.serialNumber || "",
+        imei: form.imei || "",
+        description: form.description || "",
+
+        photoUrl: form.photoUrl || null,
+        photoThumbnailUrl: form.photoThumbnailUrl || null,
+        photoFileName: form.photoFileName || null,
+        photoDriveFileId: form.photoDriveFileId || null,
+        photoMimeType: form.photoMimeType || null,
+        photoSize: form.photoSize ?? null,
+        photoUploadedAt: form.photoUploadedAt || null,
+
+        trackingMode,
+        trackingModeLabel: TRACKING_MODE_LABEL[trackingMode],
+
+        responsiblePersonUid: custodianUid,
+        responsiblePersonName: custodianName || "",
+        responsiblePersonEmail: custodianEmail || "",
+        responsiblePersonDivision:
+          trackingMode === "fixed_location" ? "" : responsiblePerson?.divisionName || form.responsiblePersonDivision || "",
+        responsiblePersonJobTitle:
+          trackingMode === "fixed_location" ? "" : responsiblePerson?.roleLabel || form.responsiblePersonJobTitle || "",
+
+        custodianUid,
+        custodianName,
+        custodianEmail,
+        custodianEmployeeId: null,
+        custodianDivision:
+          trackingMode === "fixed_location" ? null : responsiblePerson?.divisionName || form.responsiblePersonDivision || null,
+        custodianRole:
+          trackingMode === "fixed_location" ? null : responsiblePerson?.roleLabel || form.custodianRole || null,
+        custodianCompanyId: null,
+        custodianCompanyName: trackingMode === "fixed_location" ? null : responsiblePerson?.brandName || null,
+
+        // Section 2 — PIC Operasional dan PIC/Custodian dipilih lewat satu
+        // picker yang sama (belum ada picker terpisah di UI), jadi field
+        // operationalPic* diisi dari sumber data yang sama dengan custodian*
+        // supaya konsisten dan tidak kosong.
+        operationalPicUid: form.responsiblePersonUid || null,
+        operationalPicName: responsiblePerson?.name || form.responsiblePersonName || null,
+        operationalPicEmail: responsiblePerson?.email || form.responsiblePersonEmail || null,
+        operationalPicEmployeeId: null,
+        operationalPicDivision: responsiblePerson?.divisionName || form.responsiblePersonDivision || null,
+        operationalPicCompanyId: null,
+        operationalPicCompanyName: responsiblePerson?.brandName || null,
+
+        picUid: custodianUid,
+        picName: custodianName,
+        picEmail: custodianEmail,
+
+        accessories: form.accessories || "",
+        operationalNotes: form.operationalNotes || "",
+
+        updatedAt: serverTimestamp(),
+        updatedByUid: currentUserUid,
+        updatedByName: currentUserName,
+        updatedByEmail: currentUserEmail,
+      };
+
+      console.info("[Asset Custodian Submit]", {
+        assetId: asset.id,
+        locationId: asset.locationId,
+        currentUserUid: firebaseUser?.uid,
+        payloadKeys: Object.keys(updatePayload),
+        updatePayload,
+      });
+
+      const custodianChanged = custodianUid !== (asset.custodianUid || null);
+      const logAction = custodianChanged ? "asset_custodian_updated" : "asset_updated_by_location_pic";
+
+      try {
+        await updateDoc(doc(db, "assets", asset.id), updatePayload);
+
+        // Section 5 — baca ulang dokumen aset SETELAH update berhasil,
+        // supaya kalau user tetap di halaman ini (sebelum redirect selesai)
+        // state lokal `asset`/`form` sudah menampilkan nilai terbaru, bukan
+        // snapshot lama dari sebelum submit.
+        try {
+          const freshSnap = await getDoc(doc(db, "assets", asset.id));
+          if (freshSnap.exists()) {
+            const freshData = { id: freshSnap.id, ...freshSnap.data() } as Asset;
+            setAsset(freshData);
+            setForm(freshData);
+          }
+        } catch (refreshErr) {
+          console.warn("[Asset Custodian Submit] gagal baca ulang dokumen aset (non-fatal)", refreshErr);
+        }
+
+        // Section 5/10 — activity log TERPISAH, tidak boleh menggagalkan
+        // update aset yang sudah berhasil kalau gagal ditulis. Ditulis DUA
+        // kali: ke asset_logs (supaya muncul di "Log Aktivitas" halaman
+        // Detail Aset, yang membaca collection ini) dan ke
+        // asset_activity_logs (izin khusus PIC Lokasi di firestore.rules).
+        try {
+          await writeAssetLog({
+            assetId: asset.id,
+            assetName: form.assetName || asset.assetName,
+            assetCode: asset.assetCode,
+            action: logAction,
+            userUid: currentUserUid,
+            userName: currentUserName,
+            detail: "Diperbarui oleh PIC Lokasi",
+          });
+        } catch (logError) {
+          console.warn("[Asset Custodian Submit] asset_logs gagal, perubahan aset tetap berhasil", logError);
+        }
+        try {
+          await addDoc(collection(db, "asset_activity_logs"), {
+            assetId: asset.id,
+            locationId: asset.locationId || null,
+            actorUid: currentUserUid,
+            createdByUid: currentUserUid,
+            action: logAction,
+            createdAt: serverTimestamp(),
+          });
+        } catch (logError) {
+          console.warn(
+            "[Asset Custodian Submit] asset_activity_logs gagal, perubahan aset tetap berhasil",
+            logError
+          );
+        }
+
+        setToast({ type: "success", message: "Perubahan aset berhasil disimpan." });
+        router.push(`/assets/${asset.id}`);
+      } catch (err) {
+        console.error("[Asset Custodian Submit ERROR]", err);
+        setError("Gagal menyimpan perubahan.");
+        setToast({ type: "error", message: "Gagal menyimpan perubahan." });
+      } finally {
+        setSaving(false);
+      }
+      return;
     }
 
     const errors: Record<string, string> = {};
@@ -837,6 +1014,20 @@ export default function EditAssetPage() {
     );
   }
 
+  // Section 4 — PIC Lokasi di luar scope: TOLAK render form sama sekali
+  // (bukan cuma toast + redirect tertunda 1.2 detik lewat useEffect di atas
+  // — selama itu form tetap bisa diisi/disubmit). Guard ini langsung
+  // mengganti seluruh halaman dengan pesan penolakan.
+  if ((role === "location_pic" || isPicViaLocations) && !isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid)) {
+    return (
+      <ProtectedLayout>
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-6 text-center text-sm text-amber-800">
+          Anda hanya dapat mengelola asset pada lokasi yang menjadi tanggung jawab Anda.
+        </div>
+      </ProtectedLayout>
+    );
+  }
+
   const photoValue = form.photoUrl
     ? {
         url: form.photoUrl,
@@ -1021,12 +1212,16 @@ export default function EditAssetPage() {
                     </p>
                   )}
                   {isLocationPicRole ? (
-                    <PicLocationField
-                      assignedPicLocations={myPicLocations}
-                      locations={locations}
-                      selectedLocationId={selectedPicLocationId}
-                      onSelectLocation={handlePicLocationSelect}
-                    />
+                    // Section 1/2/4 — lokasi aset TIDAK BISA diubah lewat
+                    // Edit Aset oleh PIC Lokasi (locationId immutable di
+                    // firestore.rules isLocationPicAssetUpdate) — tampilkan
+                    // read-only, bukan picker yang bisa dipilih ulang.
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-700">
+                      {asset.locationText || asset.location || "-"}
+                      <p className="mt-1 text-xs text-slate-400">
+                        Lokasi aset tidak dapat diubah dari sini. Hubungi Asset Admin/QHSE untuk memindahkan aset.
+                      </p>
+                    </div>
                   ) : (
                     <LocationCascadeFields
                       locations={scopedLocations}

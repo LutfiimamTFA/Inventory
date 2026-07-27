@@ -23,11 +23,7 @@ export default function PicLocationField({
   onSelectLocation: (id: string) => void;
 }) {
   if (assignedPicLocations.length === 0) {
-    return (
-      <p className="text-xs text-amber-600">
-        Anda belum ditetapkan sebagai PIC lokasi manapun — hubungi Asset Admin/QHSE.
-      </p>
-    );
+    return <p className="text-xs text-amber-600">Anda belum ditetapkan sebagai PIC lokasi.</p>;
   }
 
   const selection = selectedLocationId

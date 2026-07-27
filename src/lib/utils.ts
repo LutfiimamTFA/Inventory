@@ -1068,6 +1068,41 @@ export const NOTIFICATION_TYPE_LABEL: Record<NotificationType, string> = {
   system: "Sistem",
 };
 
+// Section 10 — label bahasa Indonesia untuk `action` mentah pada dokumen
+// `asset_logs` (Log Aktivitas di halaman Detail Aset) — sebelumnya kode
+// action ditampilkan mentah (mis. "asset_custodian_updated") langsung ke
+// UI. Dipakai lewat getAssetLogActionLabel() supaya action baru yang belum
+// terdaftar tetap tampil rapi (fallback: underscore -> spasi + kapital),
+// bukan error atau kosong.
+export const ASSET_LOG_ACTION_LABEL: Record<string, string> = {
+  create: "Aset dibuat",
+  update: "Data aset diperbarui",
+  deactivate: "Aset dinonaktifkan",
+  custodian_changed: "PIC/Custodian aset diubah",
+  borrow: "Aset dipinjam",
+  return: "Aset dikembalikan",
+  status_repaired: "Status aset diperbaiki",
+  temporary_handover: "Aset diserahkan sementara",
+  temporary_returned: "Aset dikembalikan dari pemakaian sementara",
+  asset_created_by_location_pic: "Aset dibuat oleh PIC Lokasi",
+  asset_updated_by_location_pic: "Data aset diperbarui oleh PIC Lokasi",
+  asset_custodian_updated: "PIC/Custodian aset diperbarui",
+  operational_pic_updated: "PIC Operasional diperbarui",
+  asset_borrowed: "Aset dipinjam",
+  asset_returned: "Aset dikembalikan",
+  asset_issue_reported: "Kendala aset dilaporkan",
+};
+
+export function getAssetLogActionLabel(action: string | null | undefined): string {
+  if (!action) return "-";
+  if (ASSET_LOG_ACTION_LABEL[action]) return ASSET_LOG_ACTION_LABEL[action];
+  return action
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
 export const NOTIFICATION_PRIORITY_COLOR: Record<NotificationPriority, string> = {
   low: "bg-slate-100 text-slate-600 border-slate-200",
   medium: "bg-amber-50 text-amber-700 border-amber-200",

@@ -58,6 +58,17 @@ export function cleanFirestoreData(value: unknown): unknown {
   return value;
 }
 
+// Section 7 — SATU fungsi format kode aset, dipakai di generateAssetCode
+// DAN di fallback pemanggilnya (assets/new/page.tsx) — supaya nomor urut
+// SELALU melalui padStart(4, "0") yang sama dan tidak pernah digabung
+// manual dengan digit tambahan (akar bug "AST-EL-2026-00031" vs
+// "AST-EL-2026-0003": dua kode dengan panjang digit berbeda untuk aset
+// yang dibuat dari klik submit ganda pada permintaan yang sama).
+export function formatAssetCode(categoryCode: string, year: number, sequence: number): string {
+  const codePart = normalizeCategoryCodePart(categoryCode) || "GEN";
+  return `AST-${codePart}-${year}-${String(sequence).padStart(4, "0")}`;
+}
+
 // Format: AST-[KODE_KATEGORI]-[TAHUN]-[NOMOR_URUT] mis. AST-LAP-2026-0001
 export async function generateAssetCode(categoryCode: string): Promise<string> {
   const codePart = normalizeCategoryCodePart(categoryCode) || "GEN";
@@ -67,11 +78,11 @@ export async function generateAssetCode(categoryCode: string): Promise<string> {
   const q = query(
     collection(db, "assets"),
     where("assetCode", ">=", prefix),
-    where("assetCode", "<", prefix + "")
+    where("assetCode", "<", prefix + "\uF8FF")
   );
   const snap = await getDocs(q);
   const sequence = snap.size + 1;
-  return `${prefix}${String(sequence).padStart(4, "0")}`;
+  return formatAssetCode(categoryCode, year, sequence);
 }
 
 export async function isAssetCodeTaken(
