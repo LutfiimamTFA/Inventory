@@ -1,273 +1,153 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import Papa from "papaparse";
-import * as XLSX from "xlsx";
-import {
-  collection,
-  onSnapshot,
-  serverTimestamp,
-  writeBatch,
-  doc,
-} from "firebase/firestore";
-import { UploadCloud, CheckCircle2, AlertCircle } from "lucide-react";
-import { db } from "@/lib/firebase";
+import { useState } from "react";
+import { Download, UploadCloud, RefreshCw, Hash, Tags } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
-import { AssetCategory } from "@/lib/types";
-import { generateAssetCode } from "@/lib/firestore-helpers";
+import { downloadTemplateXlsx } from "@/lib/import/excel";
+import { PhotoSyncHandoff } from "@/lib/import/asset-photo-sync";
 import ProtectedLayout from "@/components/ProtectedLayout";
 import PageHeader from "@/components/PageHeader";
+import ImportNewAssetsTab from "@/components/bulk-upload/ImportNewAssetsTab";
+import SyncPhotosTab from "@/components/bulk-upload/SyncPhotosTab";
+import SyncAssetNumberTab from "@/components/bulk-upload/SyncAssetNumberTab";
+import SyncCategoryTab from "@/components/bulk-upload/SyncCategoryTab";
 
-interface Row {
-  assetName?: string;
-  categoryName?: string;
-  brand?: string;
-  model?: string;
-  serialNumber?: string;
-  location?: string;
-  companyOwnerName?: string;
-  divisionOwnerName?: string;
-  ownershipStatus?: string;
-  purchasePrice?: string;
-  condition?: string;
-  isBorrowable?: string;
-  _valid?: boolean;
-  _error?: string;
-}
+type TabKey = "import" | "sync" | "sync-number" | "sync-category";
 
-const REQUIRED_COLUMNS = ["assetName", "categoryName"];
+const TABS: { key: TabKey; label: string; icon: typeof UploadCloud; description: string; financeAllowed: boolean }[] = [
+  {
+    key: "import",
+    label: "Import Aset Baru",
+    icon: UploadCloud,
+    description: "Gunakan untuk memasukkan data aset baru secara massal dari Excel.",
+    financeAllowed: true,
+  },
+  {
+    key: "sync",
+    label: "Sinkronkan Foto Excel",
+    icon: RefreshCw,
+    description:
+      "Gunakan untuk mengambil foto dari Excel dan memasangkannya ke aset yang sudah ada berdasarkan Kode Aset.",
+    financeAllowed: true,
+  },
+  {
+    key: "sync-number",
+    label: "Sinkronkan No. Aset",
+    icon: Hash,
+    description:
+      "Gunakan untuk mengisi No. Aset pada data yang sudah lebih dulu diimport, dicocokkan lewat Kode Aset.",
+    financeAllowed: true,
+  },
+  {
+    key: "sync-category",
+    label: "Sinkronkan Kategori",
+    icon: Tags,
+    description:
+      "Gunakan untuk merapikan Kategori Aset pada data yang sudah lebih dulu diimport, dicocokkan lewat Kode Aset.",
+    // Section "Kategori Aset ikuti Master Kategori" — Asset Finance TIDAK
+    // punya izin mengubah categoryId/categoryName di Firestore rules
+    // (kategori bukan data finansial, tetap milik Asset Admin/Super Admin),
+    // jadi tab ini disembunyikan untuk role tersebut supaya tidak nyoba
+    // sinkron lalu gagal permission.
+    financeAllowed: false,
+  },
+];
 
 export default function BulkUploadPage() {
-  const { firebaseUser, assetUser, role, loading } = useAuth();
+  const { role, loading, firebaseUser, assetUser } = useAuth();
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
-  const [categories, setCategories] = useState<AssetCategory[]>([]);
-  const [rows, setRows] = useState<Row[]>([]);
-  const [fileName, setFileName] = useState("");
-  const [importing, setImporting] = useState(false);
-  const [done, setDone] = useState(false);
+  // Section "Rombak permission Asset" — Asset Finance sekarang juga boleh
+  // Import Aset (termasuk Sinkronkan Foto/No. Aset, satu gate yang sama
+  // untuk ketiga tab, lihat ticket poin 26). Preview/payload finance-nya
+  // sendiri tetap role-aware di dalam masing-masing tab.
+  const canImport = role === "super_admin" || role === "asset_admin" || role === "asset_finance";
+  const visibleTabs = TABS.filter((t) => role !== "asset_finance" || t.financeAllowed);
+  const [tab, setTab] = useState<TabKey>("import");
+  // Handoff dari tab Import ketika sheet+company yang dipilih sudah pernah
+  // diimport — file/sheet/company dibawa ke tab Sinkronkan Foto TANPA user
+  // upload/pilih ulang (lihat ImportNewAssetsTab -> onNeedPhotoSync).
+  const [syncHandoff, setSyncHandoff] = useState<PhotoSyncHandoff | null>(null);
 
-  useEffect(() => {
-    if (!authReady) return;
-    const unsub = onSnapshot(
-      collection(db, "asset_categories"),
-      (snap) => {
-        console.log("[BulkUploadPage Listener] asset_categories success:", snap.size);
-        setCategories(
-          snap.docs.map((d) => ({ id: d.id, ...d.data() } as AssetCategory))
-        );
-      },
-      (error) => {
-        console.error("[BulkUploadPage Listener] asset_categories error:", error);
-      }
+  if (!canImport && authReady) {
+    return (
+      <ProtectedLayout>
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-6 text-center text-sm text-amber-800">
+          Halaman Import Aset hanya bisa diakses oleh Super Admin, Asset Admin, dan Asset Finance.
+        </div>
+      </ProtectedLayout>
     );
-    return () => unsub();
-  }, [authReady]);
+  }
 
-  const validateRows = (parsed: Row[]) =>
-    parsed.map((r) => {
-      const missing = REQUIRED_COLUMNS.filter(
-        (c) => !r[c as keyof Row] || String(r[c as keyof Row]).trim() === ""
-      );
-      const categoryExists = categories.some(
-        (c) => c.categoryName.toLowerCase() === (r.categoryName || "").toLowerCase()
-      );
-      if (missing.length > 0) {
-        return { ...r, _valid: false, _error: `Kolom wajib kosong: ${missing.join(", ")}` };
-      }
-      if (!categoryExists) {
-        return { ...r, _valid: false, _error: `Kategori "${r.categoryName}" tidak ditemukan` };
-      }
-      return { ...r, _valid: true, _error: "" };
-    });
-
-  const handleFile = (file: File) => {
-    setFileName(file.name);
-    setDone(false);
-    const ext = file.name.split(".").pop()?.toLowerCase();
-    if (ext === "csv") {
-      Papa.parse<Row>(file, {
-        header: true,
-        skipEmptyLines: true,
-        complete: (res) => setRows(validateRows(res.data)),
-      });
-    } else {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const wb = XLSX.read(e.target?.result, { type: "binary" });
-        const sheet = wb.Sheets[wb.SheetNames[0]];
-        const json = XLSX.utils.sheet_to_json<Row>(sheet);
-        setRows(validateRows(json));
-      };
-      reader.readAsBinaryString(file);
-    }
-  };
-
-  const validRows = rows.filter((r) => r._valid);
-
-  const MAX_OPS_PER_BATCH = 450;
-  const isImportingRef = useRef(false);
-
-  const handleImport = async () => {
-    if (validRows.length === 0) return;
-    if (isImportingRef.current) {
-      console.debug("[Bulk Upload] import skipped because already running");
-      return;
-    }
-    isImportingRef.current = true;
-    setImporting(true);
-    try {
-      // generateAssetCode menghitung berdasarkan data yang sudah tersimpan di
-      // Firestore, jadi untuk baris-baris dalam kategori yang sama pada satu
-      // proses import ini, urutan nomor berikutnya di-increment secara lokal
-      // agar tidak saling bentrok sebelum batch di-commit.
-      const nextSequence: Record<string, number> = {};
-      const docs: { ref: ReturnType<typeof doc>; data: Record<string, unknown> }[] = [];
-
-      for (const r of validRows) {
-        const category = categories.find(
-          (c) => c.categoryName.toLowerCase() === (r.categoryName || "").toLowerCase()
-        );
-        const categoryCode = category?.categoryCode || "GEN";
-        let assetCode = await generateAssetCode(categoryCode);
-        const prefix = assetCode.slice(0, assetCode.lastIndexOf("-") + 1);
-        if (nextSequence[prefix] !== undefined) {
-          assetCode = `${prefix}${String(nextSequence[prefix]).padStart(4, "0")}`;
-          nextSequence[prefix] += 1;
-        } else {
-          const seq = Number(assetCode.slice(prefix.length));
-          nextSequence[prefix] = seq + 1;
-        }
-        docs.push({
-          ref: doc(collection(db, "assets")),
-          data: {
-            assetName: r.assetName,
-            assetCode,
-            categoryId: category?.id || "",
-            categoryName: category?.categoryName || r.categoryName,
-            brand: r.brand || "",
-            model: r.model || "",
-            serialNumber: r.serialNumber || "",
-            location: r.location || "",
-            companyOwnerName: r.companyOwnerName || "",
-            divisionOwnerName: r.divisionOwnerName || "",
-            ownershipStatus: r.ownershipStatus || "Aset Perusahaan",
-            purchasePrice: r.purchasePrice ? Number(r.purchasePrice) : null,
-            assetStatus: "available",
-            condition: r.condition || "good",
-            isBorrowable: String(r.isBorrowable).toLowerCase() !== "false",
-            requiresApproval: false,
-            qrCodeValue: assetCode,
-            currentBorrowingId: null,
-            currentBorrowerUid: null,
-            currentBorrowerName: null,
-            createdByUid: assetUser?.uid,
-            createdByName: assetUser?.name,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          },
-        });
-      }
-
-      // Firestore membatasi maksimal ~500 operasi per batch. Pecah jadi
-      // beberapa batch dan commit berurutan (bukan Promise.all) supaya tidak
-      // ada beberapa write batch berjalan bersamaan.
-      for (let i = 0; i < docs.length; i += MAX_OPS_PER_BATCH) {
-        const chunk = docs.slice(i, i + MAX_OPS_PER_BATCH);
-        const batch = writeBatch(db);
-        chunk.forEach(({ ref, data }) => batch.set(ref, data));
-        await batch.commit();
-      }
-
-      setDone(true);
-      setRows([]);
-    } finally {
-      setImporting(false);
-      isImportingRef.current = false;
-    }
-  };
+  const activeTab = visibleTabs.find((t) => t.key === tab) || visibleTabs[0];
 
   return (
     <ProtectedLayout>
       <PageHeader
-        title="Bulk Upload Aset"
-        subtitle="Import banyak aset sekaligus dari file CSV atau Excel."
+        title="Import Aset"
+        subtitle="Import data aset massal dari Excel, atau sinkronkan foto Excel ke aset yang sudah ada."
+        actions={
+          <button
+            type="button"
+            onClick={downloadTemplateXlsx}
+            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+          >
+            <Download size={15} />
+            Download Template Excel
+          </button>
+        }
       />
 
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 mb-5">
-        <label className="file-drop py-12">
-          <UploadCloud className="text-slate-400" size={30} />
-          <span className="text-sm font-medium text-slate-600">
-            Klik untuk upload file CSV atau Excel (.xlsx)
-          </span>
-          <span className="text-xs text-slate-400">
-            Kolom minimal: assetName, categoryName
-          </span>
-          <input
-            type="file"
-            accept=".csv,.xlsx,.xls"
-            className="hidden"
-            onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
-          />
-        </label>
-        {fileName && (
-          <p className="text-xs text-slate-400 mt-3">File terpilih: {fileName}</p>
-        )}
-        {done && (
-          <p className="text-sm text-emerald-600 mt-2 inline-flex items-center gap-1.5 font-medium">
-            <CheckCircle2 size={15} /> Import berhasil.
-          </p>
-        )}
+      <div className="mb-5 inline-flex flex-wrap rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+        {visibleTabs.map((t) => {
+          const Icon = t.icon;
+          const active = t.key === tab;
+          return (
+            <button
+              key={t.key}
+              type="button"
+              onClick={() => setTab(t.key)}
+              className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
+                active ? "bg-slate-900 text-white shadow" : "text-slate-600 hover:bg-slate-50"
+              }`}
+            >
+              <Icon size={15} />
+              {t.label}
+            </button>
+          );
+        })}
       </div>
 
-      {rows.length > 0 && (
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
-          <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-            <h2 className="font-semibold text-slate-800">
-              Preview{" "}
-              <span className="text-slate-400 font-normal text-sm">
-                ({validRows.length}/{rows.length} valid)
-              </span>
-            </h2>
-            <button
-              onClick={handleImport}
-              disabled={importing || validRows.length === 0}
-              className="rounded-xl bg-gradient-to-r from-blue-600 to-teal-500 text-white px-4 py-2.5 text-sm font-medium hover:brightness-105 disabled:opacity-50 shadow-md shadow-blue-900/20"
-            >
-              {importing ? "Mengimpor..." : `Import ${validRows.length} Aset`}
-            </button>
-          </div>
-          <div className="overflow-x-auto max-h-96 overflow-y-auto rounded-xl border border-slate-100">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-slate-500 border-b border-slate-200 sticky top-0 bg-slate-50">
-                  <th className="px-3 py-2 font-semibold">Status</th>
-                  <th className="px-3 py-2 font-semibold">Nama Aset</th>
-                  <th className="px-3 py-2 font-semibold">Kategori</th>
-                  <th className="px-3 py-2 font-semibold">Lokasi</th>
-                  <th className="px-3 py-2 font-semibold">Catatan</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r, i) => (
-                  <tr key={i} className="border-b border-slate-100 last:border-0">
-                    <td className="px-3 py-2">
-                      {r._valid ? (
-                        <CheckCircle2 size={16} className="text-emerald-500" />
-                      ) : (
-                        <AlertCircle size={16} className="text-red-500" />
-                      )}
-                    </td>
-                    <td className="px-3 py-2">{r.assetName || "-"}</td>
-                    <td className="px-3 py-2">{r.categoryName || "-"}</td>
-                    <td className="px-3 py-2">{r.location || "-"}</td>
-                    <td className="px-3 py-2 text-red-500 text-xs">{r._error}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+      <p className="mb-5 text-sm text-slate-500">{activeTab.description}</p>
+
+      {tab === "sync" && (
+        <div className="mb-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs font-medium text-amber-800">
+          Fitur ini tidak membuat aset baru dan tidak mengubah data aset selain foto/bukti fisik.
         </div>
       )}
+      {tab === "sync-number" && (
+        <div className="mb-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs font-medium text-amber-800">
+          Fitur ini tidak membuat aset baru dan tidak mengubah data aset selain No. Aset.
+        </div>
+      )}
+      {tab === "sync-category" && (
+        <div className="mb-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs font-medium text-amber-800">
+          Fitur ini tidak membuat aset baru dan tidak mengubah data aset selain Kategori.
+        </div>
+      )}
+
+      {tab === "import" && (
+        <ImportNewAssetsTab
+          onNeedPhotoSync={(handoff) => {
+            setSyncHandoff(handoff);
+            setTab("sync");
+          }}
+        />
+      )}
+      {tab === "sync" && (
+        <SyncPhotosTab handoff={syncHandoff} onHandoffConsumed={() => setSyncHandoff(null)} />
+      )}
+      {tab === "sync-number" && <SyncAssetNumberTab />}
+      {tab === "sync-category" && <SyncCategoryTab />}
     </ProtectedLayout>
   );
 }

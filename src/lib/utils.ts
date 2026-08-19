@@ -35,6 +35,27 @@ export function formatCurrency(value?: number) {
   }).format(value);
 }
 
+// Dipakai label/axis chart (mis. Rekap Finance) — angka rupiah penuh
+// ("Rp150.000.000") kepanjangan buat di dalam bar/axis, jadi dipendekkan
+// jadi "Rp150 jt"/"Rp1,2 M". formatCurrency() di atas TETAP dipakai untuk
+// nilai persis (card, tabel, export) — fungsi ini HANYA untuk tampilan
+// ringkas di chart.
+export function formatCompactCurrency(value?: number): string {
+  if (!value) return "Rp0";
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000_000) {
+    const v = Math.round((value / 1_000_000_000) * 10) / 10;
+    return `Rp${String(v).replace(".", ",")} M`;
+  }
+  if (abs >= 1_000_000) {
+    return `Rp${Math.round(value / 1_000_000)} jt`;
+  }
+  if (abs >= 1_000) {
+    return `Rp${Math.round(value / 1_000)} rb`;
+  }
+  return `Rp${Math.round(value)}`;
+}
+
 const DATE_KEY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 // "YYYY-MM-DD" HARUS di-parse sebagai tanggal lokal, bukan lewat
@@ -1091,6 +1112,7 @@ export const ASSET_LOG_ACTION_LABEL: Record<string, string> = {
   asset_borrowed: "Aset dipinjam",
   asset_returned: "Aset dikembalikan",
   asset_issue_reported: "Kendala aset dilaporkan",
+  SYNC_ASSET_PHOTO_FROM_EXCEL: "Foto bukti fisik disinkronkan dari Excel",
 };
 
 export function getAssetLogActionLabel(action: string | null | undefined): string {

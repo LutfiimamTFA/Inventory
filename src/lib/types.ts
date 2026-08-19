@@ -46,10 +46,36 @@ export type FundingSource =
   | "Pembelian Pribadi Dialihkan ke Kantor"
   | "Lainnya";
 
+// Section Import Aset — asal-usul data aset. "excel_import" dipakai importer
+// bulk Excel (lihat lib/import/*); "manual" adalah default lama (aset yang
+// dibuat lewat form Tambah Aset/API lain, TERMASUK dokumen lama sebelum
+// field ini ada — treat absennya field ini sebagai "manual" di UI).
+export type AssetSource = "manual" | "excel_import";
+
+// "needs_review" HANYA dipakai importer bulk Excel — semua aset hasil import
+// belum punya PIC/custodian/verifikasi fisik sama sekali, jadi WAJIB direview
+// admin dulu sebelum dipakai di alur peminjaman/PIC. Field ini SENGAJA
+// terpisah dari assetStatus/verificationStatus supaya tidak "membajak" makna
+// status yang sudah dipakai alur QHSE/peminjaman lain.
+export type AssetOperationalStatus = "active" | "needs_review";
+
+// "Invoice" di Excel Label Aset cuma penanda Ada/Tidak Ada (bukan file) —
+// BEDA dari mekanisme upload invoiceFileUrl/invoiceDriveFileId Finance yang
+// sudah ada. Jangan pernah dipakai untuk menyimpulkan financeStatus.
+export type InvoiceStatus = "ada" | "tidak_ada" | "tidak_diketahui";
+
 export interface Asset {
   id: string;
   assetName: string;
   assetCode: string;
+  // "No. Aset" — angka urut TERPISAH dari assetCode (identifier utama
+  // sistem tetap assetCode, TIDAK PERNAH diganti/dihapus oleh field ini).
+  // Diisi dari kolom "No" Excel saat Import Aset Baru (dikonversi ke number,
+  // BUKAN dari nomor baris Excel) atau manual lewat Tambah/Edit Aset.
+  // null = belum ada nomor — jangan pernah diisi otomatis dari urutan
+  // database, dan TIDAK wajib unique secara global (lihat penggunaan di
+  // assets/page.tsx untuk sorting/pencarian).
+  assetNumber?: number | null;
   categoryId: string;
   categoryName: string;
   subCategory?: string;
@@ -137,6 +163,41 @@ export interface Asset {
   financeUpdatedAt?: unknown;
   financeUpdatedByUid?: string;
   financeUpdatedByName?: string;
+
+  // ── Import Aset (Excel) — field TAMBAHAN, tidak menggantikan field lama
+  // manapun. Diisi importer bulk (lihat lib/import/asset-row-mapper.ts) DAN
+  // bisa diisi manual lewat form Tambah/Edit Aset (section "Informasi
+  // Inventaris") supaya struktur data aset manual & hasil import sama. ──
+  inventoryNumber?: string; // "No" dari Excel — murni informasional
+  assetType?: string; // "Jenis Aset" mentah dari Excel (bisa beda dari categoryName kalau tidak match ke Master Kategori)
+  quantity?: number; // "Qty" — SATU dokumen aset bisa mewakili banyak unit fisik, jangan dipecah jadi banyak dokumen
+  acquisitionDate?: string; // "Tanggal Perolehan" (YYYY-MM-DD) — terpisah dari purchaseDate Finance
+  acquisitionPrice?: number; // "Harga Perolehan" — terpisah dari purchasePrice Finance
+  invoiceStatus?: InvoiceStatus; // "Invoice" (Ada/Tidak Ada) — status penanda, BUKAN file
+  locationRaw?: string; // teks "Lokasi" mentah dari Excel, selalu disimpan walau berhasil/tidak dicocokkan ke Master Lokasi
+  inventoryCondition?: string; // "Kondisi" apa adanya dari Excel (Baik/Rusak Ringan/Rusak Berat/Hilang/Perlu Pemeriksaan)
+  inventoryNotes?: string; // "Keterangan"
+  photoStatus?: string; // "Foto" — status/keterangan foto (Sudah/Belum Ditemukan/Dihapus), BUKAN URL foto
+  physicalEvidence?: string; // "Bukti Fisik Aset" (teks)
+  // URL proxy (/api/asset-files/{fileId}) untuk embedded image "Bukti Fisik
+  // Aset" yang diekstrak dari file Excel (lihat lib/import/excel-images.ts)
+  // ATAU diupload manual lewat Edit Aset — file-nya sendiri disimpan di
+  // Google Drive lewat pipeline uploadToDrive/-api/upload-drive yang SAMA
+  // dengan foto aset manual (BUKAN Firebase Storage). Field ini TERPISAH
+  // dari photoUrl (foto utama aset) dan dari photoStatus (cuma teks status,
+  // BUKAN file).
+  physicalEvidenceImages?: string[];
+  // Asal-usul isi physicalEvidenceImages SAAT INI — beda dari `source`
+  // (asal keseluruhan DOKUMEN aset). "excel_sync" = diisi lewat tab
+  // Sinkronkan Foto Excel (aset yang sudah lama ada, foto menyusul belakangan).
+  photoSource?: "manual" | "excel_import" | "excel_sync";
+  photoSyncedAt?: unknown;
+  photoSyncedByUid?: string;
+  photoSyncedByName?: string;
+  source?: AssetSource;
+  operationalStatus?: AssetOperationalStatus;
+  importBatchId?: string;
+  importRowNumber?: number; // baris Excel asli (untuk audit/trace ke error report)
 
   assetStatus: AssetStatus;
   condition: AssetCondition;
@@ -242,6 +303,11 @@ export interface Asset {
   createdByName: string;
   createdAt: unknown;
   updatedAt: unknown;
+  // Ditulis di semua alur create/edit aset (assets/new, assets/[id]/edit)
+  // tapi belum pernah dideklarasikan di sini sampai sekarang — field-nya
+  // memang sudah ada di dokumen Firestore.
+  updatedByUid?: string;
+  updatedByName?: string;
 
   // ── Verifikasi fisik aset (Aksi Cepat setelah Scan QR) ──────────────────
   // qrTagId = nomor tag fisik yang ditempel di badan aset (BEDA dari
@@ -322,6 +388,25 @@ export interface AssetCategory {
   updatedAt: unknown;
 }
 
+// Section Import Aset — riwayat/proteksi double-import. Satu dokumen per
+// percobaan import (file+sheet+company), dipakai bulk-upload untuk
+// memperingatkan user kalau sheet yang sama pernah diimport sebelumnya.
+export interface AssetImportBatch {
+  id: string;
+  fileName: string;
+  sheetName: string;
+  companyId: string;
+  companyName: string;
+  totalRows: number;
+  successRows: number;
+  warningRows: number;
+  errorRows: number;
+  duplicateRows: number;
+  importedAt: unknown;
+  importedByUid: string;
+  importedByName: string;
+}
+
 export type BorrowingStatus = "borrowed" | "returned" | "overdue";
 
 export interface AssetBorrowing {
@@ -372,6 +457,13 @@ export interface AssetLog {
   purpose?: string;
   expectedReturnAt?: string;
   note?: string;
+
+  // ── Riwayat Aktivitas / audit log field-level (diisi dari jalur Edit
+  // Aset umum — Finance/Asset Admin/Super Admin, lihat lib/assets/audit-log.ts)
+  editedByRole?: string;
+  changedFields?: string[];
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
 }
 
 export interface AssetUser {
@@ -424,6 +516,12 @@ export interface DriveUploadResult {
 export interface HrpDivision {
   id: string;
   name: string;
+  // Section "Perbaiki generator Kode Aset" — dibaca dari data HRP kalau ada
+  // (data.code/data.divisionCode), dipakai generator Kode Aset sebagai
+  // fallback kedua (setelah Kode Ruangan, sebelum Kode Gedung). Divisi
+  // bersumber dari collection eksternal HRP, jadi field ini opsional dan
+  // TIDAK dikelola dari Master Lokasi.
+  code?: string;
 }
 
 export interface EmployeeProfile {
@@ -1387,9 +1485,18 @@ export interface AssetLocationNode {
   buildingName?: string;
   buildingCode?: string;
   floorName?: string;
+  // Section "Perbaiki generator Kode Aset" — floorCode/roomCode/areaCode
+  // SEMUANYA opsional (beda dari buildingCode yang wajib+unik). Generator
+  // Kode Aset (lib/assets/asset-code-generator.ts) memprioritaskan
+  // roomCode kalau ada, baru fallback ke buildingCode — floorCode/areaCode
+  // belum dipakai generator saat ini, disiapkan untuk kebutuhan lain
+  // (mis. ditampilkan di Master Lokasi) tanpa memaksa semua level diisi.
+  floorCode?: string;
   roomName?: string;
+  roomCode?: string;
   roomFunction?: string;
   areaName?: string;
+  areaCode?: string;
 
   parentId: string | null;
   parentPath: string[];
@@ -1417,6 +1524,15 @@ export interface AssetLocationNode {
   createdByName: string;
   createdAt: unknown;
   updatedAt: unknown;
+
+  // Section "Sinkronkan Lokasi Lama" — teks lokasi lama dari Excel (mis.
+  // "CBDMS", "MR3", "R. Meeting Lt. 3") yang sudah DIKONFIRMASI user
+  // memetakan ke node Master Lokasi ini. Dipakai lib/import/location-match.ts
+  // supaya Import Aset BERIKUTNYA otomatis mengenali alias yang sama tanpa
+  // perlu mapping ulang. Boleh berisi beberapa variasi penulisan berbeda
+  // yang sengaja diarahkan ke node yang sama (bukan cuma variasi
+  // spasi/titik — itu sudah otomatis digabung lewat normalizeLegacyLocationAlias).
+  legacyAliases?: string[];
 }
 
 export type LocationPicLogAction =

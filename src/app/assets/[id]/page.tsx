@@ -38,7 +38,19 @@ import ConfirmModal from "@/components/ConfirmModal";
 import { useAuth } from "@/lib/auth-context";
 import { getResolvedPersonDisplay, useEmployeeDirectory } from "@/lib/employeeDirectory";
 import { fetchLocationPicSnapshot, isAssetInMyPicLocation } from "@/lib/locations";
-import { getAssetPhotoPreviewUrl } from "@/lib/assets/asset-status";
+import { getAssetPhotoPreviewUrl, getAssetInvoicePreviewUrl } from "@/lib/assets/asset-status";
+import {
+  getAssetNumber,
+  getAssetQuantity,
+  getAssetSourceLabel,
+  INVOICE_STATUS_LABEL,
+  OPERATIONAL_STATUS_COLOR,
+  PHOTO_SOURCE_LABEL,
+} from "@/lib/assets/inventory";
+import { diffAssetFields, getRoleLabel } from "@/lib/assets/audit-log";
+import InvoicePreviewModal from "@/components/InvoicePreviewModal";
+import EditFinanceModal from "@/components/EditFinanceModal";
+import ImageLightboxModal, { LightboxImage } from "@/components/ImageLightboxModal";
 import { Asset, AssetBorrowing, AssetIssueTicket, AssetLog, MaintenanceWorkOrder } from "@/lib/types";
 import {
   ASSET_USAGE_STATUS_COLOR,
@@ -82,6 +94,9 @@ export default function AssetDetailPage() {
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
   const [deactivateOpen, setDeactivateOpen] = useState(false);
   const [deactivating, setDeactivating] = useState(false);
+  const [invoicePreviewOpen, setInvoicePreviewOpen] = useState(false);
+  const [editFinanceOpen, setEditFinanceOpen] = useState(false);
+  const [evidenceLightbox, setEvidenceLightbox] = useState<{ images: LightboxImage[]; initialIndex: number } | null>(null);
 
   const [employeeOptions, setEmployeeOptions] = useState<EmployeeOption[]>([]);
   const [custodianModalOpen, setCustodianModalOpen] = useState(false);
@@ -349,6 +364,15 @@ export default function AssetDetailPage() {
   // ternyata link Drive mentah) — jangan langsung simpulkan "belum ada
   // foto" hanya karena satu field kosong.
   const photoImageSrc = getAssetPhotoPreviewUrl(asset);
+  const invoiceFileSrc = getAssetInvoicePreviewUrl(asset);
+  // Section Dokumentasi Aset — jangan tampilkan thumbnail yang SAMA dengan
+  // yang sudah ditampilkan di card "Foto Aset" (mis. hasil Sinkronkan Foto
+  // Excel yang otomatis jadi foto utama) — cukup sisanya (bukti fisik
+  // tambahan di luar foto utama), nomor label tetap pakai index ASLI supaya
+  // konsisten kalau dibuka di lightbox.
+  const additionalEvidenceImages = (asset.physicalEvidenceImages || [])
+    .map((url, index) => ({ url, index }))
+    .filter((item) => item.url !== photoImageSrc);
 
   const handleDeactivate = async () => {
     setDeactivating(true);
@@ -696,13 +720,90 @@ export default function AssetDetailPage() {
         <div className="lg:col-span-2 space-y-5">
           <Section title="Informasi Aset">
             <div className="grid sm:grid-cols-2 gap-x-4 gap-y-2 text-sm">
+              <Info label="No. Aset" value={getAssetNumber(asset) !== null ? String(getAssetNumber(asset)) : undefined} />
+              <Info label="Kode Aset" value={asset.assetCode} />
+              <Info label="Nama Aset" value={asset.assetName} />
               <Info label="Kategori" value={asset.categoryName} />
+              <Info label="Jenis Aset (Excel)" value={asset.assetType} />
               <Info label="Subkategori" value={asset.subCategory} />
+              <Info label="Qty" value={String(getAssetQuantity(asset))} />
               <Info label="Merk" value={asset.brand} />
               <Info label="Model" value={asset.model} />
+              <Info label="Brand / Perusahaan" value={asset.companyOwnerName} />
               <Info label="Serial Number" value={asset.serialNumber} />
               <Info label="IMEI" value={asset.imei} />
               <Info label="Deskripsi" value={asset.description} full />
+            </div>
+          </Section>
+
+          {/* Section — "Informasi Perolehan" umum HANYA menampilkan Tanggal
+              Perolehan (data inventaris fisik), TIDAK digerbang canViewFinance
+              karena bukan data finansial. Harga Perolehan & Status Invoice
+              dipindah sepenuhnya ke section "Finance / Bukti Pembelian" di
+              bawah (tetap canViewFinance-gated) — satu sumber data yang sama
+              (acquisitionPrice/invoiceStatus), bukan field baru. */}
+          <Section title="Informasi Perolehan">
+            <div className="grid sm:grid-cols-2 gap-x-4 gap-y-2 text-sm">
+              <Info label="Tanggal Perolehan" value={formatDate(asset.acquisitionDate || asset.purchaseDate)} />
+            </div>
+          </Section>
+
+          <Section title="Informasi Inventaris">
+            <div className="grid sm:grid-cols-2 gap-x-4 gap-y-2 text-sm">
+              <Info label="Lokasi" value={asset.locationText || asset.location || asset.locationRaw} />
+              <Info label="Kondisi" value={asset.inventoryCondition} />
+              <Info label="Keterangan" value={asset.inventoryNotes} full />
+            </div>
+          </Section>
+
+          <Section title="Dokumentasi Aset">
+            <div className="grid sm:grid-cols-2 gap-x-4 gap-y-2 text-sm mb-3">
+              <Info label="Status Foto" value={asset.photoStatus} />
+              <Info label="Bukti Fisik" value={asset.physicalEvidence} />
+              <Info label="Sumber Foto" value={asset.photoSource ? PHOTO_SOURCE_LABEL[asset.photoSource] : undefined} />
+              <Info label="Tanggal Sinkronisasi" value={formatDate(asset.photoSyncedAt)} />
+            </div>
+            {additionalEvidenceImages.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {additionalEvidenceImages.map(({ url, index }) => (
+                  <button
+                    key={url}
+                    type="button"
+                    onClick={() =>
+                      setEvidenceLightbox({
+                        images: (asset.physicalEvidenceImages || []).map((u, idx) => ({
+                          src: u,
+                          label: `Bukti Fisik ${idx + 1}`,
+                        })),
+                        initialIndex: index,
+                      })
+                    }
+                    className="h-20 w-20 overflow-hidden rounded-xl border border-slate-200 hover:opacity-80"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={url} alt={`Bukti fisik ${index + 1}`} className="h-full w-full object-cover" />
+                  </button>
+                ))}
+              </div>
+            ) : asset.physicalEvidenceImages && asset.physicalEvidenceImages.length > 0 ? (
+              <p className="text-sm text-slate-400">Foto bukti fisik sudah ditampilkan sebagai Foto Aset di samping.</p>
+            ) : (
+              <p className="text-sm text-slate-400">Belum ada foto bukti fisik.</p>
+            )}
+          </Section>
+
+          <Section title="Informasi Sistem">
+            <div className="grid sm:grid-cols-2 gap-x-4 gap-y-2 text-sm">
+              <Info label="Source Data" value={getAssetSourceLabel(asset)} />
+              {asset.operationalStatus === "needs_review" && (
+                <div className="sm:col-span-2">
+                  <Badge label="Perlu Review" colorClass={OPERATIONAL_STATUS_COLOR.needs_review} />
+                </div>
+              )}
+              <Info label="PIC" value={asset.areaPicName || asset.custodianName || undefined} />
+              <Info label="Status Penggunaan" value={asset.currentUsageStatusLabel} />
+              <Info label="Terakhir Diperbarui Oleh" value={asset.updatedByName} />
+              <Info label="Terakhir Diperbarui Pada" value={formatDate(asset.updatedAt)} />
             </div>
           </Section>
 
@@ -722,33 +823,37 @@ export default function AssetDetailPage() {
                 <div className="sm:col-span-2">
                   <Badge label={financeStatusBadge.label} colorClass={financeStatusBadge.colorClass} />
                 </div>
-                <Info label="Tanggal Pembelian" value={formatDate(asset.purchaseDate)} />
-                <Info label="Harga Beli" value={formatCurrency(asset.purchasePrice)} />
+                <Info label="Tanggal Perolehan" value={formatDate(asset.acquisitionDate || asset.purchaseDate)} />
+                <Info label="Harga Perolehan" value={formatCurrency(asset.acquisitionPrice ?? asset.purchasePrice)} />
+                <Info
+                  label="Status Invoice"
+                  value={asset.invoiceStatus ? INVOICE_STATUS_LABEL[asset.invoiceStatus] : undefined}
+                />
                 <Info label="Vendor" value={asset.vendorName} />
                 <Info label="Nomor Invoice" value={asset.invoiceNumber} />
                 <Info label="Sumber Dana" value={asset.fundingSource} />
                 <Info label="Metode Pembelian" value={asset.purchaseMethod} />
                 <Info label="Estimasi Umur" value={asset.estimatedUsefulLife} />
                 <Info label="Catatan Finance" value={asset.financeNotes} full />
-                {asset.invoiceFileUrl && (
+                {invoiceFileSrc && (
                   <div className="sm:col-span-2">
-                    <a
-                      href={asset.invoiceFileUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-sm text-blue-600 hover:underline"
+                    <button
+                      type="button"
+                      onClick={() => setInvoicePreviewOpen(true)}
+                      className="text-sm font-medium text-blue-600 hover:underline"
                     >
-                      Lihat file invoice
-                    </a>
+                      Lihat Invoice
+                    </button>
                   </div>
                 )}
-                <div className="sm:col-span-2 pt-2 border-t border-slate-100 mt-1">
-                  <Link
-                    href={`/assets/${asset.id}/edit`}
+                <div className="sm:col-span-2 flex flex-wrap gap-2 pt-2 border-t border-slate-100 mt-1">
+                  <button
+                    type="button"
+                    onClick={() => setEditFinanceOpen(true)}
                     className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
                   >
                     Edit Data Finance
-                  </Link>
+                  </button>
                 </div>
               </div>
             </Section>
@@ -803,21 +908,51 @@ export default function AssetDetailPage() {
             </Section>
           )}
 
-          <Section title="Log Aktivitas" anchorId="log-aktivitas">
+          {/* Section "Riwayat Aktivitas" — audit trail field-level tiap
+              perubahan (Finance/Asset Admin/Super Admin sama-sama lewat
+              sini). Tanggal/Jam | User | Role | Aktivitas | Perubahan —
+              Perubahan menampilkan SEMUA field yang benar-benar berubah
+              nilainya (before -> after), bukan cuma satu baris "updatedBy"
+              terakhir — histori seluruh perubahan tetap tersimpan karena
+              tiap edit jadi dokumen asset_logs baru, bukan overwrite. */}
+          <Section title="Riwayat Aktivitas" anchorId="log-aktivitas">
             {logs.length === 0 ? (
-              <EmptyState icon={HistoryIcon} title="Belum ada log aktivitas" />
+              <EmptyState icon={HistoryIcon} title="Belum ada riwayat aktivitas" />
             ) : (
               <div className="divide-y divide-slate-100">
-                {logs.map((l) => (
-                  <div key={l.id} className="text-sm py-3 first:pt-0 last:pb-0">
-                    <p className="text-slate-800">
-                      <span className="font-medium">{l.userName}</span> — {getAssetLogActionLabel(l.action)}
-                    </p>
-                    <p className="text-xs text-slate-400">
-                      {formatDate(l.timestamp)} {l.detail && `· ${l.detail}`}
-                    </p>
-                  </div>
-                ))}
+                {logs.map((l) => {
+                  const changes =
+                    l.changedFields && l.changedFields.length > 0
+                      ? diffAssetFields(l.before || {}, l.after || {}, l.changedFields)
+                      : [];
+                  return (
+                    <div key={l.id} className="text-sm py-3 first:pt-0 last:pb-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium text-slate-800">{l.userName}</span>
+                        {l.editedByRole && (
+                          <Badge
+                            label={getRoleLabel(l.editedByRole)}
+                            colorClass="bg-slate-100 text-slate-600 border-slate-200"
+                          />
+                        )}
+                        <span className="text-slate-500">{getAssetLogActionLabel(l.action)}</span>
+                      </div>
+                      <p className="mt-0.5 text-xs text-slate-400">{formatDate(l.timestamp)}</p>
+                      {changes.length > 0 ? (
+                        <ul className="mt-1.5 space-y-0.5">
+                          {changes.map((c) => (
+                            <li key={c.field} className="text-xs text-slate-600">
+                              <span className="font-medium text-slate-700">{c.label}</span>: &quot;{c.before}&quot; →{" "}
+                              &quot;{c.after}&quot;
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        l.detail && <p className="mt-1 text-xs text-slate-500">{l.detail}</p>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </Section>
@@ -1021,19 +1156,31 @@ export default function AssetDetailPage() {
 
           <Section title="Foto Aset">
             {photoImageSrc && !photoImgError ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={photoImageSrc}
-                alt={asset.photoFileName || "Foto asset"}
-                className="w-full rounded-xl object-cover"
-                onLoad={() => {
-                  console.log("[Asset Photo] berhasil dimuat", { assetId: asset.id, previewUrl: photoImageSrc });
-                }}
-                onError={() => {
-                  console.error("[Asset Photo] gagal dimuat dari proxy", { assetId: asset.id, previewUrl: photoImageSrc });
-                  setPhotoImgError(true);
-                }}
-              />
+              <button
+                type="button"
+                onClick={() =>
+                  setEvidenceLightbox({
+                    images: [{ src: photoImageSrc, label: asset.photoFileName || asset.assetName }],
+                    initialIndex: 0,
+                  })
+                }
+                className="block w-full cursor-zoom-in"
+                aria-label="Perbesar foto aset"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={photoImageSrc}
+                  alt={asset.photoFileName || "Foto asset"}
+                  className="w-full rounded-xl object-cover"
+                  onLoad={() => {
+                    console.log("[Asset Photo] berhasil dimuat", { assetId: asset.id, previewUrl: photoImageSrc });
+                  }}
+                  onError={() => {
+                    console.error("[Asset Photo] gagal dimuat dari proxy", { assetId: asset.id, previewUrl: photoImageSrc });
+                    setPhotoImgError(true);
+                  }}
+                />
+              </button>
             ) : (
               // Section 8 — BEDAKAN "belum pernah diunggah" (photoImageSrc
               // kosong) dari "gagal dimuat" (src ada tapi <img> error).
@@ -1089,9 +1236,6 @@ export default function AssetDetailPage() {
                 <Info label="Total Peminjaman" value={String(borrowings.length)} />
                 <Info label="Last Maintenance" value={formatDate(asset.lastMaintenanceAt)} />
                 <Info label="Next Maintenance" value={formatDate(asset.nextMaintenanceAt)} />
-                {canViewFinance && (
-                  <Info label="Total Nilai Beli" value={formatCurrency(asset.purchasePrice)} />
-                )}
               </div>
               <div className="flex gap-2">
                 <Link
@@ -1268,6 +1412,25 @@ export default function AssetDetailPage() {
           {usageError && <p className="text-sm text-red-600">{usageError}</p>}
         </div>
       </ConfirmModal>
+
+      <InvoicePreviewModal
+        open={invoicePreviewOpen}
+        asset={asset}
+        onClose={() => setInvoicePreviewOpen(false)}
+      />
+      <ImageLightboxModal
+        open={!!evidenceLightbox}
+        images={evidenceLightbox?.images || []}
+        initialIndex={evidenceLightbox?.initialIndex || 0}
+        title="Bukti Fisik Aset"
+        onClose={() => setEvidenceLightbox(null)}
+      />
+      <EditFinanceModal
+        open={editFinanceOpen}
+        asset={asset}
+        onClose={() => setEditFinanceOpen(false)}
+        onSaved={(t) => setToast(t)}
+      />
 
       <Toast toast={toast} onClose={() => setToast(null)} />
     </ProtectedLayout>

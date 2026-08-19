@@ -36,7 +36,9 @@ import MaintenanceReportTab from "@/components/reports/tabs/MaintenanceReportTab
 import BorrowingReportTab from "@/components/reports/tabs/BorrowingReportTab";
 import LocationReportTab from "@/components/reports/tabs/LocationReportTab";
 import CostReportTab from "@/components/reports/tabs/CostReportTab";
+import RecommendationReportTab from "@/components/reports/tabs/RecommendationReportTab";
 import ExportTab from "@/components/reports/tabs/ExportTab";
+import FinanceReportTab from "@/components/reports/tabs/FinanceReportTab";
 
 type TabKey =
   | "overview"
@@ -46,7 +48,8 @@ type TabKey =
   | "borrowing"
   | "location"
   | "cost"
-  | "export";
+  | "export"
+  | "finance";
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: "overview", label: "Overview" },
@@ -57,6 +60,18 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: "location", label: "Lokasi & Ruangan" },
   { key: "cost", label: "Cost & Recommendation" },
   { key: "export", label: "Export" },
+];
+
+// Section "Rekap Laporan Finance" — Finance TIDAK diberi akses baca
+// asset_maintenance_work_orders/asset_maintenance_work_order_items/
+// asset_issue_tickets (firestore.rules TETAP tidak diubah), jadi Finance
+// sama sekali tidak bisa dapat tab yang bergantung pada data itu (Asset
+// Health, Ticket Kendala, Maintenance, Borrowing/Location — semuanya
+// menerima props tickets/workOrders untuk hitung overdue/temuan). Satu tab
+// baru "Rekap Finance" (lihat FinanceReportTab) menggantikan semuanya,
+// dihitung murni dari assets/categories/borrowings.
+const FINANCE_TABS: { key: TabKey; label: string }[] = [
+  { key: "finance", label: "Rekap Finance" },
 ];
 
 export default function ReportsPage() {
@@ -86,6 +101,42 @@ export default function ReportsPage() {
   const [snapshotSaved, setSnapshotSaved] = useState(false);
   const canViewReports =
     authReady && (role === "super_admin" || role === "asset_admin" || role === "asset_finance");
+
+  // Section "Rekap Laporan Finance" — Finance TIDAK boleh membaca
+  // asset_maintenance_work_orders/asset_maintenance_work_order_items/
+  // asset_issue_tickets (rules collection itu TETAP tidak diubah), jadi
+  // query/listener-nya wajib berhenti untuk role ini, bukan cuma disembunyikan
+  // di UI — kalau tetap jalan, Firestore balas "Missing or insufficient
+  // permissions" persis seperti bug yang dilaporkan.
+  const isFinance = role === "asset_finance";
+  const canLoadMaintenanceReport =
+    authReady && (role === "super_admin" || role === "asset_admin" || role === "it_team");
+
+  // Section "Pemisahan data finance per role" — SATU-SATUNYA helper yang
+  // dipakai untuk memutuskan boleh/tidaknya melihat nominal Rupiah aset
+  // (Harga Perolehan, Total Nilai Asset, Invoice, Vendor, dst) di Reports.
+  // Asset Admin/QHSE/IT tetap boleh baca collection `assets` penuh untuk
+  // kebutuhan operasional (lokasi/kondisi/maintenance) — yang dibatasi di
+  // sini murni tampilan/agregasi finance-nya, BUKAN akses datanya.
+  const canViewFinanceData = role === "asset_finance" || role === "super_admin";
+
+  // Tab "Cost & Recommendation" berisi nominal Rupiah — untuk role yang
+  // tidak boleh lihat data finance, labelnya diganti "Recommendation" (isi
+  // tab-nya sendiri juga dikosongkan dari harga, lihat CostReportTab).
+  const visibleTabs = (isFinance ? FINANCE_TABS : TABS).map((t) =>
+    t.key === "cost" && !canViewFinanceData ? { ...t, label: "Recommendation" } : t
+  );
+  // "Adjust state during render" (bukan useEffect) — begitu role diketahui
+  // finance, activeTab yang defaultnya "overview" (tidak ada di FINANCE_TABS)
+  // langsung dipindah ke tab pertama yang valid untuk role ini.
+  const visibleTabKey = visibleTabs.map((t) => t.key).join(",");
+  const [prevVisibleTabKey, setPrevVisibleTabKey] = useState("");
+  if (visibleTabKey !== prevVisibleTabKey) {
+    setPrevVisibleTabKey(visibleTabKey);
+    if (!visibleTabs.some((t) => t.key === activeTab)) {
+      setActiveTab(visibleTabs[0].key);
+    }
+  }
 
   const handleIndexError = (label: string) => (err: unknown) => {
     console.error(`[Reports] error loading ${label}`, err);
@@ -122,7 +173,10 @@ export default function ReportsPage() {
   }, [canViewReports]);
 
   useEffect(() => {
-    if (!canViewReports) return;
+    // Finance TIDAK punya izin baca asset_issue_tickets — listener wajib
+    // tidak pernah dibuat untuk role ini (bukan cuma di-unsubscribe setelah
+    // error permission).
+    if (!canLoadMaintenanceReport) return;
     console.debug("[Reports] loading tickets");
     const unsub = onSnapshot(
       collection(db, "asset_issue_tickets"),
@@ -133,10 +187,12 @@ export default function ReportsPage() {
       handleIndexError("tickets")
     );
     return () => unsub();
-  }, [canViewReports]);
+  }, [canLoadMaintenanceReport]);
 
   useEffect(() => {
-    if (!canViewReports) return;
+    // Sama seperti tickets di atas — asset_maintenance_work_orders di luar
+    // izin baca Finance.
+    if (!canLoadMaintenanceReport) return;
     console.debug("[Reports] loading maintenance");
     const unsub = onSnapshot(
       collection(db, "asset_maintenance_work_orders"),
@@ -147,10 +203,13 @@ export default function ReportsPage() {
       handleIndexError("maintenance work orders")
     );
     return () => unsub();
-  }, [canViewReports]);
+  }, [canLoadMaintenanceReport]);
 
   useEffect(() => {
-    if (!canViewReports) return;
+    // collectionGroup("items") ada di bawah asset_maintenance_work_orders/
+    // {id}/items — subcollection yang sama, izin bacanya sama, jadi gate-nya
+    // juga canLoadMaintenanceReport (bukan canViewReports).
+    if (!canLoadMaintenanceReport) return;
     const unsub = onSnapshot(
       collectionGroup(db, "items"),
       (snap) => {
@@ -160,7 +219,7 @@ export default function ReportsPage() {
       handleIndexError("maintenance work order items")
     );
     return () => unsub();
-  }, [canViewReports]);
+  }, [canLoadMaintenanceReport]);
 
   useEffect(() => {
     if (!canViewReports) return;
@@ -283,15 +342,21 @@ export default function ReportsPage() {
         title="Reports & Analytics"
         subtitle="Analisis data asset untuk pengambilan keputusan."
         actions={
-          <button
-            type="button"
-            onClick={handleGenerateSnapshot}
-            disabled={snapshotSaving}
-            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium cursor-pointer hover:bg-slate-50 disabled:opacity-60"
-          >
-            <Camera size={15} />
-            {snapshotSaving ? "Menyimpan..." : snapshotSaved ? "Snapshot Tersimpan" : "Simpan Snapshot Bulanan"}
-          </button>
+          // Snapshot bulanan ikut menulis totalTickets/totalMaintenance —
+          // datanya sengaja tidak pernah dimuat untuk Finance, jadi tombol
+          // ini disembunyikan supaya Finance tidak menulis snapshot dengan
+          // angka Maintenance/Ticket yang keliru (selalu 0).
+          !isFinance && (
+            <button
+              type="button"
+              onClick={handleGenerateSnapshot}
+              disabled={snapshotSaving}
+              className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium cursor-pointer hover:bg-slate-50 disabled:opacity-60"
+            >
+              <Camera size={15} />
+              {snapshotSaving ? "Menyimpan..." : snapshotSaved ? "Snapshot Tersimpan" : "Simpan Snapshot Bulanan"}
+            </button>
+          )
         }
       />
 
@@ -301,24 +366,33 @@ export default function ReportsPage() {
         </p>
       )}
 
-      <ReportsFilterBar filters={filters} onChange={setFilters} assets={assets} categories={categories} />
+      {/* Rekap Finance punya filter global sendiri (Perusahaan/Tahun
+          Perolehan/Kategori) di dalam FinanceReportTab — lebih ringkas
+          daripada ReportsFilterBar (lokasi/PIC/dst tidak relevan buat
+          dashboard finance), jadi filter bar & tab bar role lain
+          disembunyikan untuk Finance (toh cuma ada 1 tab). */}
+      {!isFinance && (
+        <>
+          <ReportsFilterBar filters={filters} onChange={setFilters} assets={assets} categories={categories} />
 
-      <div className="flex items-center gap-1 mb-5 border-b border-slate-200 overflow-x-auto">
-        {TABS.map((t) => (
-          <button
-            key={t.key}
-            type="button"
-            onClick={() => setActiveTab(t.key)}
-            className={`px-4 py-2.5 text-sm font-medium whitespace-nowrap cursor-pointer border-b-2 -mb-px transition-colors ${
-              activeTab === t.key
-                ? "border-blue-600 text-blue-700"
-                : "border-transparent text-slate-500 hover:text-slate-700"
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+          <div className="flex items-center gap-1 mb-5 border-b border-slate-200 overflow-x-auto">
+            {visibleTabs.map((t) => (
+              <button
+                key={t.key}
+                type="button"
+                onClick={() => setActiveTab(t.key)}
+                className={`px-4 py-2.5 text-sm font-medium whitespace-nowrap cursor-pointer border-b-2 -mb-px transition-colors ${
+                  activeTab === t.key
+                    ? "border-blue-600 text-blue-700"
+                    : "border-transparent text-slate-500 hover:text-slate-700"
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
 
       {activeTab === "overview" && (
         <OverviewTab
@@ -340,9 +414,16 @@ export default function ReportsPage() {
       {activeTab === "location" && (
         <LocationReportTab assets={filteredAssets} tickets={filteredTickets} workOrders={filteredWorkOrders} />
       )}
-      {activeTab === "cost" && (
-        <CostReportTab assets={filteredAssets} tickets={filteredTickets} borrowings={filteredBorrowings} />
-      )}
+      {activeTab === "cost" &&
+        (canViewFinanceData ? (
+          <CostReportTab assets={filteredAssets} tickets={filteredTickets} borrowings={filteredBorrowings} />
+        ) : (
+          <RecommendationReportTab
+            assets={filteredAssets}
+            tickets={filteredTickets}
+            borrowings={filteredBorrowings}
+          />
+        ))}
       {activeTab === "export" && (
         <ExportTab
           assets={filteredAssets}
@@ -350,8 +431,10 @@ export default function ReportsPage() {
           workOrders={filteredWorkOrders}
           items={items}
           borrowings={filteredBorrowings}
+          canViewFinanceData={canViewFinanceData}
         />
       )}
+      {activeTab === "finance" && <FinanceReportTab assets={assets} />}
       </div>
     </ProtectedLayout>
   );

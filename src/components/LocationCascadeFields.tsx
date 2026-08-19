@@ -36,12 +36,17 @@ export default function LocationCascadeFields({
   onChange,
   size = "md",
   columns = 4,
+  errorLevel,
 }: {
   locations: AssetLocationNode[];
   value: LocationSelection;
   onChange: (next: LocationSelection) => void;
   size?: "md" | "sm";
   columns?: 2 | 4;
+  // Level MANA yang gagal validasi (Gedung/Lantai/Ruangan wajib; Area
+  // opsional jadi tidak pernah error) — dipakai border merah + scroll/focus
+  // target ("field-buildingId" dst, lihat AssetFieldErrorModal).
+  errorLevel?: "building" | "floor" | "room" | null;
 }) {
   const activeLocations = locations.filter((n) => n.status === "active");
 
@@ -78,6 +83,7 @@ export default function LocationCascadeFields({
           Gedung <span className="text-red-500">*</span>
         </label>
         <SearchableSelect
+          id="field-buildingId"
           items={buildingItems}
           value={value.buildingId}
           onChange={(id) => {
@@ -91,6 +97,7 @@ export default function LocationCascadeFields({
           placeholder="Pilih gedung"
           searchPlaceholder="Cari gedung..."
           emptyText="Belum ada data Gedung di Master Lokasi."
+          error={errorLevel === "building"}
         />
       </div>
       <div className={inputClass}>
@@ -98,6 +105,7 @@ export default function LocationCascadeFields({
           Lantai <span className="text-red-500">*</span>
         </label>
         <SearchableSelect
+          id="field-floorId"
           items={floorItems}
           value={value.floorId}
           onChange={(id) => {
@@ -117,6 +125,7 @@ export default function LocationCascadeFields({
           emptyText="Belum ada Lantai di gedung ini."
           disabled={!value.buildingId}
           disabledHint="Pilih gedung dulu"
+          error={errorLevel === "floor"}
         />
       </div>
       <div className={inputClass}>
@@ -124,6 +133,7 @@ export default function LocationCascadeFields({
           Ruangan <span className="text-red-500">*</span>
         </label>
         <SearchableSelect
+          id="field-roomId"
           items={roomItems}
           value={value.roomId}
           onChange={(id) => {
@@ -141,10 +151,13 @@ export default function LocationCascadeFields({
           emptyText="Belum ada Ruangan di lantai ini."
           disabled={!value.floorId}
           disabledHint="Pilih lantai dulu"
+          error={errorLevel === "room"}
         />
       </div>
       <div className={inputClass}>
-        <label className="block text-[11px] font-medium text-slate-500 mb-1">Area</label>
+        <label className="block text-[11px] font-medium text-slate-500 mb-1">
+          Area <span className="text-slate-400 font-normal">(Opsional)</span>
+        </label>
         <SearchableSelect
           items={areaItems}
           value={value.areaId}

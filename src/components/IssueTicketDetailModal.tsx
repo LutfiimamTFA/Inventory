@@ -23,6 +23,7 @@ import { AssetIssueTicketLog, AssetIssueTicket, HandlingPriority, IssueSeverity 
 import { fetchActiveUsersByRole } from "@/lib/firestore-helpers";
 import { uploadToDrive } from "@/lib/drive-upload";
 import { createAssetNotification } from "@/lib/notifications";
+import { extractDriveFileId, getAssetFilePreviewUrl } from "@/lib/drive-file-id";
 import {
   getAvailableIssueTicketActions,
   getIssueTimelineActiveIndex,
@@ -144,34 +145,6 @@ const DRIVE_FILE_ID_KEYS = ["driveFileId", "fileId", "attachmentFileId", "photoF
 const ATTACHMENT_COLLECTION_KEYS = ["photoUrls", "attachmentUrls", "attachments", "evidencePhotoUrls"] as const;
 const VIDEO_EXTENSIONS = [".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv"];
 
-function proxiedDriveUrl(fileId: string) {
-  return `/api/drive-image?fileId=${encodeURIComponent(fileId)}`;
-}
-
-function extractDriveFileId(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const raw = value.trim();
-  if (!raw) return null;
-
-  try {
-    const url = new URL(raw, "https://assetview.local");
-    const fileId = url.searchParams.get("fileId") || url.searchParams.get("id");
-    if (fileId) return fileId;
-  } catch {
-    // Bukan URL valid; lanjut cek pola ID/URL Drive mentah.
-  }
-
-  const decoded = decodeURIComponent(raw);
-  const drivePathMatch = decoded.match(/\/file\/d\/([^/?#]+)/);
-  if (drivePathMatch?.[1]) return drivePathMatch[1];
-
-  const queryMatch = decoded.match(/[?&](?:fileId|id)=([^&#]+)/);
-  if (queryMatch?.[1]) return queryMatch[1];
-
-  if (/^[a-zA-Z0-9_-]{20,}$/.test(decoded)) return decoded;
-  return null;
-}
-
 function inferAttachmentKind(source: { mimeType?: string; name?: string; url?: string }): ReporterAttachmentKind {
   const mime = (source.mimeType || "").toLowerCase();
   if (mime.startsWith("video/")) return "video";
@@ -218,7 +191,7 @@ function normalizeAttachmentValue(value: unknown, fallbackName: string): Reporte
   return {
     id: fileId,
     fileId,
-    src: proxiedDriveUrl(fileId),
+    src: getAssetFilePreviewUrl(fileId),
     kind: inferAttachmentKind({ mimeType, name, url }),
     name,
   };

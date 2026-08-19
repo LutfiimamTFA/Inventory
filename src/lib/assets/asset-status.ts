@@ -7,6 +7,7 @@ import {
   isProblemAsset,
   normalizeAssetUsageStatus,
 } from "@/lib/utils";
+import { extractDriveFileId, getAssetFilePreviewUrl, resolveDriveFileSrc } from "@/lib/drive-file-id";
 
 // AssetBorrowing (types.ts) tidak punya index signature, jadi tidak bisa
 // langsung diintersect dengan Record<string, unknown> — union longgar ini
@@ -282,8 +283,9 @@ export function pickLatestActiveBorrowing<T extends { borrowedAt?: unknown; crea
 // lalu dianggap "belum tersedia" padahal filenya ADA.
 //
 // Urutan baru: (1) SEMUA field fileId dicek LEBIH DULU — ini paling andal
-// karena selalu lewat proxy /api/drive-image (server-side, pakai credential
-// server, sama di localhost maupun Vercel, TIDAK PERNAH link Drive mentah).
+// karena selalu lewat proxy /api/asset-files/{fileId} (server-side, pakai
+// credential server, sama di localhost maupun Vercel, TIDAK PERNAH link
+// Drive mentah).
 // (2) Baru field URL — kalau URL itu ternyata link Google Drive, fileId-nya
 // diekstrak dan tetap dipakai lewat proxy yang sama; kalau bukan link Drive
 // (URL gambar biasa), dipakai apa adanya.
@@ -292,18 +294,6 @@ export interface AssetPhotoSrc {
   isDriveProxy: boolean;
   fileId: string | null;
   fieldUsed: string | null;
-}
-
-// Pola URL Google Drive yang didukung:
-//   drive.google.com/file/d/FILE_ID/view
-//   drive.google.com/open?id=FILE_ID
-//   drive.google.com/uc?id=FILE_ID
-function extractDriveFileIdFromUrl(url: string): string | null {
-  const pathMatch = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
-  if (pathMatch?.[1]) return pathMatch[1];
-  const queryMatch = url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
-  if (queryMatch?.[1]) return queryMatch[1];
-  return null;
 }
 
 function firstNonEmptyString(...values: unknown[]): string | null {
@@ -328,16 +318,17 @@ export function resolveAssetPhotoSrc(asset: Asset): AssetPhotoSrc {
   for (const [field, value] of fileIdFields) {
     const fileId = firstNonEmptyString(value);
     if (fileId) {
-      const src = `/api/drive-image?fileId=${encodeURIComponent(fileId)}`;
+      const src = getAssetFilePreviewUrl(fileId);
       // Section 7 — log sementara untuk debugging "foto tidak tampil".
       console.log("[Asset Photo] fileId field ditemukan", { assetId: asset.id, field, fileId, previewUrl: src });
       return { src, isDriveProxy: true, fileId, fieldUsed: field };
     }
   }
 
-  // Section 2/3 — field URL: kalau ternyata link Google Drive, EKSTRAK
-  // fileId dan tetap pakai proxy (JANGAN PERNAH pakai link Drive mentah
-  // sebagai <img src> di frontend).
+  // Section 2/3 — field URL: coba EKSTRAK fileId dari URL apa pun (bukan
+  // hanya yang cocok domain "drive.google.com" — varian seperti
+  // drive.usercontent.google.com/download?id=... juga harus lewat proxy,
+  // JANGAN PERNAH dipakai mentah sebagai <img src> di frontend).
   const urlFields: [string, unknown][] = [
     ["assetPhotoUrl", a.assetPhotoUrl],
     ["photoUrl", asset.photoUrl],
@@ -348,26 +339,36 @@ export function resolveAssetPhotoSrc(asset: Asset): AssetPhotoSrc {
     const url = firstNonEmptyString(value);
     if (!url) continue;
 
-    if (/drive\.google\.com/i.test(url)) {
-      const fileId = extractDriveFileIdFromUrl(url);
-      if (fileId) {
-        const src = `/api/drive-image?fileId=${encodeURIComponent(fileId)}`;
-        console.log("[Asset Photo] fileId diekstrak dari URL Drive", {
-          assetId: asset.id,
-          field,
-          fileId,
-          previewUrl: src,
-        });
-        return { src, isDriveProxy: true, fileId, fieldUsed: field };
-      }
-      // Link Drive tapi fileId tidak bisa diekstrak — jangan pernah dipakai
-      // mentah, lanjut ke kandidat berikutnya.
-      console.warn("[Asset Photo] URL Drive ditemukan tapi fileId gagal diekstrak", { assetId: asset.id, field, url });
-      continue;
+    const fileId = extractDriveFileId(url);
+    if (fileId) {
+      const src = getAssetFilePreviewUrl(fileId);
+      console.log("[Asset Photo] fileId diekstrak dari URL Drive", {
+        assetId: asset.id,
+        field,
+        fileId,
+        previewUrl: src,
+      });
+      return { src, isDriveProxy: true, fileId, fieldUsed: field };
     }
 
     console.log("[Asset Photo] URL gambar langsung ditemukan", { assetId: asset.id, field, url });
     return { src: url, isDriveProxy: false, fileId: null, fieldUsed: field };
+  }
+
+  // Fallback backward-compat — aset yang sudah disinkron lewat "Sinkronkan
+  // Foto Excel" SEBELUM field foto utama (photoUrl/photoDriveFileId) ikut
+  // dibackfill otomatis: pakai gambar bukti fisik pertama sebagai foto
+  // utama, TANPA re-upload/re-sync apa pun (physicalEvidenceImages sudah
+  // berupa URL proxy /api/asset-files siap pakai).
+  const firstEvidenceImage = firstNonEmptyString(asset.physicalEvidenceImages?.[0]);
+  if (firstEvidenceImage) {
+    const fileId = extractDriveFileId(firstEvidenceImage);
+    console.log("[Asset Photo] fallback ke physicalEvidenceImages[0]", {
+      assetId: asset.id,
+      fileId,
+      previewUrl: firstEvidenceImage,
+    });
+    return { src: firstEvidenceImage, isDriveProxy: true, fileId, fieldUsed: "physicalEvidenceImages" };
   }
 
   console.log("[Asset Photo] tidak ada field foto ditemukan sama sekali", { assetId: asset.id });
@@ -380,6 +381,20 @@ export function resolveAssetPhotoSrc(asset: Asset): AssetPhotoSrc {
 // Google Drive mentah.
 export function getAssetPhotoPreviewUrl(asset: Asset): string | null {
   return resolveAssetPhotoSrc(asset).src;
+}
+
+// Sama seperti foto: field fileId (invoiceDriveFileId) diprioritaskan, baru
+// invoiceFileUrl — kalau ternyata link Drive (domain apa pun), tetap lewat
+// proxy /api/asset-files, JANGAN PERNAH link Drive mentah dipakai sebagai
+// href "Lihat file invoice". Field alternatif (invoiceFileId/invoiceUrl/dst)
+// dicek juga untuk data lama/import yang memakai nama field beda — sama
+// seperti hasInvoice() di lib/assetFinance.ts.
+export function getAssetInvoicePreviewUrl(asset: Asset): string | null {
+  const r = asset as unknown as Record<string, unknown>;
+  return resolveDriveFileSrc(
+    [asset.invoiceDriveFileId, r.invoiceFileId],
+    [asset.invoiceFileUrl, r.invoiceUrl, r.invoiceDriveUrl, r.purchaseProofFileUrl, r.receiptFileUrl]
+  ).src;
 }
 
 export interface AssetVerificationIndicator {

@@ -36,9 +36,21 @@ interface ExportTabProps {
   workOrders: MaintenanceWorkOrder[];
   items: MaintenanceWorkOrderItem[];
   borrowings: AssetBorrowing[];
+  // Section "Pemisahan data finance per role" — "Nilai Beli" di export Cost
+  // di bawah ini adalah nominal Rupiah, jadi tombolnya sendiri harus hilang
+  // total untuk role selain Finance/Super Admin (bukan cuma disembunyikan
+  // sebagian kolomnya).
+  canViewFinanceData: boolean;
 }
 
-export default function ExportTab({ assets, tickets, workOrders, items, borrowings }: ExportTabProps) {
+export default function ExportTab({
+  assets,
+  tickets,
+  workOrders,
+  items,
+  borrowings,
+  canViewFinanceData,
+}: ExportTabProps) {
   const exportAssetHealth = () => {
     exportToExcel(
       `QHSE-Care-Asset-Health-Report-${todayStamp()}.xlsx`,
@@ -158,7 +170,7 @@ export default function ExportTab({ assets, tickets, workOrders, items, borrowin
     { label: "Export Maintenance Report", onClick: exportMaintenance },
     { label: "Export Borrowing Report", onClick: exportBorrowings },
     { label: "Export Location Report", onClick: exportLocations },
-    { label: "Export Cost Report", onClick: exportCost },
+    ...(canViewFinanceData ? [{ label: "Export Cost Report", onClick: exportCost }] : []),
   ];
 
   return (

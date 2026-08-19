@@ -13,6 +13,7 @@ import {
   getAssetQrTarget,
   getQrDomainNotice,
 } from "@/lib/utils";
+import { getAssetNumber } from "@/lib/assets/inventory";
 import Badge from "@/components/Badge";
 
 const LABEL_SIZES = {
@@ -87,8 +88,10 @@ function QrLabelContent({
   qrValue,
   qrPixelSize,
   nameClassName,
+  numberClassName,
   codeClassName,
   nameStyle,
+  numberStyle,
   codeStyle,
   gap = 6,
 }: {
@@ -96,11 +99,17 @@ function QrLabelContent({
   qrValue: string;
   qrPixelSize: number;
   nameClassName?: string;
+  numberClassName?: string;
   codeClassName?: string;
   nameStyle?: CSSProperties;
+  numberStyle?: CSSProperties;
   codeStyle?: CSSProperties;
   gap?: number;
 }) {
+  // Section "Bug No. Aset di modal QR" — sumber No. Aset di label SAMA
+  // dengan card Identitas Aset Otomatis (getAssetNumber(asset), field
+  // assetNumber) — BUKAN inventoryNumber ("No Inventaris", field berbeda).
+  const assetNumber = getAssetNumber(asset);
   return (
     <div
       className="flex flex-col items-center justify-center w-full h-full"
@@ -117,6 +126,11 @@ function QrLabelContent({
       <p className={nameClassName} style={nameStyle}>
         {asset.assetName}
       </p>
+      {assetNumber !== null && (
+        <p className={numberClassName} style={numberStyle}>
+          No. {assetNumber}
+        </p>
+      )}
       <p className={codeClassName} style={codeStyle}>
         {asset.assetCode}
       </p>
@@ -356,6 +370,13 @@ export default function QrLabelModal({
     lineHeight: 1.15,
     textAlign: "center",
   };
+  const exportSingleNumberStyle: CSSProperties = {
+    color: "#475569",
+    fontSize: scaleScreenPx(10),
+    fontWeight: 600,
+    lineHeight: 1.15,
+    textAlign: "center",
+  };
   const exportSheetNameStyle: CSSProperties = {
     ...exportSingleNameStyle,
     fontSize: scaleScreenPx(7),
@@ -364,6 +385,10 @@ export default function QrLabelModal({
   };
   const exportSheetCodeStyle: CSSProperties = {
     ...exportSingleCodeStyle,
+    fontSize: scaleScreenPx(6),
+  };
+  const exportSheetNumberStyle: CSSProperties = {
+    ...exportSingleNumberStyle,
     fontSize: scaleScreenPx(6),
   };
 
@@ -402,7 +427,7 @@ export default function QrLabelModal({
 
       <div className="relative bg-white rounded-2xl shadow-lg border border-slate-200 w-full max-w-3xl max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 pt-6 mb-1 no-print">
-          <h2 className="text-lg font-semibold text-slate-900">QR Label Asset</h2>
+          <h2 className="text-lg font-semibold text-slate-900">QR / Barcode Aset</h2>
           <button
             type="button"
             onClick={onClose}
@@ -410,6 +435,33 @@ export default function QrLabelModal({
           >
             <X size={18} />
           </button>
+        </div>
+
+        {/* Info identitas aset — layar saja (no-print), supaya Finance/Admin
+            bisa memastikan QR yang dibuka/dicetak memang untuk aset yang
+            benar sebelum klik Print. Data cuma dibaca dari field asset yang
+            sudah ada, bukan sumber baru. */}
+        <div className="mx-6 mb-3 grid grid-cols-2 gap-x-4 gap-y-1.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs no-print">
+          <div>
+            <p className="text-slate-400">Nama Aset</p>
+            <p className="font-medium text-slate-800 truncate">{asset.assetName}</p>
+          </div>
+          <div>
+            <p className="text-slate-400">No. Aset</p>
+            <p className="font-medium text-slate-800">{getAssetNumber(asset) ?? "-"}</p>
+          </div>
+          <div>
+            <p className="text-slate-400">Kode Aset</p>
+            <p className="font-mono font-medium text-slate-800 truncate">{asset.assetCode}</p>
+          </div>
+          <div>
+            <p className="text-slate-400">Perusahaan</p>
+            <p className="font-medium text-slate-800 truncate">{asset.companyOwnerName || "-"}</p>
+          </div>
+          <div className="col-span-2">
+            <p className="text-slate-400">Lokasi</p>
+            <p className="font-medium text-slate-800 truncate">{asset.locationText || "-"}</p>
+          </div>
         </div>
 
         {/* Section D — info domain QR, HANYA di layar (no-print), supaya
@@ -463,6 +515,7 @@ export default function QrLabelModal({
                     qrValue={qrValue}
                     qrPixelSize={singleQrSize}
                     nameClassName="text-[11px] font-bold text-slate-900 text-center leading-tight px-1 truncate max-w-full"
+                    numberClassName="text-[10px] font-semibold text-slate-600 text-center leading-tight"
                     codeClassName="text-[10px] font-mono text-slate-500 text-center leading-tight"
                     gap={5}
                   />
@@ -516,6 +569,7 @@ export default function QrLabelModal({
                               qrValue={qrValue}
                               qrPixelSize={previewLabelQrSize}
                               nameClassName="text-[7px] font-bold text-slate-900 text-center leading-tight px-1 truncate max-w-full"
+                              numberClassName="text-[6px] font-semibold text-slate-600 text-center leading-tight"
                               codeClassName="text-[6px] font-mono text-slate-500 text-center leading-tight"
                               gap={2}
                             />
@@ -558,6 +612,7 @@ export default function QrLabelModal({
                               qrValue={qrValue}
                               qrPixelSize={previewLabelQrSize}
                               nameClassName="text-[7px] font-bold text-slate-900 text-center leading-tight px-1 truncate max-w-full"
+                              numberClassName="text-[6px] font-semibold text-slate-600 text-center leading-tight"
                               codeClassName="text-[6px] font-mono text-slate-500 text-center leading-tight"
                               gap={2}
                             />
@@ -594,6 +649,7 @@ export default function QrLabelModal({
                       qrValue={qrValue}
                       qrPixelSize={exportSingleQrSize}
                       nameStyle={exportSingleNameStyle}
+                      numberStyle={exportSingleNumberStyle}
                       codeStyle={exportSingleCodeStyle}
                       gap={scaleScreenPx(5)}
                     />
@@ -632,6 +688,7 @@ export default function QrLabelModal({
                             qrValue={qrValue}
                             qrPixelSize={exportLabelQrSize}
                             nameStyle={exportSheetNameStyle}
+                            numberStyle={exportSheetNumberStyle}
                             codeStyle={exportSheetCodeStyle}
                             gap={scaleScreenPx(2)}
                           />

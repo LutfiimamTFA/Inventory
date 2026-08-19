@@ -325,6 +325,26 @@ export function exportToExcel(fileName: string, sheetName: string, rows: Record<
   console.debug("[Reports] export completed", fileName);
 }
 
+// Dipakai Rekap Finance — satu file berisi beberapa sheet (Ringkasan, Nilai
+// per Perusahaan, dst) supaya export-nya benar-benar rekap analitik, bukan
+// ulang tabel Asset polos di satu sheet. Sheet dengan rows kosong tetap
+// dibuat (json_to_sheet([]) valid) supaya urutan/nama sheet tetap konsisten.
+export function exportMultiSheetExcel(
+  fileName: string,
+  sheets: { sheetName: string; rows: Record<string, unknown>[] }[]
+) {
+  console.debug("[Reports] multi-sheet export started", fileName);
+  const wb = XLSX.utils.book_new();
+  sheets.forEach(({ sheetName, rows }) => {
+    const ws = XLSX.utils.json_to_sheet(rows);
+    // Nama sheet Excel maksimal 31 karakter & tidak boleh ada karakter
+    // tertentu — dipotong defensif supaya XLSX.utils tidak throw.
+    XLSX.utils.book_append_sheet(wb, ws, sheetName.slice(0, 31));
+  });
+  XLSX.writeFile(wb, fileName);
+  console.debug("[Reports] multi-sheet export completed", fileName);
+}
+
 export function todayStamp() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(

@@ -9,12 +9,14 @@ function asRecord(asset: AssetLike): Record<string, unknown> {
   return asset as unknown as Record<string, unknown>;
 }
 
-// Beberapa data lama/import bisa saja memakai nama field lain untuk harga —
-// getAssetPrice mencoba beberapa kemungkinan supaya summary/table Asset
-// Finance tidak salah hitung cuma karena field-nya beda nama.
+// acquisitionPrice ("Harga Perolehan" dari Excel) adalah source of truth
+// utama — purchasePrice/field lama lain HANYA fallback untuk aset yang
+// dibuat manual sebelum field acquisitionPrice ada (dual-write dari
+// EditFinanceModal/import mapper menjaga keduanya tetap sinkron).
 export function getAssetPrice(asset: AssetLike): number {
   const r = asRecord(asset);
-  const raw = asset.purchasePrice ?? r.assetPrice ?? r.assetValue ?? r.acquisitionCost ?? r.hargaBeli ?? 0;
+  const raw =
+    asset.acquisitionPrice ?? asset.purchasePrice ?? r.assetPrice ?? r.assetValue ?? r.acquisitionCost ?? r.hargaBeli ?? 0;
 
   if (typeof raw === "number") return raw;
 
@@ -33,7 +35,8 @@ export function hasPrice(asset: AssetLike): boolean {
 export function hasInvoice(asset: AssetLike): boolean {
   const r = asRecord(asset);
   return Boolean(
-    asset.invoiceNumber ||
+    asset.invoiceStatus === "ada" ||
+      asset.invoiceNumber ||
       r.invoiceNo ||
       r.purchaseInvoiceNumber ||
       asset.invoiceFileUrl ||
@@ -44,7 +47,33 @@ export function hasInvoice(asset: AssetLike): boolean {
 }
 
 export function hasPurchaseDate(asset: AssetLike): boolean {
-  return Boolean(asset.purchaseDate);
+  return Boolean(asset.acquisitionDate || asset.purchaseDate);
+}
+
+// Field opsional yang tidak (belum) ada di interface Asset resmi — hanya
+// ditampilkan "jika ada" di card Finance untuk data lama/import yang
+// kebetulan punya field ini, TIDAK ditambahkan sebagai field edit baru.
+export function getAssetBookValue(asset: AssetLike): number | null {
+  const r = asRecord(asset);
+  const raw = r.bookValue ?? r.estimatedValue ?? r.currentValue;
+  if (typeof raw === "number" && raw > 0) return raw;
+  if (typeof raw === "string" && raw.trim()) {
+    const n = Number(raw.replace(/[^\d]/g, ""));
+    return n > 0 ? n : null;
+  }
+  return null;
+}
+
+export function getAssetCostCenter(asset: AssetLike): string | null {
+  const r = asRecord(asset);
+  const raw = r.costCenter ?? r.costCenterCode;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+}
+
+export function getAssetBudgetCode(asset: AssetLike): string | null {
+  const r = asRecord(asset);
+  const raw = r.budgetCode ?? r.budgetCodeNumber;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : null;
 }
 
 export function isFinanceComplete(asset: AssetLike): boolean {
@@ -72,7 +101,7 @@ export function getFinanceStatus(asset: AssetLike): FinanceStatus {
 }
 
 export const FINANCE_STATUS_LABEL: Record<FinanceStatus, string> = {
-  complete: "Lengkap",
+  complete: "Data Finance Lengkap",
   no_price: "Belum Ada Harga",
   no_invoice: "Belum Ada Invoice",
   incomplete: "Perlu Dilengkapi",

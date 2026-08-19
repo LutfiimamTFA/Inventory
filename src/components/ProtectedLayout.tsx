@@ -24,6 +24,7 @@ import {
   ClipboardCheck,
   MapPin,
   Columns3,
+  UploadCloud,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
 import { AppRole } from "@/lib/types";
@@ -136,6 +137,15 @@ const NAV_ITEMS: NavItem[] = [
     icon: MapPin,
     group: "DATA MASTER",
     roles: ["super_admin", "asset_admin"],
+  },
+  {
+    href: "/bulk-upload",
+    label: "Import Aset",
+    icon: UploadCloud,
+    group: "DATA MASTER",
+    // Section "Rombak permission Asset" — Asset Finance sekarang juga boleh
+    // Import Aset (termasuk Sinkronkan Foto/No. Aset).
+    roles: ["super_admin", "asset_admin", "asset_finance"],
   },
   {
     href: "/my-reports",

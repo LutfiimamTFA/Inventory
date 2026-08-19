@@ -55,6 +55,7 @@ import {
 } from "@/lib/firestore-helpers";
 import { createAssetNotification } from "@/lib/notifications";
 import { getAssetRoleHelpers, getAssignedMaintenanceRole } from "@/lib/roles";
+import { extractDriveFileId, getAssetFilePreviewUrl } from "@/lib/drive-file-id";
 import {
   MAINTENANCE_CONDITION_TO_ASSET_CONDITION,
   WORK_ORDER_ITEM_STATUS_COLOR,
@@ -2506,11 +2507,18 @@ export default function WorkOrderDetailModal({
   const recommendationList = items
     .filter((i) => i.technicianNote)
     .map((i) => ({ asset: i.assetName, text: i.technicianNote! }));
+  // Jangan pernah pakai URL Drive mentah sebagai <img src> — ekstrak fileId
+  // (domain apa pun, termasuk drive.usercontent.google.com) dan lewat proxy;
+  // kalau bukan link Drive (URL gambar biasa), dipakai apa adanya.
+  const toProxiedPhotoUrl = (url: string) => {
+    const fileId = extractDriveFileId(url);
+    return fileId ? getAssetFilePreviewUrl(fileId) : url;
+  };
   const photosBefore = items.flatMap((i) =>
-    (i.photoBeforeUrls || []).map((url) => ({ asset: i.assetName, url }))
+    (i.photoBeforeUrls || []).map((url) => ({ asset: i.assetName, url: toProxiedPhotoUrl(url) }))
   );
   const photosAfter = items.flatMap((i) =>
-    (i.photoAfterUrls || []).map((url) => ({ asset: i.assetName, url }))
+    (i.photoAfterUrls || []).map((url) => ({ asset: i.assetName, url: toProxiedPhotoUrl(url) }))
   );
   const followUpTickets = items.filter(
     (i) =>

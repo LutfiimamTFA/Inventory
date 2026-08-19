@@ -15,6 +15,11 @@ import SummaryCard from "@/components/reports/SummaryCard";
 import { ChartCard, SimpleBarChart } from "@/components/reports/charts";
 import ResponsiveTable from "@/components/reports/ResponsiveTable";
 
+// Section "Pemisahan data finance per role" — tab ini SEKARANG hanya pernah
+// dirender untuk role yang boleh lihat data finance (Finance/Super Admin —
+// lihat canViewFinanceData di src/app/reports/page.tsx). Role lain
+// (Asset Admin/QHSE/IT) dapat RecommendationReportTab (tanpa nominal
+// Rupiah sama sekali, dan tanpa tabel panjang — lihat file itu).
 export default function CostReportTab({
   assets,
   tickets,

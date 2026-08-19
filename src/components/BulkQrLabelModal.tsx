@@ -6,6 +6,7 @@ import { Download, Printer, X, ChevronLeft, ChevronRight } from "lucide-react";
 import { toPng } from "html-to-image";
 import { Asset } from "@/lib/types";
 import { getAppBaseUrl, getAssetQrTarget, getQrDomainNotice } from "@/lib/utils";
+import { getAssetNumber } from "@/lib/assets/inventory";
 
 const LABEL_SIZES = {
   "50x30": { label: "50mm x 30mm", width: 50, height: 30 },
@@ -74,6 +75,7 @@ function BulkLabelCell({
   asset,
   qrPixelSize,
   nameStyle,
+  numberStyle,
   codeStyle,
   gap = 4,
   borderWidth,
@@ -82,6 +84,7 @@ function BulkLabelCell({
   asset: Asset;
   qrPixelSize: number;
   nameStyle?: CSSProperties;
+  numberStyle?: CSSProperties;
   codeStyle?: CSSProperties;
   gap?: number;
   borderWidth?: number;
@@ -90,6 +93,10 @@ function BulkLabelCell({
   // Section C — sama seperti QrLabelModal: QR berisi URL /asset-action
   // penuh, bukan lagi kode asset polos.
   const qrValue = getAssetQrTarget(asset);
+  // Section "Bug No. Aset di modal QR" — SATU source of truth (field
+  // assetNumber, sama seperti QrLabelModal/card Identitas Aset Otomatis),
+  // BUKAN inventoryNumber.
+  const assetNumber = getAssetNumber(asset);
   return (
     <div
       className="border border-dashed border-slate-300 rounded flex items-center justify-center overflow-hidden"
@@ -116,6 +123,14 @@ function BulkLabelCell({
         >
           {asset.assetName}
         </p>
+        {assetNumber !== null && (
+          <p
+            className="text-[6px] font-semibold text-slate-600 text-center leading-tight"
+            style={numberStyle}
+          >
+            No. {assetNumber}
+          </p>
+        )}
         <p
           className="text-[6px] font-mono text-slate-500 text-center leading-tight"
           style={codeStyle}
@@ -278,6 +293,13 @@ export default function BulkQrLabelModal({
     lineHeight: 1.15,
     textAlign: "center",
   };
+  const exportNumberStyle: CSSProperties = {
+    color: "#475569",
+    fontSize: scaleScreenPx(6),
+    fontWeight: 600,
+    lineHeight: 1.15,
+    textAlign: "center",
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 print:p-0 print:bg-white">
@@ -433,6 +455,7 @@ export default function BulkQrLabelModal({
                           asset={asset}
                           qrPixelSize={exportLabelQrSize}
                           nameStyle={exportNameStyle}
+                          numberStyle={exportNumberStyle}
                           codeStyle={exportCodeStyle}
                           gap={scaleScreenPx(2)}
                           borderWidth={scaleScreenPx(1)}

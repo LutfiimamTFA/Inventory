@@ -93,20 +93,105 @@ service cloud.firestore {
         || isAssetViewFinance();
     }
 
-    // Field finance yang boleh diubah Asset Finance — TIDAK termasuk lokasi,
-    // custodian, currentHolder, status pemakaian, maintenance, kategori
-    // utama, nama/kode aset (lihat section G spec).
+    // Section "Finance edit lengkap + audit log" — Asset Finance sekarang
+    // boleh edit asset SECARA LENGKAP (identitas/inventaris/lokasi/kondisi/
+    // foto), BUKAN cuma field finance lagi — tetapi TETAP TIDAK BOLEH
+    // menyentuh: Perusahaan/Divisi (companyOwnerId/divisionOwnerId), PIC/
+    // Custodian/Mode Tracking (responsiblePersonUid/custodian*/currentHolder*/
+    // trackingMode/usageType/pic*), Status Kepemilikan (ownershipStatus),
+    // Status Operasional Aset/disposal (assetStatus), dan Pengaturan
+    // Pemakaian (isBorrowable/requiresApproval/accessories/operationalNotes)
+    // — field-field itu tetap dikunci di UI (lihat isFinanceOnlyRole di
+    // assets/[id]/edit/page.tsx) SEKALIGUS di sini, defense-in-depth.
     function isAssetFinanceUpdate() {
       let changed = request.resource.data.diff(resource.data).affectedKeys();
       return isAssetViewFinance() &&
         changed.hasOnly([
+          // Identitas & inventaris fisik.
+          "assetName", "assetCode", "assetNumber",
+          "categoryId", "categoryName", "subCategory",
+          "brand", "model", "serialNumber", "imei", "description",
+          "quantity", "inventoryNumber", "inventoryNotes", "assetType",
+          "qrCodeValue", "operationalStatus",
+
+          // Lokasi (Perusahaan/Divisi/PIC/Mode Tracking SENGAJA tidak ada).
+          "location", "locationText", "locationRaw",
+          "buildingId", "buildingName", "floorId", "floor", "roomId", "roomName", "areaId", "areaName", "locationId",
+          "areaPicUid", "areaPicName", "areaPicEmail", "areaPicLocationId", "areaPicLocationName",
+
+          // Kondisi (Status Operasional Aset/disposal SENGAJA tidak ada).
+          "condition", "inventoryCondition",
+
+          // Foto & bukti fisik.
+          "photoUrl", "photoThumbnailUrl", "photoFileName", "photoDriveFileId",
+          "photoMimeType", "photoSize", "photoUploadedAt", "photoStatus",
+          "physicalEvidence", "physicalEvidenceImages",
+
+          // Finance.
           "purchaseDate", "purchasePrice", "vendorName", "invoiceNumber",
           "fundingSource", "purchaseMethod", "estimatedUsefulLife", "financeNotes",
           "financeStatus", "financeUpdatedAt", "financeUpdatedByUid", "financeUpdatedByName",
           "invoiceFileId", "invoiceDriveFileId", "invoiceFileUrl", "invoiceFileName",
           "invoiceMimeType", "invoiceSize", "invoiceUploadedAt",
+          "acquisitionDate", "acquisitionPrice", "invoiceStatus",
+
           "updatedAt", "updatedByUid", "updatedByName"
         ]);
+    }
+
+    // Field finance yang TIDAK BOLEH disentuh Asset Admin sama sekali —
+    // TIDAK termasuk purchaseDate/acquisitionDate (Tanggal Perolehan BUKAN
+    // data rahasia Finance, lihat ticket "rombak permission asset") dan
+    // TIDAK termasuk financeStatus/financeUpdatedAt/* (sekadar penanda
+    // status "pending_finance", bukan data finansial sensitif).
+    function assetFinanceOnlyFields() {
+      return [
+        "purchasePrice", "vendorName", "invoiceNumber",
+        "fundingSource", "purchaseMethod", "estimatedUsefulLife", "financeNotes",
+        "invoiceFileId", "invoiceDriveFileId", "invoiceFileUrl", "invoiceFileName",
+        "invoiceMimeType", "invoiceSize", "invoiceUploadedAt",
+        "acquisitionPrice", "invoiceStatus"
+      ];
+    }
+
+    // Asset Admin boleh create/update aset (data operasional), TAPI dilarang
+    // menyentuh field finance lewat jalur apa pun termasuk request manual —
+    // lihat ticket "rombak permission asset". Create dicek NILAI-nya (harus
+    // kosong/null kalau field itu ada di payload sama sekali, karena create
+    // tidak punya "diff" terhadap dokumen sebelumnya); update dicek DIFF-nya
+    // (field finance existing tidak boleh ikut berubah nilainya).
+    function isAssetAdminOperationalCreate() {
+      let data = request.resource.data;
+      return isAssetAdmin() &&
+        data.get("purchasePrice", null) == null &&
+        data.get("acquisitionPrice", null) == null &&
+        data.get("invoiceStatus", null) == null &&
+        data.get("vendorName", "") == "" &&
+        data.get("invoiceNumber", "") == "" &&
+        data.get("invoiceFileId", "") == "" &&
+        data.get("invoiceDriveFileId", "") == "" &&
+        data.get("invoiceFileUrl", "") == "" &&
+        data.get("invoiceFileName", "") == "" &&
+        data.get("invoiceMimeType", "") == "" &&
+        data.get("invoiceSize", null) == null &&
+        data.get("invoiceUploadedAt", null) == null &&
+        data.get("fundingSource", "") == "" &&
+        data.get("purchaseMethod", "") == "" &&
+        data.get("estimatedUsefulLife", "") == "" &&
+        data.get("financeNotes", "") == "";
+    }
+
+    function isAssetAdminOperationalUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return isAssetAdmin() && !changed.hasAny(assetFinanceOnlyFields());
+    }
+
+    // Asset Finance (role "asset_finance") sekarang juga boleh membuat aset
+    // baru dari nol (bukan cuma melengkapi aset yang sudah dibuat Asset
+    // Admin) — form Finance berisi data operasional + Informasi Keuangan,
+    // jadi tidak perlu restriksi field seperti Asset Admin.
+    function isAssetFinanceCreate() {
+      return isAssetViewFinance();
     }
 
     // PIC Lokasi — orang yang bertanggung jawab mendata/mengawasi aset di
@@ -138,7 +223,8 @@ service cloud.firestore {
         "fundingSource", "purchaseMethod", "estimatedUsefulLife", "financeNotes",
         "financeStatus", "financeUpdatedAt", "financeUpdatedByUid", "financeUpdatedByName",
         "invoiceFileId", "invoiceDriveFileId", "invoiceFileUrl", "invoiceFileName",
-        "invoiceMimeType", "invoiceSize", "invoiceUploadedAt"
+        "invoiceMimeType", "invoiceSize", "invoiceUploadedAt",
+        "acquisitionDate", "acquisitionPrice", "invoiceStatus"
       ];
       return isLocationPic()
         && resource.data.areaPicUid == request.auth.uid
@@ -315,7 +401,51 @@ service cloud.firestore {
 
     match /asset_categories/{categoryId} {
       allow read: if isActiveAssetUser();
-      allow write: if isManager();
+      // Asset Finance sekarang juga boleh Import Aset — Import Aset boleh
+      // AUTO-CREATE kategori baru dari Excel kalau belum ada di Master
+      // Kategori (lihat lib/import/category-seed.ts), jadi create dibuka
+      // untuk Finance juga. Halaman Master Kategori (edit/nonaktifkan
+      // kategori) tetap khusus Super Admin/Asset Admin.
+      allow create: if isManager() || isAssetViewFinance();
+      allow update, delete: if isManager();
+    }
+
+    // asset_import_batches: riwayat percobaan Import Aset (file+sheet+
+    // company+hasil) — dipakai halaman /bulk-upload untuk proteksi double
+    // import (peringatan kalau sheet yang sama pernah diimport). Super
+    // Admin/Asset Admin/Asset Finance boleh akses (ketiganya sekarang boleh
+    // Import Aset) — PIC Lokasi TIDAK bisa bulk import.
+    match /asset_import_batches/{batchId} {
+      allow read: if isManager() || isAssetViewFinance();
+      allow create: if isManager() || isAssetViewFinance();
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // asset_number_counters/{companyId}, asset_code_counters/{companyId__categoryCode}:
+    // counter document race-safe (Firestore transaction) untuk No. Aset &
+    // Kode Aset otomatis di Create Asset (lihat lib/assets/asset-code-generator.ts).
+    // Isinya cuma angka penghitung, bukan data sensitif — siapa pun yang
+    // boleh Create Asset boleh menulis counter ini.
+    //
+    // Section "Fix Create Asset PIC Lokasi" — isLocationPic() DIHAPUS dari
+    // sini (dulu di sini, tapi cuma cek asset_users/{uid}.role == "location_pic"
+    // literal, TIDAK mencakup staff yang ditunjuk PIC lewat Master Lokasi
+    // (picUid), yang di client tetap dianggap PIC lewat isPicViaLocations —
+    // itulah kenapa PIC seperti ini bisa lolos sampai tahap Create Asset
+    // tapi gagal permission persis di counter). Diganti
+    // isLocationPicAssetCounterWrite() di bawah: PIC hanya boleh menulis
+    // counter kalau locationId pada payload counter itu SENDIRI memang
+    // lokasi yang dia pegang (isPicOfAssetLocation) — bukan blanket akses
+    // ke SEMUA counter seperti isLocationPic() sebelumnya.
+    match /asset_number_counters/{companyId} {
+      allow get, list: if isActiveAssetUser();
+      allow create, update: if isManager() || isAssetViewFinance() || isLocationPicAssetCounterWrite();
+      allow delete: if isSuperAdmin();
+    }
+    match /asset_code_counters/{counterKey} {
+      allow get, list: if isActiveAssetUser();
+      allow create, update: if isManager() || isAssetViewFinance() || isLocationPicAssetCounterWrite();
+      allow delete: if isSuperAdmin();
     }
 
     // asset_locations: Master Lokasi (Gedung/Lantai/Ruangan/Area). READ
@@ -428,6 +558,25 @@ service cloud.firestore {
         && locationId != ""
         && exists(/databases/$(database)/documents/asset_locations/$(locationId))
         && get(/databases/$(database)/documents/asset_locations/$(locationId)).data.get("picUid", "") == request.auth.uid;
+    }
+
+    // Section "Fix Create Asset PIC Lokasi" — dipakai KHUSUS write ke
+    // asset_number_counters/asset_code_counters (lihat match block-nya di
+    // bawah). locationId di sini HARUS locationId aset yang SEDANG dibuat
+    // PIC ini (lib/assets/asset-code-generator.ts menulis field ini ke
+    // payload counter saat allocateAssetNumber/allocateAssetCode dipanggil
+    // dari Create Asset) — jadi PIC cuma bisa menggenerate No./Kode Aset
+    // untuk lokasi yang benar-benar dia pegang, bukan lokasi PIC lain.
+    // updatedByUid dicocokkan juga supaya PIC tidak bisa menyamar sebagai
+    // user lain di field metadata counter.
+    function isLocationPicAssetCounterWrite() {
+      let locationId = request.resource.data.get("locationId", "");
+
+      return isSignedIn()
+        && locationId is string
+        && locationId != ""
+        && isPicOfAssetLocation(locationId)
+        && request.resource.data.get("updatedByUid", "") == request.auth.uid;
     }
 
     // Section 1/2/3 — update aset KHUSUS PIC Lokasi lewat halaman Edit
@@ -567,8 +716,20 @@ service cloud.firestore {
 
     match /assets/{assetId} {
       allow read: if isActiveAssetUser() || isLocationPicForAsset(resource.data);
-      allow create: if isManager() || isLocationPicCreate() || isLocationPicCreateAsset();
-      allow update: if isManager() ||
+      // Super Admin: create bebas. Asset Admin: create boleh TAPI field
+      // finance harus kosong (isAssetAdminOperationalCreate). Asset Finance:
+      // create bebas juga (form Finance memang berhak isi Informasi
+      // Keuangan sejak awal, lihat isAssetFinanceCreate).
+      allow create: if isSuperAdmin() ||
+        isAssetAdminOperationalCreate() ||
+        isAssetFinanceCreate() ||
+        isLocationPicCreate() ||
+        isLocationPicCreateAsset();
+      // Super Admin: update bebas. Asset Admin: update boleh TAPI dilarang
+      // mengubah field finance sama sekali (isAssetAdminOperationalUpdate),
+      // termasuk lewat request manual di luar UI.
+      allow update: if isSuperAdmin() ||
+        isAssetAdminOperationalUpdate() ||
         isCustodianOrHolderUsageUpdate() ||
         isAssetFinanceUpdate() ||
         isLocationPicUpdate() ||

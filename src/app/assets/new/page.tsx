@@ -4,10 +4,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { addDoc, collection, doc, onSnapshot, serverTimestamp, setDoc } from "firebase/firestore";
 import { QRCodeSVG } from "qrcode.react";
-import { Wand2, Pencil } from "lucide-react";
+import { Copy, Check } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import {
+  Asset,
   AssetCategory,
   AssetLocationNode,
   AssetStatus,
@@ -18,19 +19,28 @@ import {
   FundingSource,
   HrpBrand,
   HrpDivision,
+  InvoiceStatus,
   OwnershipStatus,
 } from "@/lib/types";
+import { INVOICE_STATUS_LABEL } from "@/lib/assets/inventory";
 import { fetchHrpBrands, fetchHrpDivisions } from "@/lib/hrp";
 import {
   cleanFirestoreData,
   EmployeeOption,
   fetchActiveEmployeeOptions,
   fetchActiveUsersByRoles,
-  formatAssetCode,
-  generateAssetCode,
-  isAssetCodeTaken,
+  normalizeCategoryCodePart,
   writeAssetLog,
 } from "@/lib/firestore-helpers";
+import {
+  allocateAssetCode,
+  allocateAssetNumber,
+  deriveCompanyCode,
+  formatDateForAssetCode,
+  previewNextAssetCode,
+  previewNextAssetNumber,
+  resolveOperationalLocationCode,
+} from "@/lib/assets/asset-code-generator";
 import { createAssetNotification } from "@/lib/notifications";
 import { buildFullPath, getDescendantIds, resolveAreaPic, resolveLocationSelectionForNode } from "@/lib/locations";
 import {
@@ -42,6 +52,7 @@ import {
   getQrImageSettings,
 } from "@/lib/utils";
 import ProtectedLayout from "@/components/ProtectedLayout";
+import AssetFieldErrorModal from "@/components/AssetFieldErrorModal";
 import PageHeader from "@/components/PageHeader";
 import { FormSection, Field } from "@/components/FormSection";
 import Toggle from "@/components/Toggle";
@@ -53,6 +64,7 @@ import LocationCascadeFields, {
 } from "@/components/LocationCascadeFields";
 import PicLocationField from "@/components/PicLocationField";
 import FileUploadField from "@/components/FileUploadField";
+import QrLabelModal from "@/components/QrLabelModal";
 import { Toast, ToastState } from "@/components/Toast";
 
 // Section A/B — mode tracking aset. Menggantikan "Tipe Pemakaian Aset" di
@@ -114,27 +126,37 @@ const CONDITION_OPTIONS: AssetCondition[] = [
   "heavy_damage",
 ];
 
+// Section "Validasi Create/Edit Asset" — urutan tampil form (atas ke bawah),
+// dipakai AssetFieldErrorModal untuk menentukan error PERTAMA yang di-scroll
+// & di-focus saat user klik "Perbaiki Data".
+const REQUIRED_FIELD_ORDER = [
+  "assetName",
+  "categoryId",
+  "purchaseDate",
+  "quantity",
+  "companyOwnerId",
+  "location",
+  "assetCode",
+  "responsiblePersonUid",
+  "ownershipStatus",
+  "condition",
+  "assetStatus",
+];
+
 export default function NewAssetPage() {
   const { firebaseUser, assetUser, role, loading, isLocationPicRole: isPicViaLocations } = useAuth();
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
   const router = useRouter();
 
-  // Section A/H — Asset Finance TIDAK boleh membuat aset baru (bukan bagian
-  // dari kewenangannya), hanya boleh mengedit data finance aset yang sudah
-  // ada. NAV_ITEMS mengizinkan "/assets" secara umum, jadi guard tambahan di
-  // sini mencegah akses langsung lewat URL /assets/new.
-  useEffect(() => {
-    if (authReady && role === "asset_finance") {
-      router.replace("/assets");
-    }
-  }, [authReady, role, router]);
+  // Section "Rombak permission Asset" — Asset Finance sekarang BOLEH
+  // membuat aset baru dari nol (tidak perlu menunggu Asset Admin), jadi
+  // redirect keluar yang dulu ada di sini sudah dihapus.
 
   // Section B — Asset Admin/QHSE TIDAK boleh melihat/mengisi section Finance
-  // sama sekali di Create Asset (harga dilengkapi belakangan oleh Asset
-  // Finance). Asset Finance sendiri sudah di-redirect keluar dari halaman
-  // ini di atas, jadi hanya Super Admin yang tersisa untuk melihat section
-  // ini kalau memang mau isi harga saat create.
-  const canViewFinanceCreate = role === "super_admin";
+  // sama sekali di Create Asset (field-nya benar-benar tidak dirender, bukan
+  // cuma disabled) — harga dilengkapi lewat Finance. Super Admin & Asset
+  // Finance sama-sama melihat section Finance saat create.
+  const canViewFinanceCreate = role === "super_admin" || role === "asset_finance";
   const [categories, setCategories] = useState<AssetCategory[]>([]);
   const [employeeOptions, setEmployeeOptions] = useState<EmployeeOption[]>([]);
   const [brands, setBrands] = useState<HrpBrand[]>([]);
@@ -143,6 +165,19 @@ export default function NewAssetPage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  // Section "Validasi Create/Edit Asset" — locationErrorLevel dipakai border
+  // merah per-level Gedung/Lantai/Ruangan (LocationCascadeFields), errorModalOpen
+  // untuk modal ringkasan "Periksa Data Aset".
+  const [locationErrorLevel, setLocationErrorLevel] = useState<"building" | "floor" | "room" | null>(null);
+  const [errorModalOpen, setErrorModalOpen] = useState(false);
+  // Section "Rapikan UI Identitas Aset Otomatis" — modal QR full (lihat/
+  // cetak) dari card compact, dan feedback "tersalin" sesaat di tombol Copy
+  // Kode Aset (bukan cuma toast, biar langsung kelihatan di tombolnya).
+  const [qrModalOpen, setQrModalOpen] = useState(false);
+  const [codeCopied, setCodeCopied] = useState(false);
+  // Border merah untuk <input>/<select> native saat field itu error —
+  // SearchableSelect punya prop `error` sendiri (lihat components/SearchableSelect.tsx).
+  const errCls = (hasError: boolean, base = "input") => (hasError ? `${base} border-red-500 focus:ring-red-500/30` : base);
   const [toast, setToast] = useState<ToastState | null>(null);
   // Section 4/5 — SATU document ref dipakai sepanjang percobaan submit ini
   // (termasuk kalau handleSubmit sempat terpanggil ulang sebelum berhasil).
@@ -151,22 +186,34 @@ export default function NewAssetPage() {
   // pertama selesai — supaya tidak pernah ada dua dokumen assets untuk satu
   // percobaan yang sama (akar bug aset duplikat "testing bebe h").
   const pendingAssetIdRef = useRef<string | null>(null);
+  // No./Kode Aset FINAL yang benar-benar dialokasikan (bukan preview) —
+  // di-cache per percobaan submit supaya retry tidak membakar nomor baru.
+  const pendingAllocationRef = useRef<{ assetNumber: number; assetCode: string } | null>(null);
 
-  // A. Informasi Aset
+  // A. Informasi Aset — SENGAJA hanya field yang ada di "Label Aset
+  // EGC.xlsx" (Subkategori/Merk/Model/Serial Number/IMEI dihapus, lihat
+  // ticket "Create/Edit Asset ikuti Excel").
   const [assetName, setAssetName] = useState("");
   const [categoryId, setCategoryId] = useState("");
-  const [subCategory, setSubCategory] = useState("");
-  const [brand, setBrand] = useState("");
-  const [model, setModel] = useState("");
-  const [serialNumber, setSerialNumber] = useState("");
-  const [imei, setImei] = useState("");
   const [description, setDescription] = useState("");
   const [photo, setPhoto] = useState<DriveUploadResult | null>(null);
   const [photoUploading, setPhotoUploading] = useState(false);
 
-  const [autoCode, setAutoCode] = useState(true);
+  // Informasi Inventaris — field tambahan supaya struktur data aset manual
+  // sama dengan hasil Import Aset (lihat lib/import/asset-row-mapper.ts).
+  const [inventoryNumber, setInventoryNumber] = useState("");
+  const [quantity, setQuantity] = useState<number>(1);
+  const [physicalEvidence, setPhysicalEvidence] = useState("");
+
+  // No. Aset & Kode Aset — TIDAK PERNAH diisi manual (ticket eksplisit:
+  // "rawan salah dan duplicate"). Keduanya dihitung otomatis dari
+  // Perusahaan+Tanggal Perolehan+Lokasi+Kategori lewat
+  // lib/assets/asset-code-generator.ts, readonly di UI. Nilai di state ini
+  // HANYA preview — alokasi FINAL race-safe terjadi ulang persis sebelum
+  // submit (lihat handleSubmit).
+  const [assetNumber, setAssetNumber] = useState<number | null>(null);
   const [assetCode, setAssetCode] = useState("");
-  const [generatingCode, setGeneratingCode] = useState(false);
+  const [codeGenerationError, setCodeGenerationError] = useState("");
 
   // B. Kepemilikan & Lokasi
   const [companyOwnerId, setCompanyOwnerId] = useState("");
@@ -188,6 +235,7 @@ export default function NewAssetPage() {
   const [purchasePrice, setPurchasePrice] = useState<number | undefined>(undefined);
   const [vendorName, setVendorName] = useState("");
   const [invoiceNumber, setInvoiceNumber] = useState("");
+  const [invoiceStatus, setInvoiceStatus] = useState<InvoiceStatus | "">("");
   const [invoice, setInvoice] = useState<DriveUploadResult | null>(null);
   const [invoiceUploading, setInvoiceUploading] = useState(false);
   const [fundingSource, setFundingSource] =
@@ -369,54 +417,169 @@ export default function NewAssetPage() {
     setLoadingDivisions(!!value);
   };
 
-  // Auto-generate kode asset saat kategori berubah (jika mode auto aktif).
+  // Section "Perbaiki generator Kode Aset" — No./Kode Aset otomatis dibuat
+  // ulang (preview) setiap kali Perusahaan/Tanggal Perolehan/Lokasi/Kategori
+  // berubah, mengikuti pola "EGS.28/11/2017.DTIC.G-B06". Kode LOKASI OPERASIONAL
+  // TIDAK PERNAH mewajibkan Kode Gedung — prioritas Kode Ruangan (paling
+  // spesifik) -> Kode Divisi -> Kode Gedung (fallback terakhir), lihat
+  // resolveOperationalLocationCode di lib/assets/asset-code-generator.ts.
+  const selectedBuilding = useMemo(
+    () => locations.find((n) => n.id === locationSelection.buildingId),
+    [locations, locationSelection.buildingId]
+  );
+  const selectedRoom = useMemo(
+    () => locations.find((n) => n.id === locationSelection.roomId),
+    [locations, locationSelection.roomId]
+  );
+  const operationalLocationCode = resolveOperationalLocationCode({
+    roomCode: selectedRoom?.roomCode,
+    roomName: selectedRoom?.roomName,
+    divisionCode: divisionOwner?.code,
+    divisionName: divisionOwner?.name,
+    buildingCode: selectedBuilding?.buildingCode,
+  });
+  const locationCodeForGeneration = operationalLocationCode.code;
+  const dateForCodeGeneration = purchaseDate ? formatDateForAssetCode(purchaseDate) : "";
+  const codeDepsReady = !!(
+    companyOwnerId &&
+    companyOwner &&
+    category &&
+    category.categoryCode?.trim() &&
+    dateForCodeGeneration &&
+    locationSelection.buildingId &&
+    locationCodeForGeneration
+  );
+  // Section "Validasi Create/Edit Asset" — pesan SPESIFIK per sumber data
+  // master yang belum lengkap (bukan "Gagal membuat Kode Aset" generik).
+  // Kosong ("") berarti belum ada masalah — field wajib LAIN yang belum
+  // diisi ditangani validasi required terpisah, bukan di sini.
+  const codeNotReadyReason = (() => {
+    if (companyOwnerId && companyOwner && !companyOwner.name?.trim()) {
+      return "Perusahaan belum memiliki Kode Perusahaan.";
+    }
+    if (category && !category.categoryCode?.trim()) {
+      return `Kategori "${category.categoryName}" belum memiliki Kode Kategori.`;
+    }
+    // Section "Rombak Tambah/Edit Asset" — baru dianggap "belum siap" kalau
+    // SEMUA sumber kode lokasi (Kode/Nama Ruangan, Kode/Nama Divisi, Kode
+    // Gedung) kosong — nama Ruangan/Divisi yang sudah code-like (mis.
+    // "DTIC") otomatis ikut dicoba duluan lewat resolveOperationalLocationCode,
+    // jadi kasus ini SEHARUSNYA jarang terjadi kalau Ruangan sudah dipilih.
+    if (
+      companyOwnerId &&
+      category &&
+      category.categoryCode?.trim() &&
+      purchaseDate &&
+      dateForCodeGeneration &&
+      locationSelection.buildingId &&
+      !locationCodeForGeneration
+    ) {
+      return "Lokasi ini belum memiliki kode. Atur kode Ruangan/Divisi di Master Lokasi.";
+    }
+    return "";
+  })();
+
+  // Section "Urutan Form Create/Edit ikuti dependency" — daftar field yang
+  // BELUM DIPILIH sama sekali (beda dari codeNotReadyReason di atas, yang
+  // khusus kasus field SUDAH dipilih tapi master data-nya belum punya kode)
+  // — dipakai card "Identitas Aset Otomatis" supaya pesannya bilang PERSIS
+  // field mana yang masih kosong, bukan "-" atau pesan generik. Hanya level
+  // lokasi TERDALAM yang belum diisi yang ditampilkan (sama seperti pola
+  // locationErrorLevel di bawah) — bukan Gedung/Lantai/Ruangan sekaligus.
+  const missingCodeFields: string[] = [];
+  if (!companyOwnerId) missingCodeFields.push("Perusahaan");
+  if (!purchaseDate) missingCodeFields.push("Tanggal Perolehan");
+  if (!categoryId) missingCodeFields.push("Kategori");
+  if (!locationSelection.buildingId) missingCodeFields.push("Gedung");
+  else if (!locationSelection.floorId) missingCodeFields.push("Lantai");
+  else if (!locationSelection.roomId) missingCodeFields.push("Ruangan");
+
+  // Section "Rapikan UI Identitas Aset Otomatis" — QrLabelModal butuh objek
+  // Asset penuh, tapi aset di Create BELUM tersimpan (belum punya id/asset
+  // sungguhan) — dibuatkan objek preview MINIMAL (field yang benar-benar
+  // dibaca QrLabelModal saja), TETAP memakai assetCode yang sama persis
+  // dengan yang ditampilkan di card (bukan kode baru).
+  const qrPreviewAsset = {
+    id: "preview",
+    assetName: assetName || "Aset Baru",
+    assetCode,
+    // Bug fix "No. Aset modal QR" — assetNumber sempat tidak diikutkan di
+    // sini, jadi getAssetNumber(asset) di QrLabelModal selalu null -> "-",
+    // padahal card Identitas Aset Otomatis sudah menampilkan angkanya (dari
+    // state assetNumber yang SAMA). Preview number, BUKAN alokasi final
+    // (yang baru terjadi race-safe saat submit) — tetap angka yang sama
+    // persis yang tampil di card.
+    assetNumber,
+    companyOwnerName: companyOwner?.name || "",
+    locationText: buildFullPath({
+      buildingName: locationSelection.buildingName,
+      floorName: locationSelection.floorName,
+      roomName: locationSelection.roomName,
+      areaName: locationSelection.areaName,
+    }),
+    assetStatus,
+    condition,
+  } as Asset;
+
+  const handleCopyCode = async () => {
+    if (!assetCode) return;
+    try {
+      await navigator.clipboard.writeText(assetCode);
+      setCodeCopied(true);
+      setToast({ type: "success", message: "Kode aset berhasil disalin" });
+      setTimeout(() => setCodeCopied(false), 1500);
+    } catch {
+      // clipboard tidak tersedia — abaikan diam-diam
+    }
+  };
+
+  // "Adjust state during render" (BUKAN di dalam useEffect, supaya tidak
+  // kena react-hooks/set-state-in-effect) — reset preview setiap kali
+  // kombinasi dependency berubah tapi belum lengkap. Ikut roomId/divisionId
+  // supaya ganti Ruangan/Divisi dalam Gedung yang sama juga memicu reset
+  // (dua-duanya bisa mengubah locationCodeForGeneration).
+  const codeDepsSignature = `${companyOwnerId}|${divisionOwnerId}|${category?.id || ""}|${purchaseDate}|${locationSelection.buildingId}|${locationSelection.roomId}`;
+  const [prevCodeDepsSignature, setPrevCodeDepsSignature] = useState(codeDepsSignature);
+  if (codeDepsSignature !== prevCodeDepsSignature) {
+    setPrevCodeDepsSignature(codeDepsSignature);
+    if (!codeDepsReady) {
+      setAssetNumber(null);
+      setAssetCode("");
+    }
+    setCodeGenerationError(codeNotReadyReason);
+  }
+
+  // "Membuat nomor/kode..." diturunkan (BUKAN state useEffect terpisah) —
+  // siap secara dependency tapi preview belum terisi = sedang diproses.
+  const codeGenerating = codeDepsReady && assetNumber === null && !codeGenerationError;
+
   useEffect(() => {
-    if (!autoCode || !category) return;
+    if (!codeDepsReady || !companyOwner || !category) return;
     let cancelled = false;
-    console.info("[Asset Create] stage=generate_asset_code START", { categoryCode: category.categoryCode });
-    generateAssetCode(category.categoryCode)
-      .then((code) => {
-        console.info("[Asset Create] stage=generate_asset_code SUCCESS", { assetCode: code });
-        if (!cancelled) setAssetCode(code);
+    Promise.all([
+      previewNextAssetNumber(companyOwnerId),
+      previewNextAssetCode({
+        companyId: companyOwnerId,
+        companyCode: deriveCompanyCode(companyOwner.name),
+        dateForCode: dateForCodeGeneration,
+        locationCode: locationCodeForGeneration,
+        categoryCode: normalizeCategoryCodePart(category.categoryCode),
+      }),
+    ])
+      .then(([nextNumber, nextCode]) => {
+        if (cancelled) return;
+        setAssetNumber(nextNumber);
+        setAssetCode(nextCode);
+        setCodeGenerationError("");
       })
       .catch((err) => {
-        // Section 6/7 — generateAssetCode TIDAK menulis ke asset_counters
-        // (hitung dari collection assets langsung), tapi query itu sendiri
-        // tetap bisa gagal (mis. permission-denied) — jangan biarkan
-        // pembuatan kode aset macet, pakai fallback berbasis waktu. Fallback
-        // TETAP lewat formatAssetCode (SATU fungsi format) supaya digitnya
-        // tidak pernah tergabung mentah — sequence fallback pakai 6 digit
-        // terakhir epoch ms, cukup unik dan tetap konsisten formatnya.
-        const e = err as { code?: string; message?: string };
-        console.error("[Asset Create] stage=generate_asset_code FAILED, pakai fallback", {
-          errorCode: e?.code,
-          errorMessage: e?.message,
-          collection: "assets",
-          categoryCode: category.categoryCode,
-        });
-        if (!cancelled) {
-          const fallbackSequence = Number(String(Date.now()).slice(-6));
-          setAssetCode(formatAssetCode(category.categoryCode, new Date().getFullYear(), fallbackSequence));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setGeneratingCode(false);
+        console.error("[Asset Create] gagal membuat preview No./Kode Aset", err);
+        if (!cancelled) setCodeGenerationError("Gagal membuat No./Kode Aset otomatis. Coba lagi.");
       });
     return () => {
       cancelled = true;
     };
-  }, [autoCode, category]);
-
-  const handleCategoryChange = (value: string) => {
-    setCategoryId(value);
-    if (autoCode) setGeneratingCode(true);
-  };
-
-  const handleToggleAutoCode = () => {
-    const next = !autoCode;
-    setAutoCode(next);
-    if (next && category) setGeneratingCode(true);
-  };
+  }, [codeDepsReady, companyOwnerId, companyOwner, category, dateForCodeGeneration, locationCodeForGeneration]);
 
   // Baris utama SELALU nama, baris kecil divisi/perusahaan/jabatan — email
   // TIDAK PERNAH ditampilkan, cuma dipakai sebagai kata kunci pencarian.
@@ -450,22 +613,32 @@ export default function NewAssetPage() {
 
     const errors: Record<string, string> = {};
     if (!assetName.trim()) errors.assetName = "Nama aset wajib diisi.";
-    if (!assetCode.trim()) errors.assetCode = "Kode aset wajib diisi.";
     if (!categoryId) errors.categoryId = "Kategori wajib dipilih.";
-    if (!brand.trim()) errors.brand = "Merk wajib diisi.";
-    if (!model.trim()) errors.model = "Model/Tipe wajib diisi.";
     if (!companyOwnerId) errors.companyOwnerId = "Perusahaan/Brand wajib dipilih.";
+    if (!purchaseDate) errors.purchaseDate = "Tanggal Perolehan wajib diisi.";
     // PIC Lokasi bisa ditugaskan di level Gedung/Lantai/Area juga (bukan
     // wajib sampai Ruangan) — cukup pastikan dia sudah memilih salah satu
-    // lokasi tanggung jawabnya.
+    // lokasi tanggung jawabnya. locationErrorLevel dipakai border merah +
+    // scroll/focus per-level di LocationCascadeFields (Field yang sama
+    // sekali tidak pernah kena error: Area, karena opsional).
+    let locationErrorLevel: "building" | "floor" | "room" | null = null;
     if (isLocationPicRole) {
       if (!selectedPicLocationId) errors.location = "Lokasi tanggung jawab wajib dipilih.";
     } else if (!locationSelection.buildingId) {
       errors.location = "Gedung wajib dipilih.";
+      locationErrorLevel = "building";
     } else if (!locationSelection.floorId) {
       errors.location = "Lantai wajib dipilih.";
+      locationErrorLevel = "floor";
     } else if (!locationSelection.roomId) {
       errors.location = "Ruangan wajib dipilih.";
+      locationErrorLevel = "room";
+    }
+    if (!quantity || quantity < 1) errors.quantity = "Qty minimal 1.";
+    if (codeGenerationError) {
+      errors.assetCode = codeGenerationError;
+    } else if (!assetCode || assetNumber === null) {
+      errors.assetCode = "No./Kode Aset belum bisa dibuat — lengkapi Perusahaan, Kategori, Tanggal Perolehan, dan Lokasi.";
     }
     if (!ownershipStatus) errors.ownershipStatus = "Status kepemilikan wajib dipilih.";
     if (trackingMode === "assigned_pic" && !responsiblePersonUid)
@@ -475,7 +648,9 @@ export default function NewAssetPage() {
 
     if (Object.keys(errors).length > 0) {
       setFieldErrors(errors);
-      setError("Lengkapi field yang wajib diisi.");
+      setLocationErrorLevel(locationErrorLevel);
+      setToast({ type: "error", message: `Data belum lengkap. Ada ${Object.keys(errors).length} bagian yang perlu diperbaiki.` });
+      setErrorModalOpen(true);
       return;
     }
 
@@ -491,6 +666,35 @@ export default function NewAssetPage() {
     const currentUserUid = firebaseUser?.uid || assetUser?.uid || "";
     const currentUserName = assetUser?.name || firebaseUser?.email || "";
     const picLocationId = isLocationPicRole ? selectedPicLocationId || null : null;
+    // Section "Audit Create Asset per-stage" — SATU format log dipakai di
+    // semua stage (counter/code/asset_document/activity_log/dst) supaya
+    // kalau ada yang gagal, console langsung menunjukkan STAGE + COLLECTION
+    // + errorCode/errorMessage yang sebenarnya — bukan cuma
+    // "stage=create_assets FAILED {}" yang tidak bisa ditelusuri.
+    const logStageError = (stage: string, collectionName: string, err: unknown, context?: Record<string, unknown>) => {
+      const e = err as { code?: string; message?: string; name?: string };
+      console.error(`[Asset Create] stage=${stage} FAILED`, {
+        stage,
+        collection: collectionName,
+        role,
+        uid: currentUserUid,
+        errorCode: e?.code,
+        errorMessage: e?.message,
+        errorName: e?.name,
+        ...context,
+      });
+    };
+    // Section "Audit Create Asset per-stage" — pesan spesifik ke USER: kalau
+    // error-nya benar-benar Firestore permission-denied, bilang PERSIS
+    // collection mana yang ditolak (paling actionable untuk debug rules) —
+    // selain itu baru pakai pesan generik per-stage.
+    const getUserFacingErrorMessage = (err: unknown, collectionName: string, fallbackMessage: string) => {
+      const e = err as { code?: string };
+      if (e?.code === "permission-denied") {
+        return `Tidak memiliki izin untuk menyimpan data pada ${collectionName}.`;
+      }
+      return fallbackMessage;
+    };
     // Section 1 — dokumen `assets` dianggap berhasil dibuat SEGERA setelah
     // setDoc() sukses. Proses tambahan (log aktivitas, notifikasi QHSE)
     // TIDAK PERNAH boleh membuat halaman ini melapor "gagal" — itulah akar
@@ -508,12 +712,78 @@ export default function NewAssetPage() {
         : doc(collection(db, "assets"));
       pendingAssetIdRef.current = assetRef.id;
 
-      const codeTaken = await isAssetCodeTaken(assetCode.trim(), assetRef.id);
-      if (codeTaken) {
-        setFieldErrors({ assetCode: "Kode asset sudah digunakan." });
-        setError("Kode asset sudah digunakan.");
-        setSaving(false);
-        return;
+      // Section "Fix Create Asset PIC Lokasi" — locationId PERSIS sama
+      // dengan locationId yang nanti ditulis ke assetPayload (dihitung SEKALI
+      // di sini, dipakai ulang di payload di bawah) — firestore.rules
+      // (isLocationPicAssetCounterWrite) memverifikasi PIC Lokasi cuma boleh
+      // menggenerate No./Kode Aset untuk lokasi yang benar-benar dia pegang,
+      // jadi nilainya wajib konsisten antara counter dan dokumen assets.
+      const assetLocationId =
+        locationSelection.areaId ||
+        locationSelection.roomId ||
+        locationSelection.floorId ||
+        locationSelection.buildingId ||
+        null;
+      const counterWriteMeta = {
+        locationId: assetLocationId,
+        updatedByUid: currentUserUid,
+        updatedByName: currentUserName,
+      };
+
+      // Alokasi FINAL race-safe (transaction counter, lihat
+      // lib/assets/asset-code-generator.ts) — bukan cuma preview yang sudah
+      // tampil di layar, supaya dua user create hampir bersamaan tidak
+      // pernah dapat No./Kode Aset yang sama. Di-cache per percobaan submit
+      // (pendingAllocationRef) supaya retry setelah gagal parsial TIDAK
+      // membakar nomor baru lagi — tetap idempotent seperti pendingAssetIdRef.
+      let allocation = pendingAllocationRef.current;
+      if (!allocation) {
+        // Section "Audit Create Asset per-stage" — counter (No. Aset) dan
+        // code (Kode Aset) SENGAJA dipisah try/catch masing-masing (dua
+        // collection Firestore berbeda: asset_number_counters vs
+        // asset_code_counters) supaya kalau salah satu gagal permission,
+        // pesannya spesifik ke stage itu — bukan generik "gagal simpan aset".
+        console.info("[Asset Create] stage=counter START", { companyOwnerId, locationId: assetLocationId });
+        let finalAssetNumber: number;
+        try {
+          finalAssetNumber = await allocateAssetNumber(companyOwnerId, counterWriteMeta);
+          console.info("[Asset Create] stage=counter SUCCESS", { assetNumber: finalAssetNumber });
+        } catch (err) {
+          logStageError("counter", "asset_number_counters", err, { companyOwnerId });
+          const message = getUserFacingErrorMessage(err, "asset_number_counters", "Gagal membuat No. Aset otomatis.");
+          setError(message);
+          setToast({ type: "error", message });
+          setSaving(false);
+          return;
+        }
+
+        console.info("[Asset Create] stage=code START", {
+          companyOwnerId,
+          categoryCode: category?.categoryCode,
+          locationCode: locationCodeForGeneration,
+        });
+        let finalAssetCode: string;
+        try {
+          finalAssetCode = await allocateAssetCode({
+            companyId: companyOwnerId,
+            companyCode: deriveCompanyCode(companyOwner?.name || ""),
+            dateForCode: formatDateForAssetCode(purchaseDate),
+            locationCode: locationCodeForGeneration,
+            categoryCode: normalizeCategoryCodePart(category?.categoryCode || ""),
+            counterMeta: counterWriteMeta,
+          });
+          console.info("[Asset Create] stage=code SUCCESS", { assetCode: finalAssetCode });
+        } catch (err) {
+          logStageError("code", "asset_code_counters", err, { companyOwnerId });
+          const message = getUserFacingErrorMessage(err, "asset_code_counters", "Gagal membuat Kode Aset.");
+          setError(message);
+          setToast({ type: "error", message });
+          setSaving(false);
+          return;
+        }
+
+        allocation = { assetNumber: finalAssetNumber, assetCode: finalAssetCode };
+        pendingAllocationRef.current = allocation;
       }
 
       // Section 8 — foto utama SUDAH terupload sebelum submit (lewat
@@ -551,14 +821,24 @@ export default function NewAssetPage() {
 
       const assetPayload = cleanFirestoreData({
         assetName: assetName.trim(),
-        assetCode: assetCode.trim(),
+        assetCode: allocation.assetCode,
+        // Section "Audit Create Asset per-stage" — Number() eksplisit (bukan
+        // cuma percaya tipe TS) supaya assetNumber TIDAK PERNAH kekirim
+        // sebagai undefined/NaN ke Firestore — ini SATU-SATUNYA field
+        // canonical No. Aset (dipakai sama di card Identitas/Ringkasan
+        // Aset/modal QR/Detail Asset/Table Asset/Export, lihat
+        // lib/assets/inventory.ts getAssetNumber()).
+        assetNumber: Number(allocation.assetNumber),
         categoryId,
         categoryName: category?.categoryName || "",
-        subCategory: subCategory.trim(),
-        brand: brand.trim(),
-        model: model.trim(),
-        serialNumber: serialNumber.trim(),
-        imei: imei.trim(),
+        // Subkategori/Merk/Model/Serial Number/IMEI dihapus dari form
+        // (tidak ada di Excel) — field SCHEMA tetap ada (kompatibel dengan
+        // data lama), cuma tidak pernah diisi lagi dari sini.
+        subCategory: "",
+        brand: "",
+        model: "",
+        serialNumber: "",
+        imei: "",
         description: description.trim(),
         ...photoFields,
 
@@ -575,12 +855,7 @@ export default function NewAssetPage() {
         roomName: locationSelection.roomName || "",
         areaId: locationSelection.areaId || null,
         areaName: locationSelection.areaName || "",
-        locationId:
-          locationSelection.areaId ||
-          locationSelection.roomId ||
-          locationSelection.floorId ||
-          locationSelection.buildingId ||
-          null,
+        locationId: assetLocationId,
         locationText: assetLocationText,
         areaPicUid: areaPic?.uid || null,
         areaPicName: areaPic?.name || null,
@@ -653,16 +928,24 @@ export default function NewAssetPage() {
         // financeStatus "pending_finance" supaya Asset Finance tahu aset ini
         // masih perlu dilengkapi. Cuma Super Admin yang bisa langsung isi
         // harga saat create (section Finance-nya juga cuma tampil untuknya).
-        purchaseDate: canViewFinanceCreate ? purchaseDate || null : null,
-        purchasePrice: canViewFinanceCreate ? purchasePrice ?? null : null,
+        // Tanggal Perolehan BUKAN field Finance (dipakai semua role, juga
+        // jadi bagian pembentuk Kode Aset) — SELALU ditulis apa adanya.
+        purchaseDate: purchaseDate || null,
+        // Number() eksplisit saat ada nilai — TAPI null tetap null (bukan 0)
+        // kalau memang belum diisi, supaya "belum ada harga" tidak diam-diam
+        // jadi "harga Rp0" di financeStatus/hasPrice() dan tampilan lain.
+        purchasePrice: canViewFinanceCreate && purchasePrice !== undefined ? Number(purchasePrice) : null,
         vendorName: canViewFinanceCreate ? vendorName.trim() : "",
-        invoiceNumber: canViewFinanceCreate ? invoiceNumber.trim() : "",
-        invoiceFileUrl: canViewFinanceCreate ? invoice?.url || "" : "",
-        invoiceFileName: canViewFinanceCreate ? invoice?.fileName || "" : "",
-        invoiceDriveFileId: canViewFinanceCreate ? invoice?.fileId || "" : "",
-        invoiceMimeType: canViewFinanceCreate ? invoice?.mimeType || "" : "",
-        invoiceSize: canViewFinanceCreate ? invoice?.size ?? null : null,
-        invoiceUploadedAt: canViewFinanceCreate ? invoice?.uploadedAt || null : null,
+        // Nomor/Bukti Invoice hanya disimpan saat Status Invoice = "Ada
+        // Invoice" — dijaga ulang di sini (bukan cuma di UI) supaya data
+        // yang kesimpan tetap benar walau state sempat tidak sinkron.
+        invoiceNumber: canViewFinanceCreate && invoiceStatus === "ada" ? invoiceNumber.trim() : "",
+        invoiceFileUrl: canViewFinanceCreate && invoiceStatus === "ada" ? invoice?.url || "" : "",
+        invoiceFileName: canViewFinanceCreate && invoiceStatus === "ada" ? invoice?.fileName || "" : "",
+        invoiceDriveFileId: canViewFinanceCreate && invoiceStatus === "ada" ? invoice?.fileId || "" : "",
+        invoiceMimeType: canViewFinanceCreate && invoiceStatus === "ada" ? invoice?.mimeType || "" : "",
+        invoiceSize: canViewFinanceCreate && invoiceStatus === "ada" ? invoice?.size ?? null : null,
+        invoiceUploadedAt: canViewFinanceCreate && invoiceStatus === "ada" ? invoice?.uploadedAt || null : null,
         fundingSource: canViewFinanceCreate ? fundingSource : "",
         purchaseMethod: canViewFinanceCreate ? purchaseMethod.trim() : "",
         estimatedUsefulLife: canViewFinanceCreate ? estimatedUsefulLife.trim() : "",
@@ -676,7 +959,7 @@ export default function NewAssetPage() {
         requiresApproval,
         accessories: accessories.trim(),
         operationalNotes: operationalNotes.trim(),
-        qrCodeValue: assetCode.trim(),
+        qrCodeValue: allocation.assetCode,
 
         currentBorrowingId: null,
         currentBorrowerUid: null,
@@ -688,47 +971,91 @@ export default function NewAssetPage() {
         updatedByName: currentUserName,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
+
+        // ── Informasi Inventaris — sama seperti field hasil Import Aset.
+        // Tanggal/Harga Perolehan, status Invoice, Kondisi & Status Foto
+        // SENGAJA diturunkan dari field Finance/Kondisi/Foto yang sudah diisi
+        // di atas (bukan input terpisah) supaya tidak ada isian ganda.
+        inventoryNumber: inventoryNumber.trim(),
+        assetType: category?.categoryName || "",
+        quantity: Number(quantity) || 1,
+        acquisitionDate: purchaseDate || null,
+        acquisitionPrice: canViewFinanceCreate && purchasePrice !== undefined ? Number(purchasePrice) : null,
+        // Dropdown eksplisit (Field "Status Invoice" di atas) — bukan
+        // diturunkan otomatis dari invoiceNumber/invoice presence, sama
+        // seperti Edit Asset/EditFinanceModal.
+        invoiceStatus: canViewFinanceCreate && invoiceStatus ? invoiceStatus : null,
+        locationRaw: assetLocationText,
+        inventoryCondition: CONDITION_LABEL[condition],
+        inventoryNotes: "",
+        photoStatus: photo?.fileId ? "Sudah" : "Belum Ditemukan",
+        physicalEvidence: physicalEvidence.trim(),
+        source: "manual",
+        operationalStatus: "active",
       }) as Record<string, unknown>;
 
-      console.info("[Asset Create] stage=create_assets START", {
+      // Section "Audit Create Asset per-stage" — payload lengkap di-log
+      // SEBELUM write, supaya kalau stage asset_document gagal, isi
+      // payload-nya (bukan cuma pesan error) langsung kelihatan di console.
+      console.log("[Asset Create] payload", assetPayload);
+
+      console.info("[Asset Create] stage=asset_document START", {
         assetId: assetRef.id,
         assetCode: assetPayload.assetCode,
       });
-      await setDoc(assetRef, assetPayload);
-      assetCreated = true;
-      console.info("[Asset Create] stage=create_assets SUCCESS", {
-        assetId: assetRef.id,
-        assetCode: assetPayload.assetCode,
-      });
+      try {
+        await setDoc(assetRef, assetPayload);
+        assetCreated = true;
+        console.info("[Asset Create] stage=asset_document SUCCESS", {
+          assetId: assetRef.id,
+          assetCode: assetPayload.assetCode,
+        });
+      } catch (err) {
+        logStageError("asset_document", "assets", err, {
+          assetId: assetRef.id,
+          assetCode: assetPayload.assetCode,
+        });
+        const message = getUserFacingErrorMessage(err, "assets", "Data Asset gagal disimpan.");
+        setError(message);
+        setToast({ type: "error", message });
+        setSaving(false);
+        return;
+      }
 
       // Section 2/6 — SEMUA proses di bawah ini bersifat TAMBAHAN. Mulai
       // titik ini, aset SUDAH tersimpan — apa pun yang terjadi selanjutnya
       // TIDAK PERNAH boleh membuat halaman ini menampilkan pesan gagal.
+      // Section "Audit Create Asset per-stage" — SETIAP stage sekunder
+      // dipetakan ke collection Firestore-nya yang BENAR (bug lama: log PIC
+      // Lokasi diberi label "update_counter" padahal menulis ke asset_logs,
+      // bukan collection counter apa pun — menyesatkan kalau sampai gagal).
+      const SECONDARY_STAGES = [
+        { key: "activity_log", collection: "asset_logs" },
+        { key: "location_pic_log", collection: "asset_logs" },
+        { key: "notification", collection: "asset_notifications" },
+      ];
       const additionalResults = await Promise.allSettled([
         (async () => {
-          console.info("[Asset Create] stage=create_activity_log START", { assetId: assetRef.id });
+          console.info("[Asset Create] stage=activity_log START", { assetId: assetRef.id });
           await writeAssetLog({
             assetId: assetRef.id,
             assetName: assetName.trim(),
-            assetCode: assetCode.trim(),
+            assetCode: allocation.assetCode,
             action: "create",
             userUid: currentUserUid,
             userName: currentUserName,
             detail: "Aset dibuat",
           });
-          console.info("[Asset Create] stage=create_activity_log SUCCESS", { assetId: assetRef.id });
+          console.info("[Asset Create] stage=activity_log SUCCESS", { assetId: assetRef.id });
         })(),
         (async () => {
           // Section 4/6 — log aktivitas KHUSUS saat aset dibuat oleh PIC
           // Lokasi, payload PERSIS seperti diminta, ditulis ke asset_logs
           // (bukan asset_activity_logs yang aksesnya dibatasi ke
           // canViewAssetMaintenance, sementara PIC Lokasi tidak selalu
-          // punya akses itu). Section 6 — generateAssetCode di lib ini
-          // TIDAK menulis ke collection asset_counters sama sekali (nomor
-          // urut dihitung langsung dari collection assets), jadi tidak ada
-          // "update_counter" terpisah yang perlu dijalankan di sini.
+          // punya akses itu).
           if (!isLocationPicRole) return;
-          console.info("[Asset Create] stage=update_counter (log PIC Lokasi) START", { assetId: assetRef.id });
+          console.info("[Asset Create] stage=location_pic_log START", { assetId: assetRef.id });
           await addDoc(collection(db, "asset_logs"), {
             assetId: assetRef.id,
             locationId: picLocationId,
@@ -737,10 +1064,10 @@ export default function NewAssetPage() {
             action: "asset_created_by_location_pic",
             timestamp: serverTimestamp(),
           });
-          console.info("[Asset Create] stage=update_counter (log PIC Lokasi) SUCCESS", { assetId: assetRef.id });
+          console.info("[Asset Create] stage=location_pic_log SUCCESS", { assetId: assetRef.id });
         })(),
         (async () => {
-          console.info("[Asset Create] stage=create_notification START", { assetId: assetRef.id });
+          console.info("[Asset Create] stage=notification START", { assetId: assetRef.id });
           const notifyRecipients = (await fetchActiveUsersByRoles(["asset_admin", "super_admin"])).filter(
             (u) => u.uid !== assetUser?.uid
           );
@@ -751,29 +1078,43 @@ export default function NewAssetPage() {
                 recipientName: recipient.name,
                 recipientRole: recipient.role,
                 title: "Asset Baru Ditambahkan",
-                message: `${assetName.trim()} (${assetCode.trim()}) ditambahkan oleh ${assetUser?.name || "seseorang"}.`,
+                message: `${assetName.trim()} (${allocation.assetCode}) ditambahkan oleh ${assetUser?.name || "seseorang"}.`,
                 type: "asset_created",
                 priority: "low",
                 linkUrl: `/assets/${assetRef.id}`,
                 relatedType: "asset",
                 relatedId: assetRef.id,
-                relatedNumber: assetCode.trim(),
+                relatedNumber: allocation.assetCode,
                 createdByUid: assetUser?.uid,
                 createdByName: assetUser?.name,
               })
             )
           );
-          console.info("[Asset Create] stage=create_notification SUCCESS", { assetId: assetRef.id });
+          console.info("[Asset Create] stage=notification SUCCESS", { assetId: assetRef.id });
         })(),
       ]);
 
+      // Section 2/6 (tetap) — kegagalan di sini TIDAK PERNAH boleh membuat
+      // halaman ini melapor "Gagal membuat Asset" — dokumen assets sudah
+      // tersimpan sebelum titik ini. Tetap di-log LENGKAP (stage/collection/
+      // errorCode) sebagai console.warn (bukan .error) supaya jelas ini
+      // non-fatal, sesuai section 7/8 ticket "Audit Create Asset".
       additionalResults.forEach((result, index) => {
         if (result.status === "rejected") {
-          const OPERATION_LABELS = ["create_activity_log", "update_counter", "create_notification"];
-          console.warn("[Asset Create] proses tambahan gagal (non-fatal, aset tetap tersimpan)", {
-            operation: OPERATION_LABELS[index] || `operation_${index}`,
+          const { key: stage, collection: collectionName } = SECONDARY_STAGES[index] || {
+            key: `stage_${index}`,
+            collection: "unknown",
+          };
+          const e = result.reason as { code?: string; message?: string; name?: string };
+          console.warn(`[Asset Create] stage=${stage} FAILED (non-fatal, aset tetap tersimpan)`, {
+            stage,
+            collection: collectionName,
             assetId: assetRef.id,
-            error: result.reason,
+            role,
+            uid: currentUserUid,
+            errorCode: e?.code,
+            errorMessage: e?.message,
+            errorName: e?.name,
           });
         }
       });
@@ -808,21 +1149,15 @@ export default function NewAssetPage() {
         return;
       }
 
-      // Section 7 — error log LENGKAP (bukan cuma console.error(err) polos)
-      // supaya gagal simpan aset bisa ditelusuri: field mana, lokasi mana,
-      // dan siapa yang submit.
-      const e = err as { code?: string; message?: string };
-      console.error("[Asset Create] stage=create_assets FAILED", {
-        errorCode: e?.code,
-        errorMessage: e?.message,
-        collection: "assets",
+      // Section 7 — titik ini SEHARUSNYA jarang tercapai: counter/code/
+      // asset_document masing-masing sudah punya try/catch + pesan spesifik
+      // sendiri (return lebih awal). Kalau tetap sampai sini berarti error
+      // TIDAK TERDUGA (mis. dari helper sinkron seperti buildFullPath/
+      // resolveAreaPic) — tetap di-log LENGKAP, bukan cuma err mentah,
+      // supaya tetap bisa ditelusuri dari console.
+      logStageError("unexpected", "unknown", err, {
         documentId: pendingAssetIdRef.current,
-        payloadKeys: [
-          "assetName", "assetCode", "categoryId", "locationId", "locationText",
-          "createdByUid", "createdByName", "updatedByUid", "updatedByName",
-        ],
         locationId: picLocationId,
-        currentUserUid,
       });
       setError("Gagal menyimpan aset. Coba lagi.");
       setToast({ type: "error", message: "Gagal menyimpan aset. Coba lagi." });
@@ -841,19 +1176,26 @@ export default function NewAssetPage() {
         <form onSubmit={handleSubmit}>
           <div className="grid grid-cols-12 gap-6">
             <div className="col-span-12 xl:col-span-8 2xl:col-span-9 space-y-5">
-              <FormSection step={1} title="Informasi Aset">
+              {/* Section "Rombak Tambah/Edit Asset" — SATU section berisi
+                  semua field pembentuk identitas+lokasi (Nama/Kategori/
+                  Tanggal/Qty/Perusahaan/Divisi/Gedung/Lantai/Ruangan/Area),
+                  supaya card "Identitas Aset Otomatis" tepat di bawahnya
+                  bisa langsung merefleksikan hasilnya tanpa scroll jauh. */}
+              <FormSection step={1} title="Identitas & Lokasi Asset">
                 <Field label="Nama Aset" required error={fieldErrors.assetName}>
                   <input
+                    id="field-assetName"
                     value={assetName}
                     onChange={(e) => setAssetName(e.target.value)}
-                    className="input"
+                    className={errCls(!!fieldErrors.assetName)}
                   />
                 </Field>
                 <Field label="Kategori" required error={fieldErrors.categoryId}>
                   <select
+                    id="field-categoryId"
                     value={categoryId}
-                    onChange={(e) => handleCategoryChange(e.target.value)}
-                    className="input"
+                    onChange={(e) => setCategoryId(e.target.value)}
+                    className={errCls(!!fieldErrors.categoryId)}
                   >
                     <option value="">Pilih kategori</option>
                     {categories.map((c) => (
@@ -864,75 +1206,210 @@ export default function NewAssetPage() {
                   </select>
                 </Field>
 
+                <Field label="Tanggal Perolehan" required error={fieldErrors.purchaseDate}>
+                  <input
+                    id="field-purchaseDate"
+                    type="date"
+                    value={purchaseDate}
+                    onChange={(e) => setPurchaseDate(e.target.value)}
+                    className={errCls(!!fieldErrors.purchaseDate)}
+                  />
+                </Field>
                 <Field
-                  label="Kode Asset"
+                  label="Qty"
                   required
-                  full
-                  error={fieldErrors.assetCode}
+                  error={fieldErrors.quantity}
+                  hint="Jumlah unit fisik yang diwakili SATU dokumen aset ini."
+                >
+                  <input
+                    id="field-quantity"
+                    type="number"
+                    min={1}
+                    value={quantity}
+                    onChange={(e) => setQuantity(Math.max(1, Number(e.target.value) || 1))}
+                    className={errCls(!!fieldErrors.quantity)}
+                  />
+                </Field>
+
+                <Field
+                  label="Perusahaan/Brand Pemilik"
+                  required
+                  error={fieldErrors.companyOwnerId}
+                  hint={brands.length === 0 ? "Tidak ada data perusahaan/brand dari HRP." : undefined}
+                >
+                  <SearchableSelect
+                    id="field-companyOwnerId"
+                    items={brandItems}
+                    value={companyOwnerId}
+                    onChange={handleCompanyChange}
+                    placeholder="Pilih perusahaan/brand"
+                    searchPlaceholder="Cari brand..."
+                    emptyText="Tidak ada brand yang cocok."
+                    error={!!fieldErrors.companyOwnerId}
+                  />
+                </Field>
+                <Field
+                  label="Divisi Pengguna"
                   hint={
-                    autoCode && !category
-                      ? "Kode akan dibuat otomatis setelah kategori dipilih."
+                    !companyOwnerId
+                      ? "Pilih perusahaan/brand terlebih dahulu"
+                      : loadingDivisions
+                      ? "Memuat divisi..."
+                      : divisions.length === 0
+                      ? "Tidak ada data divisi untuk brand ini."
                       : undefined
                   }
                 >
-                  <div className="flex gap-2">
-                    <input
-                      value={
-                        autoCode && generatingCode ? "Membuat kode..." : assetCode
-                      }
-                      onChange={(e) => setAssetCode(e.target.value)}
-                      readOnly={autoCode}
-                      className={`input flex-1 ${autoCode ? "bg-slate-50 text-slate-500" : ""}`}
-                      placeholder={
-                        autoCode ? "Pilih kategori untuk membuat kode" : "mis. AST-LAP-2026-0001"
-                      }
-                    />
-                    <button
-                      type="button"
-                      onClick={handleToggleAutoCode}
-                      className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50 shrink-0"
-                    >
-                      {autoCode ? <Pencil size={13} /> : <Wand2 size={13} />}
-                      {autoCode ? "Edit Manual" : "Auto Generate"}
-                    </button>
-                  </div>
+                  <select
+                    value={divisionOwnerId}
+                    onChange={(e) => setDivisionOwnerId(e.target.value)}
+                    disabled={!companyOwnerId || loadingDivisions}
+                    className="input disabled:bg-slate-50 disabled:text-slate-400"
+                  >
+                    <option value="">Pilih divisi</option>
+                    {divisions.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.name}
+                      </option>
+                    ))}
+                  </select>
                 </Field>
 
-                <Field label="Subkategori">
-                  <input
-                    value={subCategory}
-                    onChange={(e) => setSubCategory(e.target.value)}
-                    className="input"
-                  />
-                </Field>
-                <Field label="Merk" required error={fieldErrors.brand}>
-                  <input
-                    value={brand}
-                    onChange={(e) => setBrand(e.target.value)}
-                    className="input"
-                  />
-                </Field>
-                <Field label="Model/Tipe" required error={fieldErrors.model}>
-                  <input
-                    value={model}
-                    onChange={(e) => setModel(e.target.value)}
-                    className="input"
-                  />
-                </Field>
-                <Field label="Serial Number">
-                  <input
-                    value={serialNumber}
-                    onChange={(e) => setSerialNumber(e.target.value)}
-                    className="input"
-                  />
-                </Field>
-                <Field label="IMEI">
-                  <input
-                    value={imei}
-                    onChange={(e) => setImei(e.target.value)}
-                    className="input"
-                  />
-                </Field>
+                <div className="sm:col-span-2" id="field-location">
+                  <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                    Lokasi Asset <span className="text-red-500">*</span>
+                  </label>
+                  {isLocationPicRole ? (
+                    <PicLocationField
+                      assignedPicLocations={myPicLocations}
+                      locations={locations}
+                      selectedLocationId={selectedPicLocationId}
+                      onSelectLocation={setSelectedPicLocationId}
+                    />
+                  ) : (
+                    <LocationCascadeFields
+                      locations={scopedLocations}
+                      value={locationSelection}
+                      onChange={setLocationSelection}
+                      errorLevel={locationErrorLevel}
+                    />
+                  )}
+                  {fieldErrors.location && (
+                    <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
+                  )}
+                </div>
+              </FormSection>
+
+              {/* Section "Urutan Form Create/Edit ikuti dependency" — No./
+                  Kode Aset/QR TIDAK PERNAH diisi manual, jadi sengaja bukan
+                  bagian dari Section 1/2 (yang isinya field yang memang
+                  perlu diisi user) — ditaruh di sini, PERSIS setelah
+                  Perusahaan & Lokasi terisi, supaya user tidak perlu scroll
+                  balik ke atas atau ke sidebar untuk tahu hasilnya. */}
+              <div id="field-assetCode" className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-100">
+                  <h2 className="text-sm font-semibold text-slate-800">Identitas Aset Otomatis</h2>
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                    Dibuat Otomatis
+                  </span>
+                </div>
+                {missingCodeFields.length === 0 && !codeNotReadyReason ? (
+                  <div className="flex flex-col divide-y divide-slate-100 sm:grid sm:grid-cols-[20%_55%_25%] sm:divide-y-0 sm:divide-x">
+                    <div className="flex flex-col justify-center px-4 py-3">
+                      <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">No. Aset</p>
+                      <p className="mt-0.5 text-xl font-bold text-slate-900">
+                        {codeGenerating ? "…" : assetNumber !== null ? assetNumber : "-"}
+                      </p>
+                    </div>
+                    <div className="flex flex-col justify-center px-4 py-3 min-w-0">
+                      <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Kode Aset</p>
+                      <div className="mt-0.5 flex items-center gap-2 min-w-0">
+                        <p
+                          className={`truncate font-mono text-sm font-semibold ${
+                            fieldErrors.assetCode ? "text-red-600" : "text-slate-900"
+                          }`}
+                          title={assetCode}
+                        >
+                          {codeGenerating ? "Membuat kode..." : assetCode || "-"}
+                        </p>
+                        {assetCode && !codeGenerating && (
+                          <button
+                            type="button"
+                            onClick={handleCopyCode}
+                            title="Copy Kode Aset"
+                            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-500 hover:bg-slate-50"
+                          >
+                            {codeCopied ? (
+                              <Check size={12} className="text-emerald-600" />
+                            ) : (
+                              <Copy size={12} />
+                            )}
+                            Copy
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 px-4 py-3">
+                      {assetCode ? (
+                        <>
+                          <div className="shrink-0 rounded-lg border border-slate-200 bg-slate-50 p-1">
+                            <QRCodeSVG
+                              value={assetCode}
+                              size={64}
+                              level="H"
+                              includeMargin
+                              imageSettings={getQrImageSettings(64)}
+                            />
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setQrModalOpen(true)}
+                            className="text-xs font-medium text-blue-600 hover:underline"
+                          >
+                            Lihat / Cetak QR
+                          </button>
+                        </>
+                      ) : (
+                        <p className="text-xs text-slate-400">Menyiapkan...</p>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="px-4 py-3">
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5">
+                      {missingCodeFields.length === 1 ? (
+                        <p className="text-sm font-medium text-amber-800">
+                          {missingCodeFields[0] === "Tanggal Perolehan"
+                            ? "Isi Tanggal Perolehan untuk membuat Kode Aset."
+                            : `Pilih ${missingCodeFields[0]} untuk membuat Kode Aset.`}
+                        </p>
+                      ) : missingCodeFields.length > 1 ? (
+                        <>
+                          <p className="text-sm font-medium text-amber-800">Kode Aset belum dapat dibuat</p>
+                          <p className="mt-2 text-xs text-amber-700">Masih diperlukan:</p>
+                          <ul className="mt-1 list-inside list-disc text-xs text-amber-700">
+                            {missingCodeFields.map((f) => (
+                              <li key={f}>{f}</li>
+                            ))}
+                          </ul>
+                        </>
+                      ) : (
+                        <p className="text-sm font-medium text-amber-800">{codeNotReadyReason}</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {fieldErrors.assetCode && (
+                  <p className="px-4 pb-3 text-xs text-red-600">{fieldErrors.assetCode}</p>
+                )}
+              </div>
+
+              {qrModalOpen && (
+                <QrLabelModal asset={qrPreviewAsset} open={qrModalOpen} onClose={() => setQrModalOpen(false)} />
+              )}
+
+              <FormSection step={2} title="Dokumentasi Asset">
                 <Field label="Foto Aset" full>
                   <FileUploadField
                     kind="image"
@@ -965,72 +1442,31 @@ export default function NewAssetPage() {
                     rows={2}
                   />
                 </Field>
-              </FormSection>
-
-              <FormSection step={2} title="Kepemilikan & Lokasi">
-                <Field
-                  label="Perusahaan/Brand Pemilik"
-                  required
-                  error={fieldErrors.companyOwnerId}
-                  hint={brands.length === 0 ? "Tidak ada data perusahaan/brand dari HRP." : undefined}
-                >
-                  <SearchableSelect
-                    items={brandItems}
-                    value={companyOwnerId}
-                    onChange={handleCompanyChange}
-                    placeholder="Pilih perusahaan/brand"
-                    searchPlaceholder="Cari brand..."
-                    emptyText="Tidak ada brand yang cocok."
+                <Field label="Bukti Fisik Aset" full hint="Catatan verifikasi fisik, mis. tanggal ditemukan/dihapuskan.">
+                  <input
+                    value={physicalEvidence}
+                    onChange={(e) => setPhysicalEvidence(e.target.value)}
+                    className="input"
                   />
                 </Field>
+                {/* Section "Rombak Tambah/Edit Asset" — dipertegas BUKAN
+                    No. Aset (yang dibuat otomatis di card di atas) — cuma
+                    label lama/manual dari pencatatan sebelum sistem ini,
+                    TIDAK PERNAH ikut membentuk No./Kode Aset/QR. */}
                 <Field
-                  label="Divisi Pengguna"
-                  hint={
-                    !companyOwnerId
-                      ? "Pilih perusahaan/brand terlebih dahulu"
-                      : loadingDivisions
-                      ? "Memuat divisi..."
-                      : divisions.length === 0
-                      ? "Tidak ada data divisi untuk brand ini."
-                      : undefined
-                  }
+                  label="Nomor Inventaris Lama"
+                  full
+                  hint="Nomor inventaris lama/label fisik sebelumnya jika asset sudah pernah tercatat. Kosongkan untuk asset baru."
                 >
-                  <select
-                    value={divisionOwnerId}
-                    onChange={(e) => setDivisionOwnerId(e.target.value)}
-                    disabled={!companyOwnerId || loadingDivisions}
-                    className="input disabled:bg-slate-50 disabled:text-slate-400"
-                  >
-                    <option value="">Pilih divisi</option>
-                    {divisions.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name}
-                      </option>
-                    ))}
-                  </select>
+                  <input
+                    value={inventoryNumber}
+                    onChange={(e) => setInventoryNumber(e.target.value)}
+                    className="input"
+                  />
                 </Field>
-                <div className="sm:col-span-2">
-                  <label className="block text-xs font-medium text-slate-500 mb-1.5">
-                    Lokasi Asset <span className="text-red-500">*</span>
-                  </label>
-                  {isLocationPicRole ? (
-                    <PicLocationField
-                      assignedPicLocations={myPicLocations}
-                      locations={locations}
-                      selectedLocationId={selectedPicLocationId}
-                      onSelectLocation={setSelectedPicLocationId}
-                    />
-                  ) : (
-                    <LocationCascadeFields
-                      locations={scopedLocations}
-                      value={locationSelection}
-                      onChange={setLocationSelection}
-                    />
-                  )}
-                  {fieldErrors.location && (
-                    <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
-                  )}
-                </div>
+              </FormSection>
+
+              <FormSection step={3} title="Pengelolaan Asset">
                 <Field
                   label="Mode Tracking Aset"
                   hint={TRACKING_MODE_OPTIONS.find((o) => o.value === trackingMode)?.hint}
@@ -1099,16 +1535,8 @@ export default function NewAssetPage() {
               </FormSection>
 
               {canViewFinanceCreate && (
-              <FormSection step={3} title="Finance / Bukti Pembelian">
-                <Field label="Tanggal Pembelian">
-                  <input
-                    type="date"
-                    value={purchaseDate}
-                    onChange={(e) => setPurchaseDate(e.target.value)}
-                    className="input"
-                  />
-                </Field>
-                <Field label="Harga Beli">
+              <FormSection step={4} title="Informasi Keuangan">
+                <Field label="Harga Perolehan">
                   <CurrencyInput value={purchasePrice} onChange={setPurchasePrice} />
                 </Field>
                 <Field label="Vendor">
@@ -1118,31 +1546,60 @@ export default function NewAssetPage() {
                     className="input"
                   />
                 </Field>
-                <Field label="Nomor Invoice">
-                  <input
-                    value={invoiceNumber}
-                    onChange={(e) => setInvoiceNumber(e.target.value)}
+                <Field label="Status Invoice">
+                  <select
+                    value={invoiceStatus}
+                    onChange={(e) => {
+                      const next = e.target.value as InvoiceStatus | "";
+                      setInvoiceStatus(next);
+                      // Nomor/Bukti Invoice hanya relevan saat "Ada Invoice" —
+                      // pindah ke status lain mengosongkan state sementara ini
+                      // (belum ada asset tersimpan di Create, jadi aman
+                      // langsung direset, bukan cuma disembunyikan).
+                      if (next !== "ada") {
+                        setInvoiceNumber("");
+                        setInvoice(null);
+                      }
+                    }}
                     className="input"
-                  />
+                  >
+                    <option value="">Belum diisi</option>
+                    {(Object.keys(INVOICE_STATUS_LABEL) as InvoiceStatus[]).map((s) => (
+                      <option key={s} value={s}>
+                        {INVOICE_STATUS_LABEL[s]}
+                      </option>
+                    ))}
+                  </select>
                 </Field>
-                <Field label="Upload Invoice" full>
-                  <FileUploadField
-                    kind="file"
-                    uploadType="invoice"
-                    accept={["pdf", "jpg", "jpeg", "png"]}
-                    maxSizeMB={10}
-                    value={
-                      invoice
-                        ? { url: invoice.url, fileName: invoice.fileName, size: invoice.size }
-                        : null
-                    }
-                    meta={{ assetCode, assetName }}
-                    onUploadStateChange={setInvoiceUploading}
-                    onUploaded={(result) => setInvoice(result)}
-                    onRemove={() => setInvoice(null)}
-                    onError={(msg) => setToast({ type: "error", message: msg })}
-                  />
-                </Field>
+                {invoiceStatus === "ada" && (
+                  <>
+                    <Field label="Nomor Invoice">
+                      <input
+                        value={invoiceNumber}
+                        onChange={(e) => setInvoiceNumber(e.target.value)}
+                        className="input"
+                      />
+                    </Field>
+                    <Field label="Bukti Invoice" full>
+                      <FileUploadField
+                        kind="file"
+                        uploadType="invoice"
+                        accept={["pdf", "jpg", "jpeg", "png"]}
+                        maxSizeMB={10}
+                        value={
+                          invoice
+                            ? { url: invoice.url, fileName: invoice.fileName, size: invoice.size }
+                            : null
+                        }
+                        meta={{ assetCode, assetName }}
+                        onUploadStateChange={setInvoiceUploading}
+                        onUploaded={(result) => setInvoice(result)}
+                        onRemove={() => setInvoice(null)}
+                        onError={(msg) => setToast({ type: "error", message: msg })}
+                      />
+                    </Field>
+                  </>
+                )}
                 <Field label="Sumber Dana">
                   <select
                     value={fundingSource}
@@ -1182,7 +1639,7 @@ export default function NewAssetPage() {
               )}
 
               <FormSection
-                step={4}
+                step={5}
                 title="Kondisi & Status Aset"
                 description="Kondisi fisik dan status operasional barang — TERPISAH dari status pemakaian (Dipinjam/Tersedia diatur otomatis lewat proses pinjam/kembali)."
               >
@@ -1206,9 +1663,10 @@ export default function NewAssetPage() {
                 </Field>
                 <Field label="Kondisi Aset" required error={fieldErrors.condition}>
                   <select
+                    id="field-condition"
                     value={condition}
                     onChange={(e) => setCondition(e.target.value as AssetCondition)}
-                    className="input"
+                    className={errCls(!!fieldErrors.condition)}
                   >
                     {CONDITION_OPTIONS.map((c) => (
                       <option key={c} value={c}>
@@ -1220,7 +1678,7 @@ export default function NewAssetPage() {
               </FormSection>
 
               <FormSection
-                step={5}
+                step={6}
                 title="Pengaturan Pemakaian Aset"
                 description="QR Code akan digenerate otomatis dari kode aset."
               >
@@ -1271,8 +1729,12 @@ export default function NewAssetPage() {
                     <dd className="font-medium text-slate-800">{assetName || "-"}</dd>
                   </div>
                   <div>
+                    <dt className="text-xs text-slate-400">No. Aset</dt>
+                    <dd className="font-medium text-slate-800">{assetNumber !== null ? assetNumber : "-"}</dd>
+                  </div>
+                  <div>
                     <dt className="text-xs text-slate-400">Kode Aset</dt>
-                    <dd className="font-medium text-slate-800">{assetCode || "-"}</dd>
+                    <dd className="font-medium text-slate-800 break-all">{assetCode || "-"}</dd>
                   </div>
                   <div>
                     <dt className="text-xs text-slate-400">Kategori</dt>
@@ -1281,39 +1743,26 @@ export default function NewAssetPage() {
                     </dd>
                   </div>
                   <div>
+                    <dt className="text-xs text-slate-400">Perusahaan</dt>
+                    <dd className="font-medium text-slate-800">
+                      {companyOwner?.name || "-"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-slate-400">Lokasi</dt>
+                    <dd className="font-medium text-slate-800">
+                      {[locationSelection.buildingName, locationSelection.floorName, locationSelection.roomName]
+                        .filter(Boolean)
+                        .join(" / ") || "-"}
+                    </dd>
+                  </div>
+                  <div>
                     <dt className="text-xs text-slate-400">Status Asset</dt>
                     <dd className="font-medium text-slate-800">
                       {ASSET_STATUS_LABEL[assetStatus]}
                     </dd>
                   </div>
-                  <div>
-                    <dt className="text-xs text-slate-400">Perusahaan/Brand</dt>
-                    <dd className="font-medium text-slate-800">
-                      {companyOwner?.name || "-"}
-                    </dd>
-                  </div>
                 </dl>
-              </div>
-
-              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex flex-col items-center">
-                <h2 className="font-semibold text-slate-800 mb-4 self-start">
-                  Preview QR
-                </h2>
-                {assetCode ? (
-                  <div className="p-3 rounded-xl border border-slate-200 bg-slate-50">
-                    <QRCodeSVG
-                      value={assetCode}
-                      size={140}
-                      level="H"
-                      includeMargin
-                      imageSettings={getQrImageSettings(140)}
-                    />
-                  </div>
-                ) : (
-                  <p className="text-xs text-slate-400 text-center py-8">
-                    QR akan tersedia setelah kode aset dibuat.
-                  </p>
-                )}
               </div>
 
               <div className="bg-blue-50/60 rounded-2xl border border-blue-100 p-5">
@@ -1353,6 +1802,12 @@ export default function NewAssetPage() {
         </form>
       </div>
 
+      <AssetFieldErrorModal
+        open={errorModalOpen}
+        errors={fieldErrors}
+        fieldOrder={REQUIRED_FIELD_ORDER}
+        onClose={() => setErrorModalOpen(false)}
+      />
       <Toast toast={toast} onClose={() => setToast(null)} />
     </ProtectedLayout>
   );

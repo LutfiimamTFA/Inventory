@@ -64,6 +64,14 @@ export default function LocationFormModal({
   const [roomId, setRoomId] = useState("");
   const [name, setName] = useState("");
   const [buildingCode, setBuildingCode] = useState("");
+  // Section "Perbaiki generator Kode Aset" — floorCode/roomCode/areaCode
+  // SEMUANYA opsional (beda dari buildingCode yang wajib+unik) — generator
+  // Kode Aset memprioritaskan roomCode kalau ada, baru fallback ke
+  // buildingCode (lihat resolveOperationalLocationCode). floorCode/areaCode
+  // belum dipakai generator, disiapkan untuk kebutuhan lain.
+  const [floorCode, setFloorCode] = useState("");
+  const [roomCode, setRoomCode] = useState("");
+  const [areaCode, setAreaCode] = useState("");
   const [roomFunction, setRoomFunction] = useState("");
   const [notes, setNotes] = useState("");
   const [error, setError] = useState("");
@@ -84,6 +92,9 @@ export default function LocationFormModal({
             : editingNode.areaName || ""
         );
         setBuildingCode(editingNode.buildingCode || "");
+        setFloorCode(editingNode.floorCode || "");
+        setRoomCode(editingNode.roomCode || "");
+        setAreaCode(editingNode.areaCode || "");
         setRoomFunction(editingNode.roomFunction || "");
         setNotes(editingNode.notes || "");
         const parentChain = editingNode.parentPath;
@@ -94,6 +105,9 @@ export default function LocationFormModal({
         setLocationType(defaultType);
         setName("");
         setBuildingCode("");
+        setFloorCode("");
+        setRoomCode("");
+        setAreaCode("");
         setRoomFunction("");
         setNotes("");
         if (defaultType === "building") {
@@ -147,6 +161,21 @@ export default function LocationFormModal({
     if (locationType !== "building" && !buildingId) return "Gedung wajib dipilih.";
     if ((locationType === "room" || locationType === "area") && !floorId) return "Lantai wajib dipilih.";
     if (locationType === "area" && !roomId) return "Ruangan wajib dipilih.";
+    // Section "Validasi Create/Edit Asset" — Kode Gedung WAJIB & UNIQUE
+    // (dipakai membentuk Kode Aset otomatis, lihat lib/assets/asset-code-generator.ts
+    // — tanpa Kode Gedung, Kode Aset tidak pernah bisa dibuat untuk aset di
+    // gedung ini).
+    if (locationType === "building") {
+      if (!buildingCode.trim()) return "Kode Gedung wajib diisi.";
+      const normalizedCode = buildingCode.trim().toUpperCase();
+      const duplicate = locations.some(
+        (n) =>
+          n.locationType === "building" &&
+          n.id !== editingNode?.id &&
+          (n.buildingCode || "").trim().toUpperCase() === normalizedCode
+      );
+      if (duplicate) return `Kode Gedung "${buildingCode.trim()}" sudah dipakai Gedung lain — Kode Gedung harus unik.`;
+    }
     return "";
   };
 
@@ -189,6 +218,9 @@ export default function LocationFormModal({
             : "",
         areaName: locationType === "area" ? name.trim() : "",
         buildingCode: locationType === "building" ? buildingCode.trim() : "",
+        floorCode: locationType === "floor" ? floorCode.trim() : "",
+        roomCode: locationType === "room" ? roomCode.trim() : "",
+        areaCode: locationType === "area" ? areaCode.trim() : "",
         roomFunction: locationType === "room" ? roomFunction.trim() : "",
         notes: notes.trim(),
         parentId,
@@ -367,13 +399,49 @@ export default function LocationFormModal({
 
           {locationType === "building" && (
             <div>
-              <FormLabel>Kode Gedung (opsional)</FormLabel>
+              <FormLabel>
+                Kode Gedung <span className="text-red-500">*</span>
+              </FormLabel>
               <input
                 value={buildingCode}
                 onChange={(e) => setBuildingCode(e.target.value)}
-                placeholder="mis. GDA"
+                placeholder="mis. AVE, GRH"
+                className={`input min-h-12 rounded-xl ${
+                  error === "Kode Gedung wajib diisi." || error.startsWith('Kode Gedung "') ? "border-red-500" : ""
+                }`}
+              />
+              <p className="mt-1.5 text-xs text-slate-400">
+                Kode singkat unik untuk gedung ini (mis. Avenue → AVE, Grha → GRH) — dipakai membentuk Kode Aset
+                otomatis kalau Ruangan aset tidak punya Kode Ruangan sendiri (lihat Kode Ruangan di bawah).
+              </p>
+            </div>
+          )}
+
+          {locationType === "floor" && (
+            <div>
+              <FormLabel>Kode Lantai (opsional)</FormLabel>
+              <input
+                value={floorCode}
+                onChange={(e) => setFloorCode(e.target.value)}
+                placeholder="mis. L2"
                 className="input min-h-12 rounded-xl"
               />
+            </div>
+          )}
+
+          {locationType === "room" && (
+            <div>
+              <FormLabel>Kode Ruangan (opsional)</FormLabel>
+              <input
+                value={roomCode}
+                onChange={(e) => setRoomCode(e.target.value)}
+                placeholder="mis. DTIC"
+                className="input min-h-12 rounded-xl"
+              />
+              <p className="mt-1.5 text-xs text-slate-400">
+                Kalau diisi, Kode Ruangan ini DIUTAMAKAN dibanding Kode Gedung saat membentuk Kode Aset
+                otomatis di Create/Edit Asset (mis. Ruangan &quot;DTIC&quot; → EGS.18/08/2026.DTIC.G-B01).
+              </p>
             </div>
           )}
 
@@ -384,6 +452,18 @@ export default function LocationFormModal({
                 value={roomFunction}
                 onChange={(e) => setRoomFunction(e.target.value)}
                 placeholder="mis. Ruang Kerja Finance"
+                className="input min-h-12 rounded-xl"
+              />
+            </div>
+          )}
+
+          {locationType === "area" && (
+            <div>
+              <FormLabel>Kode Area (opsional)</FormLabel>
+              <input
+                value={areaCode}
+                onChange={(e) => setAreaCode(e.target.value)}
+                placeholder="mis. PRN"
                 className="input min-h-12 rounded-xl"
               />
             </div>

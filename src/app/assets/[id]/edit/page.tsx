@@ -12,6 +12,7 @@ import {
   updateDoc,
 } from "firebase/firestore";
 import { QRCodeSVG } from "qrcode.react";
+import { Copy, Check } from "lucide-react";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { isAssetInMyPicLocation } from "@/lib/locations";
@@ -26,14 +27,23 @@ import {
   FundingSource,
   HrpBrand,
   HrpDivision,
+  InvoiceStatus,
   OwnershipStatus,
 } from "@/lib/types";
+import { INVOICE_STATUS_LABEL } from "@/lib/assets/inventory";
+import { diffAssetFields, buildAssetChangeSummary } from "@/lib/assets/audit-log";
+import {
+  allocateAssetCode,
+  deriveCompanyCode,
+  formatDateForAssetCode,
+  resolveOperationalLocationCode,
+} from "@/lib/assets/asset-code-generator";
 import { fetchHrpBrands, fetchHrpDivisions } from "@/lib/hrp";
 import {
   EmployeeOption,
   fetchActiveEmployeeOptions,
   fetchActiveUsersByRoles,
-  isAssetCodeTaken,
+  normalizeCategoryCodePart,
   writeAssetLog,
 } from "@/lib/firestore-helpers";
 import { buildChangeMessage, buildChangeSummary, createAssetNotification } from "@/lib/notifications";
@@ -47,6 +57,7 @@ import {
   getQrImageSettings,
 } from "@/lib/utils";
 import ProtectedLayout from "@/components/ProtectedLayout";
+import AssetFieldErrorModal from "@/components/AssetFieldErrorModal";
 import PageHeader from "@/components/PageHeader";
 import { FormSection, Field } from "@/components/FormSection";
 import Toggle from "@/components/Toggle";
@@ -54,6 +65,8 @@ import CurrencyInput from "@/components/CurrencyInput";
 import SearchableSelect, { SearchableSelectItem } from "@/components/SearchableSelect";
 import LocationCascadeFields, { LocationSelection } from "@/components/LocationCascadeFields";
 import FileUploadField from "@/components/FileUploadField";
+import PhysicalEvidenceManager from "@/components/PhysicalEvidenceManager";
+import QrLabelModal from "@/components/QrLabelModal";
 import { Toast, ToastState } from "@/components/Toast";
 
 const TRACKING_MODE_OPTIONS: { value: TrackingMode; hint: string }[] = [
@@ -107,12 +120,49 @@ const ASSET_STATUS_OPTIONS: AssetStatus[] = [
   "disposed",
 ];
 
+// Section "Riwayat Aktivitas" — field yang diikutkan diff audit log dari
+// jalur submit umum (Finance/Asset Admin/Super Admin sama-sama lewat sini).
+// Urutan SENGAJA menaruh field yang lebih "manusiawi" duluan (categoryName
+// sebelum categoryId, dst) — lihat diffAssetFields di lib/assets/audit-log.ts.
+const AUDITED_ASSET_FIELDS = [
+  "assetName", "categoryName", "categoryId", "subCategory",
+  "assetCode", "assetNumber",
+  "brand", "model", "serialNumber", "imei", "description",
+  "quantity",
+  "acquisitionDate", "purchaseDate",
+  "locationText", "location",
+  "condition", "inventoryCondition",
+  "photoUrl", "photoThumbnailUrl", "photoFileName", "photoDriveFileId", "photoMimeType", "photoSize", "photoUploadedAt",
+  "acquisitionPrice", "purchasePrice",
+  "invoiceStatus", "invoiceNumber", "vendorName", "fundingSource", "purchaseMethod", "estimatedUsefulLife", "financeNotes",
+  "responsiblePersonName", "responsiblePersonUid",
+  "ownershipStatus",
+  "assetStatus",
+];
+
 const CONDITION_OPTIONS: AssetCondition[] = [
   "new",
   "good",
   "fair",
   "minor_damage",
   "heavy_damage",
+];
+
+// Section "Validasi Create/Edit Asset" — urutan tampil form, dipakai
+// AssetFieldErrorModal untuk menentukan error PERTAMA yang di-scroll & di-
+// focus saat user klik "Perbaiki Data".
+const REQUIRED_FIELD_ORDER = [
+  "assetName",
+  "categoryId",
+  "acquisitionDate",
+  "quantity",
+  "companyOwnerId",
+  "location",
+  "assetCode",
+  "responsiblePersonUid",
+  "ownershipStatus",
+  "condition",
+  "assetStatus",
 ];
 
 export default function EditAssetPage() {
@@ -136,9 +186,25 @@ export default function EditAssetPage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  // Section "Validasi Create/Edit Asset" — locationErrorLevel: border merah
+  // per-level Gedung/Lantai/Ruangan; errorModalOpen: modal ringkasan
+  // "Periksa Data Aset".
+  const [locationErrorLevel, setLocationErrorLevel] = useState<"building" | "floor" | "room" | null>(null);
+  const [errorModalOpen, setErrorModalOpen] = useState(false);
+  // Section "Rapikan UI Identitas Aset Otomatis" — modal QR full (lihat/
+  // cetak) dari card compact, dan feedback "tersalin" sesaat di tombol Copy
+  // Kode Aset (bukan cuma toast, biar langsung kelihatan di tombolnya).
+  const [qrModalOpen, setQrModalOpen] = useState(false);
+  const [codeCopied, setCodeCopied] = useState(false);
+  const errCls = (hasError: boolean, base = "input") => (hasError ? `${base} border-red-500 focus:ring-red-500/30` : base);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [photoUploading, setPhotoUploading] = useState(false);
   const [invoiceUploading, setInvoiceUploading] = useState(false);
+  // Section "Create/Edit Asset ikuti Excel" — Kode Aset readonly, TIDAK
+  // PERNAH digenerate ulang otomatis. User harus mencentang ini dulu kalau
+  // memang bermaksud mengubah field pembentuk kode (Perusahaan/Tanggal
+  // Perolehan/Lokasi Gedung/Kategori) — lihat codeFormingChanged di bawah.
+  const [codeChangeAcknowledged, setCodeChangeAcknowledged] = useState(false);
 
   const [form, setForm] = useState<Partial<Asset>>({});
   const [locations, setLocations] = useState<AssetLocationNode[]>([]);
@@ -383,78 +449,16 @@ export default function EditAssetPage() {
       return;
     }
 
-    // Asset Finance HANYA boleh mengubah field finance (lihat
-    // isAssetFinanceUpdate di firestore.rules) — jalur submit ini WAJIB
-    // terpisah dan berjalan SEBELUM validasi field fisik (assetName,
-    // categoryId, lokasi, PIC, condition, dst) supaya tidak pernah mengirim
-    // field non-finance yang bikin updateDoc kena "Missing or insufficient
-    // permissions".
-    if (isFinanceOnlyRole) {
-      setSaving(true);
-      setError("");
-      setFieldErrors({});
-
-      try {
-        const financePayload = {
-          purchaseDate: form.purchaseDate || null,
-          purchasePrice: form.purchasePrice ?? null,
-          vendorName: form.vendorName || "",
-          invoiceNumber: form.invoiceNumber || "",
-
-          invoiceFileUrl: form.invoiceFileUrl || "",
-          invoiceFileName: form.invoiceFileName || "",
-          invoiceDriveFileId: form.invoiceDriveFileId || "",
-          invoiceMimeType: form.invoiceMimeType || "",
-          invoiceSize: form.invoiceSize ?? null,
-          invoiceUploadedAt: form.invoiceUploadedAt || null,
-
-          fundingSource: form.fundingSource || "",
-          purchaseMethod: form.purchaseMethod || "",
-          estimatedUsefulLife: form.estimatedUsefulLife || "",
-          financeNotes: form.financeNotes || "",
-
-          financeStatus:
-            form.purchasePrice || form.invoiceNumber || form.invoiceFileUrl
-              ? "complete"
-              : "pending_finance",
-
-          financeUpdatedAt: serverTimestamp(),
-          financeUpdatedByUid: firebaseUser?.uid || "",
-          financeUpdatedByName: assetUser?.name || firebaseUser?.email || "",
-
-          updatedAt: serverTimestamp(),
-          updatedByUid: firebaseUser?.uid || "",
-          updatedByName: assetUser?.name || firebaseUser?.email || "",
-        };
-
-        console.log("[Asset Finance Submit]", {
-          role,
-          assetId: asset.id,
-          financePayloadKeys: Object.keys(financePayload),
-          financePayload,
-        });
-
-        await updateDoc(doc(db, "assets", asset.id), financePayload);
-
-        setToast({
-          type: "success",
-          message: "Data finance aset berhasil disimpan.",
-        });
-
-        router.push(`/assets/${asset.id}`);
-        return;
-      } catch (err) {
-        console.error("[Asset Finance Submit ERROR]", err);
-        setError("Gagal menyimpan data finance.");
-        setToast({
-          type: "error",
-          message: "Gagal menyimpan data finance.",
-        });
-        return;
-      } finally {
-        setSaving(false);
-      }
-    }
+    // Section "Finance edit lengkap + audit log" — Asset Finance sekarang
+    // ikut jalur submit UMUM yang sama dengan Asset Admin/Super Admin
+    // (bukan cabang financePayload terpisah lagi). Field yang memang tidak
+    // boleh disentuh Finance (Perusahaan/Divisi/PIC/Mode Tracking/Status
+    // Kepemilikan/Status Operasional Aset/Pengaturan Pemakaian) sudah
+    // di-disable di level UI (lihat fieldset disabled={isFinanceOnlyRole}
+    // di form di bawah), jadi form.* untuk field itu tetap nilai lama yang
+    // di-load — updateDoc mengirim nilai yang SAMA (bukan berubah), dan
+    // Firestore rules (isAssetFinanceUpdate) menolak kalau field itu tetap
+    // berhasil berubah lewat jalur lain.
 
     // Section 1/2/3 — PIC Lokasi HANYA boleh mengubah data fisik + PIC
     // Operasional/Custodian aset di lokasinya sendiri (lihat
@@ -643,17 +647,53 @@ export default function EditAssetPage() {
     if (!form.assetName?.trim()) errors.assetName = "Nama aset wajib diisi.";
     if (!form.assetCode?.trim()) errors.assetCode = "Kode aset wajib diisi.";
     if (!form.categoryId) errors.categoryId = "Kategori wajib dipilih.";
-    if (!form.brand?.trim()) errors.brand = "Merk wajib diisi.";
-    if (!form.model?.trim()) errors.model = "Model/Tipe wajib diisi.";
+    if (!form.purchaseDate) errors.acquisitionDate = "Tanggal Perolehan wajib diisi.";
     if (!form.companyOwnerId) errors.companyOwnerId = "Perusahaan/Brand wajib dipilih.";
+    let locationErrorLevelNow: "building" | "floor" | "room" | null = null;
     if (isLocationPicRole) {
       if (!selectedPicLocationId) errors.location = "Lokasi tanggung jawab wajib dipilih.";
     } else if (!form.buildingId) {
       errors.location = "Gedung wajib dipilih.";
+      locationErrorLevelNow = "building";
     } else if (!form.floorId) {
       errors.location = "Lantai wajib dipilih.";
+      locationErrorLevelNow = "floor";
     } else if (!form.roomId) {
       errors.location = "Ruangan wajib dipilih.";
+      locationErrorLevelNow = "room";
+    }
+    if (!form.quantity || form.quantity < 1) errors.quantity = "Qty minimal 1.";
+    // Section "Create/Edit Asset ikuti Excel" — Kode Aset TIDAK PERNAH
+    // digenerate ulang diam-diam. Kalau field pembentuknya berubah, user
+    // WAJIB mencentang konfirmasi di banner dekat field Kode Aset dulu.
+    // Section "Perbaiki generator Kode Aset" — dibandingkan KODE LOKASI
+    // HASIL RESOLVE (bukan sekadar apakah roomId/divisionOwnerId berubah),
+    // supaya ganti Divisi/Ruangan yang TIDAK mengubah kode final (mis.
+    // Ruangan tetap sama, atau Ruangan baru kebetulan tidak punya kode jadi
+    // tetap fallback ke Gedung yang sama) tidak memicu regenerasi/konfirmasi
+    // yang tidak perlu — allocateAssetCode() SELALU membakar sequence baru,
+    // jadi harus benar-benar yakin kode-nya berubah dulu.
+    const originalLocationCode = resolveOperationalLocationCode({
+      roomCode: locations.find((n) => n.id === asset.roomId)?.roomCode,
+      roomName: locations.find((n) => n.id === asset.roomId)?.roomName,
+      divisionCode: divisions.find((d) => d.id === asset.divisionOwnerId)?.code,
+      divisionName: divisions.find((d) => d.id === asset.divisionOwnerId)?.name,
+      buildingCode: locations.find((n) => n.id === asset.buildingId)?.buildingCode,
+    }).code;
+    const currentLocationCodeForCompare = resolveOperationalLocationCode({
+      roomCode: locations.find((n) => n.id === form.roomId)?.roomCode,
+      roomName: locations.find((n) => n.id === form.roomId)?.roomName,
+      divisionCode: divisionOwner?.code,
+      divisionName: divisionOwner?.name,
+      buildingCode: locations.find((n) => n.id === form.buildingId)?.buildingCode,
+    }).code;
+    const codeFormingChangedNow =
+      (form.companyOwnerId || "") !== (asset.companyOwnerId || "") ||
+      (form.purchaseDate || "") !== (asset.acquisitionDate || asset.purchaseDate || "") ||
+      (form.categoryId || "") !== (asset.categoryId || "") ||
+      currentLocationCodeForCompare !== originalLocationCode;
+    if (codeFormingChangedNow && !codeChangeAcknowledged) {
+      errors.assetCode = "Konfirmasi perubahan Kode Aset (centang di bawah field Kode Aset) sebelum menyimpan.";
     }
     if (!form.ownershipStatus) errors.ownershipStatus = "Status kepemilikan wajib dipilih.";
     if (trackingMode === "assigned_pic" && !form.responsiblePersonUid)
@@ -663,7 +703,9 @@ export default function EditAssetPage() {
 
     if (Object.keys(errors).length > 0) {
       setFieldErrors(errors);
-      setError("Lengkapi field yang wajib diisi.");
+      setLocationErrorLevel(locationErrorLevelNow);
+      setToast({ type: "error", message: `Data belum lengkap. Ada ${Object.keys(errors).length} bagian yang perlu diperbaiki.` });
+      setErrorModalOpen(true);
       return;
     }
 
@@ -678,14 +720,43 @@ export default function EditAssetPage() {
     setError("");
     setFieldErrors({});
     try {
-      if (form.assetCode?.trim() !== asset.assetCode) {
-        const taken = await isAssetCodeTaken(form.assetCode!.trim(), asset.id);
-        if (taken) {
-          setFieldErrors({ assetCode: "Kode asset sudah digunakan." });
-          setError("Kode asset sudah digunakan.");
+      // Section "Create/Edit Asset ikuti Excel" — Kode Aset HANYA digenerate
+      // ulang kalau field pembentuknya benar-benar berubah (sudah divalidasi
+      // & dikonfirmasi user di atas). Selain itu, form.assetCode/No. Aset
+      // TIDAK PERNAH disentuh — dipertahankan persis seperti data asli
+      // (readonly di UI). allocateAssetCode sendiri sudah punya jaring
+      // pengaman anti-duplicate (lihat lib/assets/asset-code-generator.ts).
+      let finalAssetCode = form.assetCode || asset.assetCode;
+      if (codeFormingChangedNow) {
+        // Section "Perbaiki generator Kode Aset" — locationCode sudah
+        // dihitung di atas (currentLocationCodeForCompare) dengan prioritas
+        // Kode Ruangan -> Kode Divisi -> Kode Gedung, SAMA seperti Create
+        // Asset — jangan wajibkan Kode Gedung kalau Ruangan/Divisi sudah
+        // punya kode sendiri.
+        const locationCode = currentLocationCodeForCompare;
+        const dateForCode = form.purchaseDate ? formatDateForAssetCode(form.purchaseDate) : "";
+        if (!locationCode || !dateForCode || !companyOwner || !category) {
+          setFieldErrors({
+            assetCode: !locationCode
+              ? "Lokasi ini belum memiliki kode. Atur kode Ruangan/Divisi di Master Lokasi."
+              : "Gagal membuat Kode Aset baru — pastikan Perusahaan/Tanggal Perolehan/Kategori sudah lengkap.",
+          });
+          setError("Gagal membuat Kode Aset baru.");
           setSaving(false);
           return;
         }
+        finalAssetCode = await allocateAssetCode({
+          companyId: form.companyOwnerId!,
+          companyCode: deriveCompanyCode(companyOwner.name),
+          dateForCode,
+          locationCode,
+          categoryCode: normalizeCategoryCodePart(category.categoryCode),
+        });
+        console.info("[Asset Edit] Kode Aset digenerate ulang", {
+          assetId: asset.id,
+          oldCode: asset.assetCode,
+          newCode: finalAssetCode,
+        });
       }
 
       const photoFields = {
@@ -800,9 +871,12 @@ export default function EditAssetPage() {
         },
       });
 
-      await updateDoc(doc(db, "assets", asset.id), {
+      const generalUpdatePayload = {
         assetName: form.assetName,
-        assetCode: form.assetCode,
+        assetCode: finalAssetCode,
+        // No. Aset TIDAK PERNAH digenerate ulang lewat Edit Aset — dipakai
+        // persis nilai existing (readonly di UI, lihat Field "No. Aset").
+        assetNumber: typeof form.assetNumber === "number" ? form.assetNumber : null,
         categoryId: form.categoryId,
         categoryName: category?.categoryName || form.categoryName,
         subCategory: form.subCategory || "",
@@ -849,13 +923,18 @@ export default function EditAssetPage() {
         purchaseDate: form.purchaseDate || null,
         purchasePrice: form.purchasePrice ?? null,
         vendorName: form.vendorName || "",
-        invoiceNumber: form.invoiceNumber || "",
-        invoiceFileUrl: form.invoiceFileUrl || "",
-        invoiceFileName: form.invoiceFileName || "",
-        invoiceDriveFileId: form.invoiceDriveFileId || "",
-        invoiceMimeType: form.invoiceMimeType || "",
-        invoiceSize: form.invoiceSize ?? null,
-        invoiceUploadedAt: form.invoiceUploadedAt || null,
+        // Nomor/Bukti Invoice hanya disimpan saat Status Invoice = "Ada
+        // Invoice" — dijaga ulang di sini (bukan cuma di UI) supaya data
+        // yang kesimpan tetap benar walau state form sempat tidak sinkron.
+        // File di Google Drive-nya sendiri TIDAK pernah dihapus dari sini —
+        // hanya relasinya di dokumen asset yang dikosongkan.
+        invoiceNumber: form.invoiceStatus === "ada" ? form.invoiceNumber || "" : "",
+        invoiceFileUrl: form.invoiceStatus === "ada" ? form.invoiceFileUrl || "" : "",
+        invoiceFileName: form.invoiceStatus === "ada" ? form.invoiceFileName || "" : "",
+        invoiceDriveFileId: form.invoiceStatus === "ada" ? form.invoiceDriveFileId || "" : "",
+        invoiceMimeType: form.invoiceStatus === "ada" ? form.invoiceMimeType || "" : "",
+        invoiceSize: form.invoiceStatus === "ada" ? form.invoiceSize ?? null : null,
+        invoiceUploadedAt: form.invoiceStatus === "ada" ? form.invoiceUploadedAt || null : null,
         fundingSource: form.fundingSource,
         purchaseMethod: form.purchaseMethod || "",
         estimatedUsefulLife: form.estimatedUsefulLife || "",
@@ -867,19 +946,65 @@ export default function EditAssetPage() {
         requiresApproval: form.requiresApproval,
         accessories: form.accessories || "",
         operationalNotes: form.operationalNotes || "",
-        qrCodeValue: form.assetCode,
+        qrCodeValue: finalAssetCode,
+
+        // ── Informasi Inventaris — inventoryNumber/quantity/inventoryNotes/
+        // physicalEvidence diedit langsung di form (section "Informasi
+        // Inventaris" di atas). assetType/inventoryCondition/photoStatus
+        // SENGAJA cuma diisi kalau BELUM ADA (bukan menimpa tiap submit) —
+        // supaya teks asli dari Excel (mis. "Perlu Pemeriksaan") tidak hilang
+        // hanya karena admin edit field lain yang tidak berkaitan.
+        inventoryNumber: form.inventoryNumber || "",
+        assetType: form.assetType || category?.categoryName || "",
+        quantity: form.quantity ?? 1,
+        acquisitionDate: form.purchaseDate || null,
+        acquisitionPrice: form.purchasePrice ?? null,
+        // Section "Rombak permission Asset" — JANGAN derive ulang dari
+        // invoiceNumber/invoiceFileUrl di sini. form.invoiceStatus sudah
+        // memuat nilai tersimpan apa adanya (form di-load dari seluruh
+        // dokumen asset, lihat setForm(data) di atas) — non-Finance role
+        // tidak pernah mengubahnya, jadi menulis ulang persis nilai ini
+        // aman dan tidak menimpa keputusan Finance (mis. "Belum Diperiksa"
+        // tanpa nomor/file invoice) hanya karena field lain diedit.
+        invoiceStatus: form.invoiceStatus ?? null,
+        locationRaw: assetLocationText,
+        inventoryCondition: form.inventoryCondition || CONDITION_LABEL[form.condition as AssetCondition],
+        inventoryNotes: form.inventoryNotes || "",
+        photoStatus: form.photoStatus || (form.photoDriveFileId ? "Sudah" : "Belum Ditemukan"),
+        physicalEvidence: form.physicalEvidence || "",
+        physicalEvidenceImages: form.physicalEvidenceImages || [],
+        // Aset hasil import dianggap SUDAH DIREVIEW begitu admin menyimpan
+        // perubahan lewat form edit lengkap ini.
+        operationalStatus: "active",
 
         updatedAt: serverTimestamp(),
-      });
+      };
 
+      await updateDoc(doc(db, "assets", asset.id), generalUpdatePayload);
+
+      // Section "Riwayat Aktivitas" — audit log field-level, dipakai
+      // Finance/Asset Admin/Super Admin sama-sama (jalur submit ini sekarang
+      // dibagi ketiganya). Diff dihitung dari dokumen SEBELUM disimpan
+      // (asset, hasil getDoc awal) terhadap payload yang BENAR-BENAR baru
+      // saja ditulis (generalUpdatePayload) — bukan re-derive terpisah,
+      // supaya before/after selalu mencerminkan apa yang sungguhan tersimpan.
+      const auditChanges = diffAssetFields(
+        asset as unknown as Record<string, unknown>,
+        generalUpdatePayload as unknown as Record<string, unknown>,
+        AUDITED_ASSET_FIELDS
+      );
       await writeAssetLog({
         assetId: asset.id,
         assetName: form.assetName || asset.assetName,
-        assetCode: form.assetCode || asset.assetCode,
+        assetCode: finalAssetCode,
         action: "update",
-        userUid: assetUser?.uid || "",
-        userName: assetUser?.name || "",
-        detail: "Data aset diperbarui",
+        userUid: assetUser?.uid || firebaseUser?.uid || "",
+        userName: assetUser?.name || firebaseUser?.email || "",
+        editedByRole: role || "",
+        detail: auditChanges.length > 0 ? buildAssetChangeSummary(auditChanges) : "Data aset diperbarui (tidak ada field yang berubah nilainya)",
+        changedFields: auditChanges.map((c) => c.field),
+        before: Object.fromEntries(auditChanges.map((c) => [c.field, (asset as unknown as Record<string, unknown>)[c.field] ?? null])),
+        after: Object.fromEntries(auditChanges.map((c) => [c.field, (generalUpdatePayload as unknown as Record<string, unknown>)[c.field] ?? null])),
       });
 
       const assetLabel = `${form.assetName || asset.assetName} (${form.assetCode || asset.assetCode})`;
@@ -1028,6 +1153,37 @@ export default function EditAssetPage() {
     );
   }
 
+  // Section "Create/Edit Asset ikuti Excel" — field pembentuk Kode Aset
+  // (Perusahaan/Tanggal Perolehan/Lokasi Gedung/Kategori) berubah dari nilai
+  // ASLI aset -> tampilkan banner konfirmasi, JANGAN diam-diam regenerate.
+  // Section "Perbaiki generator Kode Aset" — "Lokasi" dibandingkan lewat
+  // KODE HASIL RESOLVE (Ruangan -> Divisi -> Gedung), bukan cuma buildingId,
+  // supaya ganti Ruangan/Divisi yang TIDAK mengubah kode final (mis. sama-
+  // sama fallback ke Kode Gedung yang sama) tidak memicu banner konfirmasi
+  // yang tidak perlu. Duplikat sengaja dari perhitungan yang sama di
+  // handleSubmit (codeFormingChangedNow) — komponen ini dievaluasi di scope
+  // render terpisah, sama seperti pola locationErrorLevel di file ini.
+  const codeFormingChangedFields: string[] = [];
+  if ((form.companyOwnerId || "") !== (asset.companyOwnerId || "")) codeFormingChangedFields.push("Perusahaan");
+  if ((form.purchaseDate || "") !== (asset.acquisitionDate || asset.purchaseDate || "")) codeFormingChangedFields.push("Tanggal Perolehan");
+  if ((form.categoryId || "") !== (asset.categoryId || "")) codeFormingChangedFields.push("Kategori");
+  const originalLocationCodeForBanner = resolveOperationalLocationCode({
+    roomCode: locations.find((n) => n.id === asset.roomId)?.roomCode,
+    roomName: locations.find((n) => n.id === asset.roomId)?.roomName,
+    divisionCode: divisions.find((d) => d.id === asset.divisionOwnerId)?.code,
+    divisionName: divisions.find((d) => d.id === asset.divisionOwnerId)?.name,
+    buildingCode: locations.find((n) => n.id === asset.buildingId)?.buildingCode,
+  }).code;
+  const currentLocationCodeForBanner = resolveOperationalLocationCode({
+    roomCode: locations.find((n) => n.id === form.roomId)?.roomCode,
+    roomName: locations.find((n) => n.id === form.roomId)?.roomName,
+    divisionCode: divisionOwner?.code,
+    divisionName: divisionOwner?.name,
+    buildingCode: locations.find((n) => n.id === form.buildingId)?.buildingCode,
+  }).code;
+  if (currentLocationCodeForBanner !== originalLocationCodeForBanner) codeFormingChangedFields.push("Lokasi");
+  const codeFormingChanged = codeFormingChangedFields.length > 0;
+
   const photoValue = form.photoUrl
     ? {
         url: form.photoUrl,
@@ -1041,6 +1197,26 @@ export default function EditAssetPage() {
     ? { url: form.invoiceFileUrl, fileName: form.invoiceFileName || "invoice", size: form.invoiceSize }
     : null;
 
+  // Section "Rapikan UI Identitas Aset Otomatis" — QrLabelModal ditampilkan
+  // dengan data TERKINI dari form (bukan cuma `asset` snapshot awal), supaya
+  // kalau user baru saja mengubah field pembentuk kode (belum disimpan),
+  // preview QR/labelnya konsisten dengan Kode Aset yang tampil di card. QR
+  // value-nya sendiri tetap dari getAssetQrTarget(asset) di dalam modal —
+  // tidak ada logic QR baru di sini.
+  const qrModalAsset = { ...asset, ...form } as Asset;
+
+  const handleCopyCode = async () => {
+    if (!form.assetCode) return;
+    try {
+      await navigator.clipboard.writeText(form.assetCode);
+      setCodeCopied(true);
+      setToast({ type: "success", message: "Kode aset berhasil disalin" });
+      setTimeout(() => setCodeCopied(false), 1500);
+    } catch {
+      // clipboard tidak tersedia — abaikan diam-diam
+    }
+  };
+
   return (
     <ProtectedLayout>
       <div className="mx-auto max-w-[1440px]">
@@ -1051,20 +1227,33 @@ export default function EditAssetPage() {
         <form onSubmit={handleSubmit}>
           <div className="grid grid-cols-12 gap-6">
             <div className="col-span-12 xl:col-span-8 2xl:col-span-9 space-y-5">
-              <fieldset disabled={isFinanceOnlyRole} className="space-y-5 disabled:opacity-60">
-              <FormSection step={1} title="Informasi Aset">
+              {/* Section "Finance edit lengkap" — Informasi Aset & Informasi
+                  Inventaris SEKARANG full-enabled untuk Finance juga (Nama
+                  Aset/Kategori/Kode Aset/No. Aset/Qty/Merk/Model/Serial
+                  Number/IMEI/Deskripsi/Foto — semua ada di daftar field yang
+                  boleh diedit Finance). Company/Divisi/PIC/Mode Tracking/
+                  Status Kepemilikan/Status Operasional Aset TETAP dikunci
+                  per-field di bawah (bukan level fieldset lagi). */}
+              <div className="space-y-5">
+              {/* Section "Rombak Tambah/Edit Asset" — SATU section berisi
+                  semua field pembentuk identitas+lokasi, supaya card
+                  "Identitas Aset Otomatis" tepat di bawahnya langsung
+                  merefleksikan hasilnya tanpa scroll jauh. */}
+              <FormSection step={1} title="Identitas & Lokasi Asset">
                 <Field label="Nama Aset" required error={fieldErrors.assetName}>
                   <input
+                    id="field-assetName"
                     value={form.assetName || ""}
                     onChange={(e) => set("assetName", e.target.value)}
-                    className="input"
+                    className={errCls(!!fieldErrors.assetName)}
                   />
                 </Field>
                 <Field label="Kategori" required error={fieldErrors.categoryId}>
                   <select
+                    id="field-categoryId"
                     value={form.categoryId || ""}
                     onChange={(e) => set("categoryId", e.target.value)}
-                    className="input"
+                    className={errCls(!!fieldErrors.categoryId)}
                   >
                     <option value="">Pilih kategori</option>
                     {categories.map((c) => (
@@ -1074,54 +1263,227 @@ export default function EditAssetPage() {
                     ))}
                   </select>
                 </Field>
+                <Field label="Tanggal Perolehan" required error={fieldErrors.acquisitionDate}>
+                  <input
+                    id="field-acquisitionDate"
+                    type="date"
+                    value={form.purchaseDate || ""}
+                    onChange={(e) => set("purchaseDate", e.target.value)}
+                    className={errCls(!!fieldErrors.acquisitionDate)}
+                  />
+                </Field>
                 <Field
-                  label="Kode Asset"
+                  label="Qty"
                   required
-                  full
-                  error={fieldErrors.assetCode}
-                  hint="Ubah dengan hati-hati — kode ini tercetak di QR yang sudah ditempel ke aset."
+                  error={fieldErrors.quantity}
+                  hint="Jumlah unit fisik yang diwakili SATU dokumen aset ini."
                 >
                   <input
-                    value={form.assetCode || ""}
-                    onChange={(e) => set("assetCode", e.target.value)}
-                    className="input"
+                    id="field-quantity"
+                    type="number"
+                    min={1}
+                    value={form.quantity ?? 1}
+                    onChange={(e) => set("quantity", Math.max(1, Number(e.target.value) || 1))}
+                    className={errCls(!!fieldErrors.quantity)}
                   />
                 </Field>
-                <Field label="Subkategori">
-                  <input
-                    value={form.subCategory || ""}
-                    onChange={(e) => set("subCategory", e.target.value)}
-                    className="input"
+
+                <Field
+                  label="Perusahaan/Brand Pemilik"
+                  required
+                  error={fieldErrors.companyOwnerId}
+                  hint={
+                    isFinanceOnlyRole
+                      ? "Hanya Asset Admin/Super Admin yang dapat memindahkan aset ke perusahaan/brand lain."
+                      : brands.length === 0
+                      ? "Tidak ada data perusahaan/brand dari HRP."
+                      : undefined
+                  }
+                >
+                  <SearchableSelect
+                    id="field-companyOwnerId"
+                    items={brandItems}
+                    value={form.companyOwnerId || ""}
+                    onChange={handleCompanyChange}
+                    placeholder="Pilih perusahaan/brand"
+                    searchPlaceholder="Cari brand..."
+                    emptyText="Tidak ada brand yang cocok."
+                    disabled={isFinanceOnlyRole}
+                    error={!!fieldErrors.companyOwnerId}
                   />
                 </Field>
-                <Field label="Merk" required error={fieldErrors.brand}>
-                  <input
-                    value={form.brand || ""}
-                    onChange={(e) => set("brand", e.target.value)}
-                    className="input"
-                  />
+                <Field
+                  label="Divisi Pengguna"
+                  hint={
+                    !form.companyOwnerId
+                      ? "Pilih perusahaan/brand terlebih dahulu"
+                      : loadingDivisions
+                      ? "Memuat divisi..."
+                      : divisions.length === 0
+                      ? "Tidak ada data divisi untuk brand ini."
+                      : undefined
+                  }
+                >
+                  <select
+                    value={form.divisionOwnerId || ""}
+                    onChange={(e) => set("divisionOwnerId", e.target.value)}
+                    disabled={!form.companyOwnerId || loadingDivisions || isFinanceOnlyRole}
+                    className="input disabled:bg-slate-50 disabled:text-slate-400"
+                  >
+                    <option value="">Pilih divisi</option>
+                    {divisions.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.name}
+                      </option>
+                    ))}
+                  </select>
                 </Field>
-                <Field label="Model/Tipe" required error={fieldErrors.model}>
-                  <input
-                    value={form.model || ""}
-                    onChange={(e) => set("model", e.target.value)}
-                    className="input"
-                  />
-                </Field>
-                <Field label="Serial Number">
-                  <input
-                    value={form.serialNumber || ""}
-                    onChange={(e) => set("serialNumber", e.target.value)}
-                    className="input"
-                  />
-                </Field>
-                <Field label="IMEI">
-                  <input
-                    value={form.imei || ""}
-                    onChange={(e) => set("imei", e.target.value)}
-                    className="input"
-                  />
-                </Field>
+
+                <div className="sm:col-span-2" id="field-location">
+                  <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                    Lokasi Asset <span className="text-red-500">*</span>
+                  </label>
+                  {form.location && !form.buildingId && (
+                    <p className="mb-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                      Asset ini masih memakai lokasi lama. Pilih Lokasi Asset dari Master Lokasi
+                      untuk sinkronisasi.
+                    </p>
+                  )}
+                  {isLocationPicRole ? (
+                    // Section 1/2/4 — lokasi aset TIDAK BISA diubah lewat
+                    // Edit Aset oleh PIC Lokasi (locationId immutable di
+                    // firestore.rules isLocationPicAssetUpdate) — tampilkan
+                    // read-only, bukan picker yang bisa dipilih ulang.
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-700">
+                      {asset.locationText || asset.location || "-"}
+                      <p className="mt-1 text-xs text-slate-400">
+                        Lokasi aset tidak dapat diubah dari sini. Hubungi Asset Admin/QHSE untuk memindahkan aset.
+                      </p>
+                    </div>
+                  ) : (
+                    <LocationCascadeFields
+                      locations={scopedLocations}
+                      value={locationSelection}
+                      onChange={handleLocationSelectionChange}
+                      errorLevel={locationErrorLevel}
+                    />
+                  )}
+                  {fieldErrors.location && (
+                    <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
+                  )}
+                  {form.location && !form.buildingId && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Lokasi Lama: <span className="text-slate-700">{form.location}</span>
+                    </p>
+                  )}
+                </div>
+              </FormSection>
+
+              {/* Section "Urutan Form Create/Edit ikuti dependency" — No./
+                  Kode Aset/QR TIDAK PERNAH diisi manual, jadi ditaruh di
+                  sini (PERSIS setelah Perusahaan & Lokasi), bukan lagi di
+                  Section 1. Beda dari Create: nilainya SELALU sudah ada
+                  (aset ini sudah tersimpan) — yang bisa terjadi di sini
+                  cuma banner konfirmasi kalau field pembentuk kode berubah. */}
+              <div id="field-assetCode" className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-100">
+                  <h2 className="text-sm font-semibold text-slate-800">Identitas Aset Otomatis</h2>
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                    Dibuat Otomatis
+                  </span>
+                </div>
+                <div className="flex flex-col divide-y divide-slate-100 sm:grid sm:grid-cols-[20%_55%_25%] sm:divide-y-0 sm:divide-x">
+                  <div className="flex flex-col justify-center px-4 py-3">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">No. Aset</p>
+                    <p className="mt-0.5 text-xl font-bold text-slate-900">
+                      {typeof form.assetNumber === "number" ? form.assetNumber : "-"}
+                    </p>
+                  </div>
+                  <div className="flex flex-col justify-center px-4 py-3 min-w-0">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Kode Aset</p>
+                    <div className="mt-0.5 flex items-center gap-2 min-w-0">
+                      <p
+                        className={`truncate font-mono text-sm font-semibold ${
+                          fieldErrors.assetCode ? "text-red-600" : "text-slate-900"
+                        }`}
+                        title={form.assetCode}
+                      >
+                        {form.assetCode || "-"}
+                      </p>
+                      {form.assetCode && (
+                        <button
+                          type="button"
+                          onClick={handleCopyCode}
+                          title="Copy Kode Aset"
+                          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-500 hover:bg-slate-50"
+                        >
+                          {codeCopied ? (
+                            <Check size={12} className="text-emerald-600" />
+                          ) : (
+                            <Copy size={12} />
+                          )}
+                          Copy
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 px-4 py-3">
+                    {form.assetCode ? (
+                      <>
+                        <div className="shrink-0 rounded-lg border border-slate-200 bg-slate-50 p-1">
+                          <QRCodeSVG
+                            value={form.assetCode}
+                            size={64}
+                            level="H"
+                            includeMargin
+                            imageSettings={getQrImageSettings(64)}
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setQrModalOpen(true)}
+                          className="text-xs font-medium text-blue-600 hover:underline"
+                        >
+                          Lihat / Cetak QR
+                        </button>
+                      </>
+                    ) : (
+                      <p className="text-xs text-slate-400">-</p>
+                    )}
+                  </div>
+                </div>
+                {codeFormingChanged && (
+                  <div className="mx-4 mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">
+                    <p className="font-medium">
+                      Anda mengubah {codeFormingChangedFields.join(", ")} — Kode Aset akan dibuat ULANG saat
+                      disimpan.
+                    </p>
+                    <p className="mt-1 text-amber-700">
+                      QR/histori yang sudah memakai kode lama ({asset.assetCode}) tetap tersimpan di Log
+                      Aktivitas, tapi QR fisik yang sudah tercetak/ditempel tidak berubah otomatis.
+                    </p>
+                    <label className="mt-2 flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={codeChangeAcknowledged}
+                        onChange={(e) => setCodeChangeAcknowledged(e.target.checked)}
+                      />
+                      Saya mengerti dan ingin melanjutkan perubahan Kode Aset.
+                    </label>
+                  </div>
+                )}
+                {fieldErrors.assetCode && (
+                  <p className="px-4 pb-3 text-xs text-red-600">{fieldErrors.assetCode}</p>
+                )}
+              </div>
+              </div>
+
+              {qrModalOpen && (
+                <QrLabelModal asset={qrModalAsset} open={qrModalOpen} onClose={() => setQrModalOpen(false)} />
+              )}
+
+              <FormSection step={2} title="Dokumentasi Asset">
                 <Field label="Foto Aset" full>
                   <FileUploadField
                     kind="image"
@@ -1157,87 +1519,58 @@ export default function EditAssetPage() {
                     rows={2}
                   />
                 </Field>
-              </FormSection>
-
-              <FormSection step={2} title="Kepemilikan & Lokasi">
-                <Field
-                  label="Perusahaan/Brand Pemilik"
-                  required
-                  error={fieldErrors.companyOwnerId}
-                  hint={brands.length === 0 ? "Tidak ada data perusahaan/brand dari HRP." : undefined}
-                >
-                  <SearchableSelect
-                    items={brandItems}
-                    value={form.companyOwnerId || ""}
-                    onChange={handleCompanyChange}
-                    placeholder="Pilih perusahaan/brand"
-                    searchPlaceholder="Cari brand..."
-                    emptyText="Tidak ada brand yang cocok."
+                <Field label="Bukti Fisik Aset" full hint="Catatan verifikasi fisik, mis. tanggal ditemukan/dihapuskan.">
+                  <input
+                    value={form.physicalEvidence || ""}
+                    onChange={(e) => set("physicalEvidence", e.target.value)}
+                    className="input"
                   />
                 </Field>
+                {/* Section "Rombak Tambah/Edit Asset" — dipertegas BUKAN
+                    No. Aset (yang dibuat otomatis di card di atas) — cuma
+                    label lama/manual dari pencatatan sebelum sistem ini,
+                    TIDAK PERNAH ikut membentuk No./Kode Aset/QR. */}
                 <Field
-                  label="Divisi Pengguna"
-                  hint={
-                    !form.companyOwnerId
-                      ? "Pilih perusahaan/brand terlebih dahulu"
-                      : loadingDivisions
-                      ? "Memuat divisi..."
-                      : divisions.length === 0
-                      ? "Tidak ada data divisi untuk brand ini."
-                      : undefined
-                  }
+                  label="Nomor Inventaris Lama"
+                  full
+                  hint="Nomor inventaris lama/label fisik sebelumnya jika asset sudah pernah tercatat. Kosongkan untuk asset baru."
                 >
-                  <select
-                    value={form.divisionOwnerId || ""}
-                    onChange={(e) => set("divisionOwnerId", e.target.value)}
-                    disabled={!form.companyOwnerId || loadingDivisions}
-                    className="input disabled:bg-slate-50 disabled:text-slate-400"
-                  >
-                    <option value="">Pilih divisi</option>
-                    {divisions.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name}
-                      </option>
-                    ))}
-                  </select>
+                  <input
+                    value={form.inventoryNumber || ""}
+                    onChange={(e) => set("inventoryNumber", e.target.value)}
+                    className="input"
+                  />
                 </Field>
-                <div className="sm:col-span-2">
-                  <label className="block text-xs font-medium text-slate-500 mb-1.5">
-                    Lokasi Asset <span className="text-red-500">*</span>
-                  </label>
-                  {form.location && !form.buildingId && (
-                    <p className="mb-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                      Asset ini masih memakai lokasi lama. Pilih Lokasi Asset dari Master Lokasi
-                      untuk sinkronisasi.
-                    </p>
-                  )}
-                  {isLocationPicRole ? (
-                    // Section 1/2/4 — lokasi aset TIDAK BISA diubah lewat
-                    // Edit Aset oleh PIC Lokasi (locationId immutable di
-                    // firestore.rules isLocationPicAssetUpdate) — tampilkan
-                    // read-only, bukan picker yang bisa dipilih ulang.
-                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-700">
-                      {asset.locationText || asset.location || "-"}
-                      <p className="mt-1 text-xs text-slate-400">
-                        Lokasi aset tidak dapat diubah dari sini. Hubungi Asset Admin/QHSE untuk memindahkan aset.
-                      </p>
-                    </div>
-                  ) : (
-                    <LocationCascadeFields
-                      locations={scopedLocations}
-                      value={locationSelection}
-                      onChange={handleLocationSelectionChange}
-                    />
-                  )}
-                  {fieldErrors.location && (
-                    <p className="mt-1 text-xs text-red-600">{fieldErrors.location}</p>
-                  )}
-                  {form.location && !form.buildingId && (
-                    <p className="mt-2 text-xs text-slate-500">
-                      Lokasi Lama: <span className="text-slate-700">{form.location}</span>
-                    </p>
-                  )}
-                </div>
+                {/* Keterangan/Foto Bukti Fisik — khusus data pelengkap hasil
+                    Import Aset dari Excel, tidak ada equivalent-nya di
+                    Create Asset (aset baru belum punya riwayat import). */}
+                {!isLocationPicRole && (
+                  <>
+                    <Field label="Keterangan" full hint="Catatan inventaris (mis. dari data lama/import Excel).">
+                      <input
+                        value={form.inventoryNotes || ""}
+                        onChange={(e) => set("inventoryNotes", e.target.value)}
+                        className="input"
+                      />
+                    </Field>
+                    <Field
+                      label="Foto Bukti Fisik"
+                      full
+                      hint="Hasil ekstrak Excel (kalau ada) atau upload manual ke Google Drive. Hapus/tambah langsung tersimpan."
+                    >
+                      <PhysicalEvidenceManager
+                        images={form.physicalEvidenceImages || []}
+                        onChange={(urls) => set("physicalEvidenceImages", urls)}
+                        assetCode={form.assetCode || asset.assetCode}
+                        assetName={form.assetName || asset.assetName}
+                        onError={(msg) => setToast({ type: "error", message: msg })}
+                      />
+                    </Field>
+                  </>
+                )}
+              </FormSection>
+
+              <FormSection step={3} title="Pengelolaan Asset">
                 <Field
                   label="Mode Tracking Aset"
                   hint={TRACKING_MODE_OPTIONS.find((o) => o.value === trackingMode)?.hint}
@@ -1245,7 +1578,8 @@ export default function EditAssetPage() {
                   <select
                     value={trackingMode}
                     onChange={(e) => set("trackingMode", e.target.value as TrackingMode)}
-                    className="input"
+                    disabled={isFinanceOnlyRole}
+                    className="input disabled:bg-slate-50 disabled:text-slate-400"
                   >
                     {TRACKING_MODE_OPTIONS.map((o) => (
                       <option key={o.value} value={o.value}>
@@ -1271,6 +1605,7 @@ export default function EditAssetPage() {
                     placeholder="Pilih karyawan"
                     searchPlaceholder="Cari nama karyawan..."
                     emptyText="Tidak ada karyawan yang cocok."
+                    disabled={isFinanceOnlyRole}
                   />
                 </Field>
                 {trackingMode === "assigned_pic" && (
@@ -1296,7 +1631,8 @@ export default function EditAssetPage() {
                     onChange={(e) =>
                       set("ownershipStatus", e.target.value as OwnershipStatus)
                     }
-                    className="input"
+                    disabled={isFinanceOnlyRole}
+                    className="input disabled:bg-slate-50 disabled:text-slate-400"
                   >
                     {OWNERSHIP_OPTIONS.map((o) => (
                       <option key={o} value={o}>
@@ -1306,23 +1642,54 @@ export default function EditAssetPage() {
                   </select>
                 </Field>
               </FormSection>
-              </fieldset>
 
               {canViewFinanceEdit && (
-              <FormSection step={3} title="Finance / Bukti Pembelian">
-                <Field label="Tanggal Pembelian">
-                  <input
-                    type="date"
-                    value={form.purchaseDate || ""}
-                    onChange={(e) => set("purchaseDate", e.target.value)}
-                    className="input"
-                  />
-                </Field>
-                <Field label="Harga Beli">
+              <FormSection step={4} title="Finance / Bukti Pembelian">
+                <Field label="Harga Perolehan">
                   <CurrencyInput
                     value={form.purchasePrice ?? undefined}
                     onChange={(v) => set("purchasePrice", v as number)}
                   />
+                </Field>
+                <Field label="Status Invoice">
+                  <select
+                    value={form.invoiceStatus || ""}
+                    onChange={(e) => {
+                      const next = e.target.value as InvoiceStatus | "";
+                      // Nomor/Bukti Invoice cuma relevan saat "Ada Invoice" —
+                      // pindah ke status lain mengosongkan state form ini
+                      // (relasi ke file Drive existing baru benar-benar
+                      // hilang dari data asset SETELAH user klik Simpan;
+                      // file di Drive sendiri tidak pernah dihapus di sini).
+                      setForm((f) =>
+                        f
+                          ? {
+                              ...f,
+                              invoiceStatus: next || undefined,
+                              ...(next !== "ada"
+                                ? {
+                                    invoiceNumber: "",
+                                    invoiceFileUrl: "",
+                                    invoiceFileName: "",
+                                    invoiceDriveFileId: "",
+                                    invoiceMimeType: "",
+                                    invoiceSize: undefined,
+                                    invoiceUploadedAt: undefined,
+                                  }
+                                : {}),
+                            }
+                          : f
+                      );
+                    }}
+                    className="input"
+                  >
+                    <option value="">Belum diisi</option>
+                    {(Object.keys(INVOICE_STATUS_LABEL) as InvoiceStatus[]).map((s) => (
+                      <option key={s} value={s}>
+                        {INVOICE_STATUS_LABEL[s]}
+                      </option>
+                    ))}
+                  </select>
                 </Field>
                 <Field label="Vendor">
                   <input
@@ -1331,38 +1698,42 @@ export default function EditAssetPage() {
                     className="input"
                   />
                 </Field>
-                <Field label="Nomor Invoice">
-                  <input
-                    value={form.invoiceNumber || ""}
-                    onChange={(e) => set("invoiceNumber", e.target.value)}
-                    className="input"
-                  />
-                </Field>
-                <Field label="Upload Invoice" full>
-                  <FileUploadField
-                    kind="file"
-                    uploadType="invoice"
-                    accept={["pdf", "jpg", "jpeg", "png"]}
-                    maxSizeMB={10}
-                    value={invoiceValue}
-                    meta={{ assetCode: form.assetCode, assetName: form.assetName }}
-                    onUploadStateChange={setInvoiceUploading}
-                    onUploaded={(result) => {
-                      set("invoiceFileUrl", result.url);
-                      set("invoiceFileName", result.fileName);
-                      set("invoiceDriveFileId", result.fileId);
-                      set("invoiceMimeType", result.mimeType);
-                      set("invoiceSize", result.size);
-                      set("invoiceUploadedAt", result.uploadedAt);
-                    }}
-                    onRemove={() => {
-                      set("invoiceFileUrl", "");
-                      set("invoiceFileName", "");
-                      set("invoiceDriveFileId", "");
-                    }}
-                    onError={(msg) => setToast({ type: "error", message: msg })}
-                  />
-                </Field>
+                {form.invoiceStatus === "ada" && (
+                  <>
+                    <Field label="Nomor Invoice">
+                      <input
+                        value={form.invoiceNumber || ""}
+                        onChange={(e) => set("invoiceNumber", e.target.value)}
+                        className="input"
+                      />
+                    </Field>
+                    <Field label="Upload Invoice" full>
+                      <FileUploadField
+                        kind="file"
+                        uploadType="invoice"
+                        accept={["pdf", "jpg", "jpeg", "png"]}
+                        maxSizeMB={10}
+                        value={invoiceValue}
+                        meta={{ assetCode: form.assetCode, assetName: form.assetName }}
+                        onUploadStateChange={setInvoiceUploading}
+                        onUploaded={(result) => {
+                          set("invoiceFileUrl", result.url);
+                          set("invoiceFileName", result.fileName);
+                          set("invoiceDriveFileId", result.fileId);
+                          set("invoiceMimeType", result.mimeType);
+                          set("invoiceSize", result.size);
+                          set("invoiceUploadedAt", result.uploadedAt);
+                        }}
+                        onRemove={() => {
+                          set("invoiceFileUrl", "");
+                          set("invoiceFileName", "");
+                          set("invoiceDriveFileId", "");
+                        }}
+                        onError={(msg) => setToast({ type: "error", message: msg })}
+                      />
+                    </Field>
+                  </>
+                )}
                 <Field label="Sumber Dana">
                   <select
                     value={form.fundingSource || "Kas Perusahaan"}
@@ -1403,9 +1774,13 @@ export default function EditAssetPage() {
               </FormSection>
               )}
 
-              <fieldset disabled={isFinanceOnlyRole} className="space-y-5 disabled:opacity-60">
+              {/* Section "Finance edit lengkap" — Kondisi Aset full-enabled
+                  untuk Finance (ada di daftar field yang boleh diedit).
+                  Status Operasional Aset (disposal-adjacent: available/
+                  lost/disposed/dst) TETAP dikunci per-field — ticket minta
+                  "hapus/disposal asset" tetap ikut permission existing. */}
               <FormSection
-                step={4}
+                step={5}
                 title="Kondisi & Status Aset"
                 description="Kondisi fisik dan status operasional barang — TERPISAH dari status pemakaian (Dipinjam/Tersedia diatur otomatis lewat proses pinjam/kembali)."
               >
@@ -1414,13 +1789,18 @@ export default function EditAssetPage() {
                   required
                   error={fieldErrors.assetStatus}
                   hint={
-                    form.assetStatus ? ASSET_STATUS_HELPER[form.assetStatus] : undefined
+                    isFinanceOnlyRole
+                      ? "Hanya Asset Admin/Super Admin yang dapat mengubah status operasional (mis. disposal)."
+                      : form.assetStatus
+                      ? ASSET_STATUS_HELPER[form.assetStatus]
+                      : undefined
                   }
                 >
                   <select
                     value={form.assetStatus || "available"}
                     onChange={(e) => set("assetStatus", e.target.value as AssetStatus)}
-                    className="input"
+                    disabled={isFinanceOnlyRole}
+                    className="input disabled:bg-slate-50 disabled:text-slate-400"
                   >
                     {(ASSET_STATUS_OPTIONS.includes(form.assetStatus as AssetStatus) || !form.assetStatus
                       ? ASSET_STATUS_OPTIONS
@@ -1434,9 +1814,10 @@ export default function EditAssetPage() {
                 </Field>
                 <Field label="Kondisi Aset" required error={fieldErrors.condition}>
                   <select
+                    id="field-condition"
                     value={form.condition || "good"}
                     onChange={(e) => set("condition", e.target.value as AssetCondition)}
-                    className="input"
+                    className={errCls(!!fieldErrors.condition)}
                   >
                     {CONDITION_OPTIONS.map((c) => (
                       <option key={c} value={c}>
@@ -1447,7 +1828,11 @@ export default function EditAssetPage() {
                 </Field>
               </FormSection>
 
-              <FormSection step={5} title="Pengaturan Pemakaian Aset">
+              {/* Pengaturan Pemakaian Aset (Bisa Dipinjam/Approval/Aksesoris/
+                  Catatan Operasional) TIDAK ada di daftar field yang diminta
+                  ticket untuk Finance — tetap dikunci lewat fieldset. */}
+              <fieldset disabled={isFinanceOnlyRole} className="space-y-5 disabled:opacity-60">
+              <FormSection step={6} title="Pengaturan Pemakaian Aset">
                 <div className="md:col-span-2 grid md:grid-cols-2 gap-4">
                   <Toggle
                     checked={!!form.isBorrowable}
@@ -1496,13 +1881,31 @@ export default function EditAssetPage() {
                     <dd className="font-medium text-slate-800">{form.assetName || "-"}</dd>
                   </div>
                   <div>
+                    <dt className="text-xs text-slate-400">No. Aset</dt>
+                    <dd className="font-medium text-slate-800">
+                      {typeof form.assetNumber === "number" ? form.assetNumber : "-"}
+                    </dd>
+                  </div>
+                  <div>
                     <dt className="text-xs text-slate-400">Kode Aset</dt>
-                    <dd className="font-medium text-slate-800">{form.assetCode || "-"}</dd>
+                    <dd className="font-medium text-slate-800 break-all">{form.assetCode || "-"}</dd>
                   </div>
                   <div>
                     <dt className="text-xs text-slate-400">Kategori</dt>
                     <dd className="font-medium text-slate-800">
                       {category?.categoryName || form.categoryName || "-"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-slate-400">Perusahaan</dt>
+                    <dd className="font-medium text-slate-800">
+                      {companyOwner?.name || form.companyOwnerName || "-"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-slate-400">Lokasi</dt>
+                    <dd className="font-medium text-slate-800">
+                      {[form.buildingName, form.floor, form.roomName].filter(Boolean).join(" / ") || "-"}
                     </dd>
                   </div>
                   <div>
@@ -1512,27 +1915,6 @@ export default function EditAssetPage() {
                     </dd>
                   </div>
                 </dl>
-              </div>
-
-              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex flex-col items-center">
-                <h2 className="font-semibold text-slate-800 mb-4 self-start">
-                  Preview QR
-                </h2>
-                {form.assetCode ? (
-                  <div className="p-3 rounded-xl border border-slate-200 bg-slate-50">
-                    <QRCodeSVG
-                      value={form.assetCode}
-                      size={140}
-                      level="H"
-                      includeMargin
-                      imageSettings={getQrImageSettings(140)}
-                    />
-                  </div>
-                ) : (
-                  <p className="text-xs text-slate-400 text-center py-8">
-                    QR akan tersedia setelah kode aset dibuat.
-                  </p>
-                )}
               </div>
             </aside>
           </div>
@@ -1560,6 +1942,12 @@ export default function EditAssetPage() {
         </form>
       </div>
 
+      <AssetFieldErrorModal
+        open={errorModalOpen}
+        errors={fieldErrors}
+        fieldOrder={REQUIRED_FIELD_ORDER}
+        onClose={() => setErrorModalOpen(false)}
+      />
       <Toast toast={toast} onClose={() => setToast(null)} />
     </ProtectedLayout>
   );

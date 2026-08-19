@@ -19,6 +19,8 @@ export default function SearchableSelect({
   emptyText = "Tidak ada data yang cocok.",
   disabled = false,
   disabledHint,
+  id,
+  error,
 }: {
   items: SearchableSelectItem[];
   value: string;
@@ -28,6 +30,12 @@ export default function SearchableSelect({
   emptyText?: string;
   disabled?: boolean;
   disabledHint?: string;
+  // id: dipakai scroll+focus ke field ini dari modal ringkasan error
+  // (lihat components/AssetFieldErrorModal.tsx). error: border merah saat
+  // validasi gagal — SearchableSelect tidak native <input>, jadi border
+  // error-nya dikontrol manual lewat prop ini, bukan :invalid CSS.
+  id?: string;
+  error?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -56,9 +64,12 @@ export default function SearchableSelect({
     <div className="relative" ref={rootRef}>
       <button
         type="button"
+        id={id}
         disabled={disabled}
         onClick={() => setOpen((v) => !v)}
-        className="input flex items-center justify-between text-left disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed"
+        className={`input flex items-center justify-between text-left disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed ${
+          error ? "border-red-500 focus:ring-red-500/30" : ""
+        }`}
       >
         <span className={`truncate ${selected ? "text-slate-800" : "text-slate-400"}`}>
           {selected ? selected.label : disabled ? disabledHint || placeholder : placeholder}

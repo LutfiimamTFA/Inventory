@@ -248,6 +248,7 @@ export async function fetchHrpDivisions(brandId: string): Promise<HrpDivision[]>
         return {
           id: d.id,
           name: (data.name as string) || (data.divisionName as string) || d.id,
+          code: (data.code as string) || (data.divisionCode as string) || undefined,
         };
       });
     }
@@ -263,6 +264,7 @@ export async function fetchHrpDivisions(brandId: string): Promise<HrpDivision[]>
       return {
         id: d.id,
         name: (data.name as string) || (data.divisionName as string) || d.id,
+        code: (data.code as string) || (data.divisionCode as string) || undefined,
       };
     });
   } catch {

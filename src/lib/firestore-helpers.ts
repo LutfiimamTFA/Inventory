@@ -26,7 +26,7 @@ import {
   WorkOrderStatus,
 } from "@/lib/types";
 
-function normalizeCategoryCodePart(categoryCode: string) {
+export function normalizeCategoryCodePart(categoryCode: string) {
   return (categoryCode || "GEN").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
@@ -115,6 +115,17 @@ export async function writeAssetLog(params: {
   purpose?: string;
   expectedReturnAt?: string;
   note?: string;
+  // Section "Riwayat Aktivitas" — audit trail field-level (Detail Aset →
+  // Riwayat Aktivitas). editedByRole/changedFields/before/after OPSIONAL
+  // supaya call site lama (borrow/return/maintenance/dst) tetap jalan tanpa
+  // perubahan — hanya alur edit aset (Finance/Asset Admin/Super Admin) yang
+  // mengisi field ini. userUid/userName/timestamp yang SUDAH ADA berperan
+  // sebagai editedByUid/editedByName/editedAt, tidak diduplikasi jadi nama
+  // field baru.
+  editedByRole?: string;
+  changedFields?: string[];
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
 }) {
   const payload = cleanFirestoreData(params) as Record<string, unknown>;
   await addDoc(collection(db, "asset_logs"), {

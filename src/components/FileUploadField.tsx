@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { UploadCloud, FileText, ImageOff, X, RefreshCw } from "lucide-react";
 import { uploadToDrive, DriveUploadType } from "@/lib/drive-upload";
 import { DriveUploadResult } from "@/lib/types";
+import { getAssetFilePreviewUrl } from "@/lib/drive-file-id";
 
 export interface FileUploadValue {
   url: string;
@@ -143,7 +144,7 @@ export default function FileUploadField({
   const imageSrc = imgError
     ? null
     : localPreviewUrl ||
-      (value?.driveFileId ? `/api/drive-image?fileId=${value.driveFileId}` : null);
+      (value?.driveFileId ? getAssetFilePreviewUrl(value.driveFileId) : null);
   if (kind === "image") {
     console.debug(`${logTag} image src:`, imageSrc);
   }
