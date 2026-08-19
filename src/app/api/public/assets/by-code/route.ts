@@ -30,11 +30,6 @@ import { Asset } from "@/lib/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-async function getAdminDb() {
-  const { getAdminFirestore } = await import("@/lib/firebase-admin");
-  return getAdminFirestore();
-}
-
 interface PublicAssetPayload {
   id: string;
   assetNumber: number | null;
@@ -98,17 +93,32 @@ function toPublicAssetPayload(id: string, asset: Asset): PublicAssetPayload {
 // (env/credential vs. kode memang tidak ada) dan harus mudah dibedakan dari
 // log server saat audit environment Vercel.
 class AdminNotConfiguredError extends Error {
-  constructor() {
-    super("Firebase Admin SDK belum terkonfigurasi (env FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY).");
+  code = "FIREBASE_ADMIN_NOT_CONFIGURED";
+
+  constructor(message: string) {
+    super(message);
     this.name = "AdminNotConfiguredError";
   }
+}
+
+async function getAdminDb() {
+  const { getAdminFirestore, getFirebaseAdminStatus } = await import("@/lib/firebase-admin");
+  const db = getAdminFirestore();
+  if (db) return db;
+
+  // getAdminFirestore sengaja dipakai juga oleh route server lain dan
+  // mengembalikan null saat bootstrap gagal. Di endpoint ini null BUKAN
+  // "asset tidak ada"; ubah menjadi error yang membawa penyebab asli agar
+  // log production langsung menunjukkan env yang hilang atau error cert().
+  const status = getFirebaseAdminStatus();
+  const detail = status.error || (status.missing.length ? `Env hilang: ${status.missing.join(", ")}` : "Penyebab tidak diketahui.");
+  throw new AdminNotConfiguredError(`Firebase Admin SDK tidak siap. ${detail}`);
 }
 
 async function findAssetByCode(
   code: string
 ): Promise<{ id: string; data: Asset } | null> {
   const db = await getAdminDb();
-  if (!db) throw new AdminNotConfiguredError();
 
   console.log("[Public Asset Lookup] QUERY", { collection: "assets", field: "assetCode", code });
   const byCode = await db.collection("assets").where("assetCode", "==", code).limit(1).get();
@@ -147,7 +157,7 @@ export async function GET(request: NextRequest) {
 
   if (!code) {
     console.warn("[Public Asset Lookup] REJECTED", { reason: "empty_code" });
-    return NextResponse.json({ error: "Kode asset tidak valid." }, { status: 400 });
+    return NextResponse.json({ error: "Kode asset wajib diisi." }, { status: 400 });
   }
 
   try {
@@ -160,22 +170,22 @@ export async function GET(request: NextRequest) {
     console.log("[Public Asset Lookup] SUCCESS", { assetId: result.id, assetCode: result.data.assetCode });
     return NextResponse.json({ asset: toPublicAssetPayload(result.id, result.data) }, { status: 200 });
   } catch (error) {
-    // Section "Cek Vercel environment" — AdminNotConfiguredError dilog
-    // TERPISAH dengan pesan jelas supaya kalau penyebabnya memang env
-    // FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY belum
-    // di-set (atau newline private key belum di-unescape) di Production/
-    // Preview/Development Vercel, itu LANGSUNG kelihatan dari log server —
-    // bukan cuma "500" tanpa penyebab.
-    const isAdminNotConfigured = error instanceof AdminNotConfiguredError;
-    console.error("[Public Asset Lookup] FAILED", {
+    const errorInfo = error as {
+      code?: unknown;
+      message?: unknown;
+      name?: unknown;
+      stack?: unknown;
+    };
+    console.error("[PUBLIC ASSET BY CODE] FAILED", {
       code,
-      stage: isAdminNotConfigured ? "admin_init" : "query_or_payload",
-      errorName: error instanceof Error ? error.name : "Unknown",
-      errorMessage: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
+      stage: error instanceof AdminNotConfiguredError ? "firebase_admin_init" : "firestore_query_or_payload",
+      errorCode: typeof errorInfo?.code === "string" ? errorInfo.code : undefined,
+      errorMessage: typeof errorInfo?.message === "string" ? errorInfo.message : String(error),
+      errorName: typeof errorInfo?.name === "string" ? errorInfo.name : "Unknown",
+      errorStack: typeof errorInfo?.stack === "string" ? errorInfo.stack : undefined,
     });
     return NextResponse.json(
-      { error: isAdminNotConfigured ? "Layanan pencarian asset sedang tidak tersedia." : "Gagal memuat data asset." },
+      { error: "Gagal memuat data asset.", code: "ASSET_PUBLIC_READ_FAILED" },
       { status: 500 }
     );
   }
