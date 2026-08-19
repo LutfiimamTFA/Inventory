@@ -66,18 +66,24 @@ import { Toast, ToastState } from "@/components/Toast";
 // internal/maintenance/audit log/data karyawan.
 interface PublicAssetInfo {
   id: string;
+  assetNumber: number | null;
   assetCode: string;
   assetName: string;
-  assetNumber: number | null;
   categoryName: string;
-  statusLabel: string;
-  conditionLabel: string;
-  companyName: string;
-  locationText: string;
-  locationId: string | null;
+  acquisitionDate: string | null;
   quantity: number;
+  companyName: string;
+  locationId: string | null;
+  locationText: string;
+  condition: string;
+  conditionLabel: string;
+  assetStatus: string;
+  assetStatusLabel: string;
   photoUrl: string | null;
-  picName: string | null;
+  photoThumbnailUrl: string | null;
+  photoDriveFileId: string | null;
+  hasActiveIssue: boolean;
+  activeIssueTicketNo: string | null;
 }
 
 type GatedActionKey = "borrow" | "verify" | "report" | "detail";
@@ -189,11 +195,17 @@ function AssetActionContent() {
           return;
         }
         if (!res.ok) {
+          const body = await res.json().catch(() => null);
+          console.error("[Asset Action] /api/public/assets/by-code gagal", {
+            code,
+            status: res.status,
+            error: body?.error,
+          });
           setPublicState("error");
           return;
         }
         const data = await res.json();
-        if (data?.found && data.asset) {
+        if (data?.asset) {
           setPublicAsset(data.asset as PublicAssetInfo);
           setPublicState("found");
         } else {
@@ -346,11 +358,16 @@ function AssetActionContent() {
   const activeBorrowing = pickLatestActiveBorrowing(activeBorrowings);
   const activeIssue = asset
     ? getActiveIssueSummary(asset)
-    : { hasIssue: false, ticketNo: null, symptomLabel: null, note: null };
+    : {
+        hasIssue: !!publicAsset?.hasActiveIssue,
+        ticketNo: publicAsset?.activeIssueTicketNo || null,
+        symptomLabel: null,
+        note: null,
+      };
   const isAvailableToBorrow =
     !!asset?.isBorrowable && !isFixedLocation && !borrowedByMe && !borrowedByOther && !brokenBorrowState && !activeIssue.hasIssue;
 
-  const usageLabel = asset ? getAssetUsageLabel(asset, activeBorrowing) : publicAsset?.statusLabel || "";
+  const usageLabel = asset ? getAssetUsageLabel(asset, activeBorrowing) : publicAsset?.assetStatusLabel || "";
   const usageColor = asset ? getAssetUsageColor(asset, activeBorrowing) : "bg-slate-100 text-slate-500 border-slate-200";
   const rawHolder = asset ? getCurrentAssetHolder(asset, activeBorrowing) : null;
   const resolvedHolderName =
@@ -550,11 +567,14 @@ function AssetActionContent() {
   // dipakai BAIK saat sudah login (data `asset` lengkap) MAUPUN belum (data
   // `publicAsset` whitelist saja) — satu tampilan yang sama, cuma sumber
   // datanya beda, supaya tidak ada "kedipan" layout begitu login selesai.
+  // Section "Perbaiki error public Scan QR" — whitelist publik TIDAK lagi
+  // menyertakan nama PIC (lebih konservatif dari sebelumnya) — PIC
+  // Operasional hanya tampil setelah login (data `asset` lengkap).
   const displayCode = asset?.assetCode || publicAsset?.assetCode || "";
   const displayName = asset?.assetName || publicAsset?.assetName || "";
   const displayConditionLabel = asset ? getAssetConditionLabel(asset) : publicAsset?.conditionLabel || "-";
   const displayLocationText = asset ? asset.location || asset.locationText || "-" : publicAsset?.locationText || "-";
-  const displayPicName = asset?.areaPicName || publicAsset?.picName || null;
+  const displayPicName = asset?.areaPicName || null;
   const displayPhotoSrc = photo.src;
 
   return (
