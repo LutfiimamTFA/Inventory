@@ -90,6 +90,18 @@ export function formatDate(value: unknown) {
   }).format(d);
 }
 
+// Nama bulan lengkap ("20 Desember 2016"), tanpa waktu — dipakai halaman
+// hasil scan QR (Identitas Aset Terverifikasi, Tanggal Perolehan).
+export function formatDateLong(value: unknown) {
+  const d = toDisplayDate(value);
+  if (!d) return "-";
+  return new Intl.DateTimeFormat("id-ID", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  }).format(d);
+}
+
 export const ASSET_STATUS_LABEL: Record<AssetStatus, string> = {
   available: "Tersedia",
   borrowed: "Dipinjam",

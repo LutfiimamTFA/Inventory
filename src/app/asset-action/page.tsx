@@ -32,12 +32,14 @@ import { useEmployeeDirectory } from "@/lib/employeeDirectory";
 import {
   TRACKING_MODE_LABEL,
   formatDate,
+  formatDateLong,
   formatExpectedReturn,
   getAssetConditionLabel,
   hasBrokenBorrowState,
   isBorrowedByMe,
   isBorrowedByOther,
 } from "@/lib/utils";
+import { getAssetNumber, getAssetQuantity } from "@/lib/assets/inventory";
 import {
   detectAssetDataAnomalies,
   getActiveIssueSummary,
@@ -574,10 +576,16 @@ function AssetActionContent() {
               tidak perlu navigasi sama sekali untuk mereka. */}
           {!canOpenFullDetailPage && showFullDetail && (
             <div className="mt-3 space-y-2 border-t border-slate-100 pt-3 text-sm text-slate-600">
-              <Row label="Kategori" value={asset.categoryName || "-"} />
-              <Row label="Merk" value={asset.brand || "-"} />
-              <Row label="Model/Tipe" value={asset.model || "-"} />
-              <Row label="Serial Number" value={asset.serialNumber || "-"} />
+              <Row label="Kategori" value={asset.categoryName || "Belum tersedia"} />
+              <Row
+                label="Tanggal Perolehan"
+                value={
+                  asset.acquisitionDate || asset.purchaseDate
+                    ? formatDateLong(asset.acquisitionDate || asset.purchaseDate)
+                    : "Belum tersedia"
+                }
+              />
+              <Row label="Qty" value={`${getAssetQuantity(asset)} Unit`} />
               <Row label="Mode Tracking" value={asset.trackingMode ? TRACKING_MODE_LABEL[asset.trackingMode] : "-"} />
               {asset.operationalNotes && <Row label="Catatan Operasional" value={asset.operationalNotes} />}
             </div>
@@ -607,26 +615,44 @@ function AssetActionContent() {
                 <div className="rounded-xl border border-blue-100 bg-blue-50/60 p-3 text-xs text-blue-800">
                   <p className="font-semibold">Status QR: Terdaftar di Sistem</p>
                   <p className="mt-1">
-                    Tag QR ini terdaftar dalam sistem. Cocokkan foto, kode aset, nomor seri, dan tag fisik dengan
-                    barang di hadapan Anda.
+                    Tag QR ini terdaftar dalam sistem. Cocokkan foto, nama, dan kode aset dengan barang di
+                    hadapan Anda.
                   </p>
                 </div>
 
+                {/* Section "Rapikan Detail Asset scan QR" — mengikuti struktur
+                    Create/Edit Asset terbaru (Merek/Model/Nomor Seri/Nomor
+                    Tag Fisik sudah tidak jadi field utama, dihapus supaya
+                    tidak menghasilkan baris "-" terus-menerus). Bagian atas
+                    halaman ini sudah menampilkan Kode Aset/Nama Aset/Status/
+                    Lokasi/Kondisi/PIC — jadi di sini fokus ke data
+                    registrasi: identitas, tanggal & jumlah, kepemilikan, dan
+                    riwayat verifikasi. */}
                 <div className="space-y-2 text-sm text-slate-600">
-                  <Row label="Nama Aset" value={asset.assetName} />
-                  <Row label="Kode Aset" value={asset.assetCode} />
-                  <Row label="Merek" value={asset.brand || "-"} />
-                  <Row label="Model" value={asset.model || "-"} />
-                  <Row label="Nomor Seri" value={asset.serialNumber || "-"} />
-                  <Row label="Nomor Tag Fisik" value={asset.qrTagId || "-"} />
-                  <Row label="Perusahaan" value={asset.companyOwnerName || "-"} />
-                  <Row label="Divisi" value={asset.divisionOwnerName || "-"} />
-                  <Row label="Lokasi Terdaftar" value={asset.location || asset.locationText || "-"} />
+                  <Row
+                    label="No. Aset"
+                    value={getAssetNumber(asset) !== null ? String(getAssetNumber(asset)) : "Belum tersedia"}
+                  />
+                  <Row label="Nama Aset" value={asset.assetName || "Belum tersedia"} />
+                  <Row label="Kode Aset" value={asset.assetCode || "Belum tersedia"} />
+                  <Row label="Kategori Aset" value={asset.categoryName || "Belum tersedia"} />
+                  <Row
+                    label="Tanggal Perolehan"
+                    value={
+                      asset.acquisitionDate || asset.purchaseDate
+                        ? formatDateLong(asset.acquisitionDate || asset.purchaseDate)
+                        : "Belum tersedia"
+                    }
+                  />
+                  <Row label="Qty" value={`${getAssetQuantity(asset)} Unit`} />
+                  <Row label="Perusahaan" value={asset.companyOwnerName || "Belum tersedia"} />
+                  {asset.divisionOwnerName && <Row label="Divisi" value={asset.divisionOwnerName} />}
+                  <Row label="Lokasi Terdaftar" value={asset.location || asset.locationText || "Belum tersedia"} />
                   <Row
                     label="Terakhir Diverifikasi"
                     value={asset.lastVerifiedAt ? formatDate(asset.lastVerifiedAt) : "Belum pernah"}
                   />
-                  <Row label="Diverifikasi Oleh" value={asset.lastVerifiedByName || "-"} />
+                  {asset.lastVerifiedByName && <Row label="Diverifikasi Oleh" value={asset.lastVerifiedByName} />}
                 </div>
 
                 <div className="space-y-1.5 rounded-xl border border-slate-200 bg-slate-50 p-3">
