@@ -31,6 +31,12 @@ function LoginPageContent() {
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
+  // Section "Kembalikan flow Scan QR" — kalau user datang dari QR (returnUrl
+  // menuju /asset-action), tunjukkan konteks singkat supaya tidak bingung
+  // kenapa tiba-tiba diminta login — bukan halaman login biasa tanpa alasan.
+  const safeReturnUrlForContext = getSafeReturnUrl(searchParams.get("returnUrl"));
+  const isFromAssetScan = !!safeReturnUrlForContext?.startsWith("/asset-action");
+
   // Section G — kalau datang dari QR (/asset-action -> /login?returnUrl=...),
   // balik ke returnUrl itu setelah login berhasil, bukan selalu ke halaman
   // default role. getSafeReturnUrl menolak apa pun yang bukan path internal
@@ -103,6 +109,11 @@ function LoginPageContent() {
           </h1>
           <p className="text-sm text-slate-500">Safety, Asset & Maintenance System</p>
         </div>
+        {isFromAssetScan && (
+          <p className="mb-4 rounded-xl border border-blue-200 bg-blue-50 px-3.5 py-2.5 text-center text-sm text-blue-700">
+            Login untuk melanjutkan ke asset yang Anda scan.
+          </p>
+        )}
         <form
           onSubmit={handleSubmit}
           className="bg-white rounded-2xl shadow-lg border border-slate-200 p-6 space-y-4"
