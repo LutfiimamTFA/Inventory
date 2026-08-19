@@ -1,19 +1,39 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAdminFirestore } from "@/lib/firebase-admin";
 import { ASSET_STATUS_LABEL, getAssetConditionLabel } from "@/lib/utils";
 import { getAssetNumber, getAssetQuantity } from "@/lib/assets/inventory";
 import { resolveAssetPhotoSrc } from "@/lib/assets/asset-status";
 import { Asset } from "@/lib/types";
 
-// Section "Perbaiki error public Scan QR" — route ini WAJIB server-only:
-// hanya Firebase Admin SDK (getAdminFirestore, helper existing di
-// lib/firebase-admin.ts — TIDAK ada initialization baru di file ini).
-// Firestore `assets` TETAP tidak public (tidak ada `allow read: if true`
-// di firestore.rules) — akses publik lewat route ini SAJA, yang berjalan
+// Section "Perbaiki bug kritis QR Asset public" — route ini WAJIB
+// server-only: hanya Firebase Admin SDK (getAdminFirestore, helper existing
+// di lib/firebase-admin.ts — TIDAK ada initialization baru di file ini).
+// Firestore `assets` TETAP tidak public (tidak ada `allow read: if true` di
+// firestore.rules) — akses publik lewat route ini SAJA, yang berjalan
 // tepercaya di server dan hanya mengembalikan field whitelist di bawah.
 // Jangan pernah import "firebase/firestore" (client SDK) atau
-// "@/lib/firebase" (auth.currentUser/onAuthStateChanged) di file ini.
+// "@/lib/firebase" (auth.currentUser/onAuthStateChanged) di file ini — sudah
+// ditelusuri: utils.ts/asset-status.ts/inventory.ts/drive-file-id.ts/types.ts
+// SEMUA bersih, tidak ada satupun yang menyentuh client SDK.
+//
+// Section — import "@/lib/firebase-admin" (dan subpath firebase-admin/app,
+// firebase-admin/firestore, dst di baliknya) SENGAJA dilakukan lewat
+// dynamic import() DI DALAM handler (lihat getAdminDb() di bawah), BUKAN
+// sebagai top-level `import`. Kalau bootstrap Admin SDK gagal di runtime
+// serverless Vercel (mis. bundling/tracing gRPC, native binding, atau
+// resolusi package "exports" yang berbeda dari lingkungan lokal), top-level
+// import akan crash SAAT MODULE DIEVALUASI — sebelum baris kode apa pun di
+// handler ini sempat jalan, sehingga try/catch di bawah TIDAK PERNAH
+// tereksekusi dan yang tampil ke user cuma halaman error generik platform
+// ("This page couldn't load"), bukan JSON 500 buatan kita. Dynamic import
+// di dalam try/catch memastikan kegagalan seperti itu tetap TERTANGKAP dan
+// masuk log terstruktur di bawah, bukan crash opaque.
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+async function getAdminDb() {
+  const { getAdminFirestore } = await import("@/lib/firebase-admin");
+  return getAdminFirestore();
+}
 
 interface PublicAssetPayload {
   id: string;
@@ -87,7 +107,7 @@ class AdminNotConfiguredError extends Error {
 async function findAssetByCode(
   code: string
 ): Promise<{ id: string; data: Asset } | null> {
-  const db = getAdminFirestore();
+  const db = await getAdminDb();
   if (!db) throw new AdminNotConfiguredError();
 
   console.log("[Public Asset Lookup] QUERY", { collection: "assets", field: "assetCode", code });
