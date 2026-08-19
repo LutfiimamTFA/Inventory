@@ -176,7 +176,7 @@ export async function GET(request: NextRequest) {
       name?: unknown;
       stack?: unknown;
     };
-    console.error("[PUBLIC ASSET BY CODE] FAILED", {
+    console.error("[PUBLIC ASSET READ FAILED]", {
       code,
       stage: error instanceof AdminNotConfiguredError ? "firebase_admin_init" : "firestore_query_or_payload",
       errorCode: typeof errorInfo?.code === "string" ? errorInfo.code : undefined,
