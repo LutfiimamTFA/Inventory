@@ -550,6 +550,15 @@ export type IssueSymptomType =
   | "Tidak Lengkap"
   | "Aksesori Hilang"
   | "Hilang"
+  // Section "Rombak flow Scan QR" — kategori modal "Laporkan Masalah" untuk
+  // ketidaksesuaian identitas/lokasi/QR/foto, dulu ditulis lewat flow
+  // terpisah (asset_verification_logs type=mismatch) yang sekarang digabung
+  // ke asset_issue_tickets sebagai satu-satunya source of truth laporan.
+  | "Data Tidak Sesuai"
+  | "Lokasi Tidak Sesuai"
+  | "QR Tidak Sesuai"
+  | "Foto Tidak Sesuai"
+  | "Aset Tidak Ditemukan"
   | "Lainnya";
 
 export type IssueImpactLevel =
@@ -702,6 +711,10 @@ export interface AssetIssueTicket {
   assetId?: string | null;
   assetName?: string | null;
   assetCode?: string | null;
+  // Section "Perbaiki flow Laporkan Masalah" — "No. Aset" pada tiket dari
+  // Scan QR (asset.assetNumber, TERPISAH dari assetCode) supaya identitas
+  // aset di tabel Laporan Kendala tetap jelas, bukan cuma nama+kode.
+  assetNumber?: number | null;
   assetCategory?: string;
   assetLocation?: string;
   locationId?: string;

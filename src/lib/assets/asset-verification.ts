@@ -57,10 +57,12 @@ export async function logAssetQrScan(params: {
   }
 }
 
+// Section "Rapikan checklist Identitas Aset Terverifikasi" — serialMatches
+// dihapus (Nomor Seri sudah tidak jadi field aset sejak Create/Edit Asset
+// terbaru, jadi tidak ada lagi apa pun untuk dicocokkan).
 export interface VerificationChecklist {
   photoMatches: boolean;
   codeMatches: boolean;
-  serialMatches: boolean;
   qrOnRightItem: boolean;
   locationAndHolderMatch: boolean;
 }

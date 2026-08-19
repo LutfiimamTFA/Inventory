@@ -11,6 +11,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Circle,
   Eye,
   FileWarning,
   ImageIcon,
@@ -27,7 +28,6 @@ import { useAuth } from "@/lib/auth-context";
 import { Asset, AssetBorrowing } from "@/lib/types";
 import { isAssetInMyPicLocation } from "@/lib/locations";
 import { repairBrokenBorrowState } from "@/lib/borrow-actions";
-import { getAssetIssueReportContext } from "@/lib/asset-issue-reporting";
 import { useEmployeeDirectory } from "@/lib/employeeDirectory";
 import {
   TRACKING_MODE_LABEL,
@@ -53,21 +53,46 @@ import {
   pickLatestActiveBorrowing,
   resolveAssetPhotoSrc,
 } from "@/lib/assets/asset-status";
-import {
-  VerificationChecklist,
-  logAssetQrScan,
-  submitAssetMismatchReport,
-  submitAssetVerification,
-} from "@/lib/assets/asset-verification";
+import { VerificationChecklist, logAssetQrScan, submitAssetVerification } from "@/lib/assets/asset-verification";
 import Badge from "@/components/Badge";
-import ReportIssueModal from "@/components/ReportIssueModal";
+import ReportProblemModal from "@/components/ReportProblemModal";
 import { BorrowModal, ReturnModal } from "@/components/BorrowReturnModal";
 import { Toast, ToastState } from "@/components/Toast";
 
+// Section "Rombak flow Scan QR" — bentuk data PUBLIK (whitelist), field
+// PERSIS sama dengan yang dikembalikan /api/public/assets/by-code. Dipakai
+// SEBELUM login (atau sebagai fallback kalau fetch client SDK gagal karena
+// rules) — TIDAK PERNAH berisi harga/invoice/finance/email PIC/UID/riwayat
+// internal/maintenance/audit log/data karyawan.
+interface PublicAssetInfo {
+  id: string;
+  assetCode: string;
+  assetName: string;
+  assetNumber: number | null;
+  categoryName: string;
+  statusLabel: string;
+  conditionLabel: string;
+  companyName: string;
+  locationText: string;
+  locationId: string | null;
+  quantity: number;
+  photoUrl: string | null;
+  picName: string | null;
+}
+
+type GatedActionKey = "borrow" | "verify" | "report" | "detail";
+type PublicFetchState = "loading" | "found" | "not_found" | "error";
+
 // Section E — halaman ini SENGAJA berdiri sendiri (bukan dalam
 // ProtectedLayout/sidebar) supaya bisa langsung dibuka kamera bawaan HP dari
-// QR fisik tanpa nyasar ke guard role sidebar dulu. Guard login/akses
-// ditangani manual di bawah (redirect ke /login?returnUrl=...).
+// QR fisik. Section 1/2 — TARGET UTAMA rombak ini: info asset boleh dibaca
+// TANPA login sama sekali; login HANYA dipicu saat user menekan aksi yang
+// butuh identitas (Pinjam/Konfirmasi/Laporkan Masalah/Lihat Detail
+// Internal), lewat /login?returnUrl=/asset-action?code=X&action=Y — setelah
+// login berhasil, /login mengembalikan user ke returnUrl itu APA ADANYA
+// (lihat getSafeReturnUrl di login/page.tsx, tidak diubah sama sekali), dan
+// effect "auto-continue" di bawah membaca query `action` untuk otomatis
+// melanjutkan aksi yang tadi dipilih.
 export default function AssetActionPage() {
   return (
     <Suspense fallback={<PageShell><LoadingState /></PageShell>}>
@@ -79,44 +104,46 @@ export default function AssetActionPage() {
 function AssetActionContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const { firebaseUser, assetUser, role, loading, isLocationPicRole, assignedPicLocations } = useAuth();
+  const { firebaseUser, assetUser, role, isLocationPicRole, assignedPicLocations } = useAuth();
   const code = searchParams.get("code") || "";
-  const employeeDirectory = useEmployeeDirectory();
+  const actionParam = searchParams.get("action") as GatedActionKey | null;
+
+  // Section 4 — Employee Directory HANYA diaktifkan setelah user benar-benar
+  // jadi active asset_users (rules employee_profiles mewajibkan
+  // isActiveAssetUser()) — sebelumnya hook ini fetch TANPA SYARAT begitu
+  // komponen mount, termasuk untuk pengunjung publik/belum login sama
+  // sekali, yang SELALU permission-denied ("[Employee Directory] gagal
+  // memuat"). Dipakai HANYA untuk resolve nama pemegang aset, TIDAK PERNAH
+  // dibutuhkan oleh modal Laporkan Masalah (lihat ReportProblemModal, yang
+  // tidak mengimpor hook ini sama sekali).
+  const employeeDirectory = useEmployeeDirectory(!!assetUser?.uid);
+
+  const [publicAsset, setPublicAsset] = useState<PublicAssetInfo | null>(null);
+  const [publicState, setPublicState] = useState<PublicFetchState>("loading");
 
   const [asset, setAsset] = useState<Asset | null>(null);
   const [notFound, setNotFound] = useState(false);
   const [loadingAsset, setLoadingAsset] = useState(true);
-  const [reportOpen, setReportOpen] = useState(false);
+  const [problemOpen, setProblemOpen] = useState(false);
   const [borrowOpen, setBorrowOpen] = useState(false);
   const [returnOpen, setReturnOpen] = useState(false);
   const [showFullDetail, setShowFullDetail] = useState(false);
   const [showIdentityDetail, setShowIdentityDetail] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
-  // Section 1/4 — borrowing AKTIF untuk aset ini, sumber utama status
-  // pemakaian & pemegang (lihat lib/assets/asset-status.ts) — bukan cuma
-  // baca field mentah di dokumen assets yang bisa tidak sinkron.
   const [activeBorrowings, setActiveBorrowings] = useState<AssetBorrowing[]>([]);
 
-  // Section 2/10 — foto ASLI aset (bukan logo QHSE): loading skeleton +
-  // fallback kalau gagal dimuat + preview besar.
   const [photoLoaded, setPhotoLoaded] = useState(false);
   const [photoFailed, setPhotoFailed] = useState(false);
   const [photoPreviewOpen, setPhotoPreviewOpen] = useState(false);
 
-  // Section 6/7 — "Konfirmasi Aset Sesuai" / "Laporkan Ketidaksesuaian",
-  // TERPISAH dari laporan kerusakan (ReportIssueModal).
   const [verifyOpen, setVerifyOpen] = useState(false);
-  const [mismatchOpen, setMismatchOpen] = useState(false);
   const [verifySubmitting, setVerifySubmitting] = useState(false);
-  const [mismatchSubmitting, setMismatchSubmitting] = useState(false);
 
-  // Section K — diekstrak jadi fungsi sendiri supaya bisa dipanggil ULANG
-  // setelah Pinjam/Kembalikan sukses (refresh status asset), TANPA perlu
-  // scan ulang atau redirect ke /scan sama sekali.
   // Section 6 — QR lama/baru harus tetap terbuka ke asset yang sama meskipun
   // isi QR berbeda-beda (assetCode polos, qrTagId, atau assetId dokumen).
-  // Urutan fallback: assetCode -> qrTagId -> assetId (getDoc langsung),
-  // berhenti begitu salah satu ditemukan.
+  // Urutan fallback: assetCode -> qrTagId -> assetId (getDoc langsung), SAMA
+  // PERSIS dengan urutan pencarian di /api/public/assets/by-code supaya
+  // hasil publik & hasil setelah login selalu konsisten.
   const fetchAssetByCode = useCallback(async (rawCode: string) => {
     const codeSnap = await getDocs(
       query(collection(db, "assets"), where("assetCode", "==", rawCode), limit(1))
@@ -142,24 +169,53 @@ function AssetActionContent() {
     return null;
   }, []);
 
-  // Section E — flow: tunggu auth selesai, redirect ke login kalau belum
-  // login (bawa returnUrl supaya balik ke sini lagi setelah login), baru
-  // cari asset kalau sudah login.
+  // Section 1 — data PUBLIK dimuat SELALU, terlepas dari status login,
+  // lewat server route yang pakai Firebase Admin SDK (bukan client SDK
+  // langsung ke Firestore) supaya `assets` TIDAK PERNAH perlu dibuka publik
+  // lewat rules. Ini yang membuat info asset bisa tampil SEKETIKA scan,
+  // tanpa menunggu proses auth selesai sama sekali.
   useEffect(() => {
-    if (loading) return;
-
-    if (!firebaseUser) {
-      const returnUrl = `/asset-action?code=${encodeURIComponent(code)}`;
-      router.replace(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
+    if (!code) {
+      queueMicrotask(() => setPublicState("error"));
       return;
     }
-  }, [loading, firebaseUser, code, router]);
+    let cancelled = false;
+    queueMicrotask(() => setPublicState("loading"));
+    fetch(`/api/public/assets/by-code?code=${encodeURIComponent(code)}`)
+      .then(async (res) => {
+        if (cancelled) return;
+        if (res.status === 404) {
+          setPublicState("not_found");
+          return;
+        }
+        if (!res.ok) {
+          setPublicState("error");
+          return;
+        }
+        const data = await res.json();
+        if (data?.found && data.asset) {
+          setPublicAsset(data.asset as PublicAssetInfo);
+          setPublicState("found");
+        } else {
+          setPublicState("not_found");
+        }
+      })
+      .catch((error) => {
+        console.error("[Asset Action] gagal memuat data publik asset", { code, error });
+        if (!cancelled) setPublicState("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [code]);
 
+  // Section 2 — data LENGKAP (semua field, dipakai UI penuh + logika bisnis
+  // pinjam/verifikasi/laporan) HANYA dimuat lewat client SDK setelah user
+  // benar-benar login — TIDAK PERNAH lagi memaksa redirect ke /login begitu
+  // halaman dibuka (bandingkan versi lama yang langsung router.replace ke
+  // /login sebelum data apa pun sempat tampil).
   useEffect(() => {
-    if (loading || !firebaseUser || !code) {
-      if (!loading && !code) queueMicrotask(() => setLoadingAsset(false));
-      return;
-    }
+    if (!firebaseUser || !code) return;
 
     let cancelled = false;
     queueMicrotask(() => {
@@ -180,7 +236,7 @@ function AssetActionContent() {
         }
       })
       .catch((error) => {
-        console.error("[Asset Action] gagal memuat asset", { code, error });
+        console.error("[Asset Action] gagal memuat asset setelah login", { code, error });
         if (!cancelled) setNotFound(true);
       })
       .finally(() => {
@@ -190,11 +246,8 @@ function AssetActionContent() {
     return () => {
       cancelled = true;
     };
-  }, [loading, firebaseUser, code, fetchAssetByCode]);
+  }, [firebaseUser, code, fetchAssetByCode]);
 
-  // Section K/L/M — setelah Pinjam/Kembalikan sukses, refresh data asset
-  // YANG SAMA di tempat (tanpa navigasi/scan ulang) supaya tombol aksi
-  // langsung menyesuaikan status terbaru.
   const refreshAsset = useCallback(async () => {
     if (!code) return;
     try {
@@ -205,13 +258,41 @@ function AssetActionContent() {
     }
   }, [code, fetchAssetByCode]);
 
-  // Section 4 — begitu asset diketahui, ambil SEMUA asset_borrowings yang
-  // menunjuk ke asset ini (assetId) — bukan cuma percaya field currentHolder*
-  // di dokumen assets, yang bisa telat/tidak sinkron dari borrowing yang
-  // sebenarnya masih aktif.
+  // Section "Perbaiki flow Laporkan Masalah" — begitu ReportProblemModal
+  // sukses membuat ticket, langsung update state `asset` di sini SECARA
+  // OPTIMISTIS (tanpa menunggu refetch Firestore yang butuh round-trip
+  // jaringan) supaya badge "Ada Laporan Aktif" tampil seketika DAN guard
+  // "sudah ada laporan aktif" di modal langsung aktif kalau user menekan
+  // "Laporkan Masalah" lagi sebelum refetch selesai — inilah yang mencegah
+  // laporan ganda akibat race klik cepat. refreshAsset() tetap dipanggil
+  // sesudahnya supaya data akhirnya sinkron penuh dengan server.
+  const handleProblemSubmitted = useCallback(
+    (info: { ticketId: string; ticketNumber: string; symptomLabel: string; note: string }) => {
+      setAsset((prev) =>
+        prev
+          ? {
+              ...prev,
+              hasActiveIssue: true,
+              activeIssueTicketId: info.ticketId,
+              activeIssueTicketNo: info.ticketNumber,
+              condition: "reported_issue",
+              conditionLabel: "Perlu Pemeriksaan",
+              issueReportedAt: new Date().toISOString(),
+              issueReportedByUid: assetUser?.uid || firebaseUser?.uid || prev.issueReportedByUid,
+              issueReportedByName: assetUser?.name || firebaseUser?.email || prev.issueReportedByName,
+              lastIssueSymptomLabel: info.symptomLabel,
+              lastIssueNote: info.note,
+            }
+          : prev
+      );
+      void refreshAsset();
+    },
+    [assetUser?.uid, assetUser?.name, firebaseUser?.uid, firebaseUser?.email, refreshAsset]
+  );
+
   useEffect(() => {
     if (!asset?.id) {
-      Promise.resolve().then(() => setActiveBorrowings([]));
+      queueMicrotask(() => setActiveBorrowings([]));
       return;
     }
     let cancelled = false;
@@ -228,11 +309,11 @@ function AssetActionContent() {
     };
   }, [asset?.id]);
 
-  // Section 8/9 — catat SETIAP QR discan (bukan verifikasi fisik) begitu
-  // asset+user diketahui. loggedForRef mencegah log ganda untuk asset yang
-  // sama selama komponen ini hidup (termasuk saat React Strict Mode
-  // menjalankan effect dua kali di dev) — dikombinasikan dengan dedupe
-  // in-memory di lib/assets/asset-verification.ts.
+  // Section 7/9 — catat SETIAP QR discan HANYA untuk user yang sudah
+  // diketahui identitasnya (assetUser aktif) — pengunjung anonim/publik
+  // SENGAJA tidak pernah memicu write ke asset_qr_scan_logs sama sekali
+  // (bukan kegagalan, memang tidak dicatat; lihat firestore.rules).
+  // Kegagalan tetap non-fatal (try/catch di logAssetQrScan sendiri).
   const loggedForRef = useRef<string | null>(null);
   useEffect(() => {
     if (!asset?.id || !assetUser?.uid) return;
@@ -250,145 +331,76 @@ function AssetActionContent() {
       scannedByUid: assetUser.uid,
       scannedByName: assetUser.name || firebaseUser?.email || "",
     });
-    // activeBorrowings sengaja tidak dipakai ulang sebagai dependency biar
-    // scan hanya dicatat SEKALI per asset+user per kunjungan halaman ini,
-    // bukan setiap kali daftar borrowing selesai fetch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asset?.id, assetUser?.uid]);
 
-  if (loading || (!firebaseUser && !code)) {
-    return (
-      <PageShell>
-        <LoadingState />
-      </PageShell>
-    );
-  }
-
-  if (!code) {
-    return (
-      <PageShell>
-        <ErrorState message="Kode asset tidak ditemukan dari QR." />
-      </PageShell>
-    );
-  }
-
-  if (!firebaseUser) {
-    // Sedang di tengah redirect ke /login (lihat useEffect di atas).
-    return (
-      <PageShell>
-        <LoadingState />
-      </PageShell>
-    );
-  }
-
-  if (loadingAsset) {
-    return (
-      <PageShell>
-        <LoadingState />
-      </PageShell>
-    );
-  }
-
-  if (notFound || !asset) {
-    return (
-      <PageShell>
-        <ErrorState message={`Asset dengan kode "${code}" tidak ditemukan.`} />
-      </PageShell>
-    );
-  }
-
-  // Section A — status dibaca lewat helper normalisasi (lib/utils.ts),
-  // BUKAN dibaca mentah dari satu field saja — asset ini bisa punya data
-  // dari skema lama (assetStatus/currentBorrower*) maupun skema baru
-  // (currentUsageStatus/currentHolder*), dan keduanya harus dianggap sah.
-  const isFixedLocation = asset.trackingMode === "fixed_location";
-  const borrowedByMe = isBorrowedByMe(asset, { uid: assetUser?.uid || firebaseUser.uid });
-  const borrowedByOther = isBorrowedByOther(asset, { uid: assetUser?.uid || firebaseUser.uid });
-  const brokenBorrowState = hasBrokenBorrowState(asset);
-
-  // Section 1/2 — SATU sumber untuk status pemakaian + pemegang, lewat
-  // lib/assets/asset-status.ts, supaya badge dan pesan warning tidak lagi
-  // bisa saling bertentangan (akar bug: badge sebelumnya baca assetStatus
-  // mentah, warning baca currentUsageStatus — dua field yang bisa beda).
+  // Section A — status dibaca lewat helper normalisasi, null-safe karena
+  // `asset` bisa belum ada (belum login/masih memuat) saat const ini
+  // dievaluasi — SEMUA turunan di bawah dihitung tanpa syarat (bukan di
+  // dalam if), supaya effect "auto-continue" setelah login (di bawah) bisa
+  // memakainya dan urutan Hook tetap konsisten di setiap render.
+  const isFixedLocation = asset?.trackingMode === "fixed_location";
+  const borrowedByMe = asset ? isBorrowedByMe(asset, { uid: assetUser?.uid || firebaseUser?.uid }) : false;
+  const borrowedByOther = asset ? isBorrowedByOther(asset, { uid: assetUser?.uid || firebaseUser?.uid }) : false;
+  const brokenBorrowState = asset ? hasBrokenBorrowState(asset) : false;
   const activeBorrowing = pickLatestActiveBorrowing(activeBorrowings);
-  const activeIssue = getActiveIssueSummary(asset);
-  // Section 5 — status inspection_required/reported_issue mengunci Pinjam
-  // Aset TOTAL sampai laporan aktif selesai, terlepas dari isBorrowable.
+  const activeIssue = asset
+    ? getActiveIssueSummary(asset)
+    : { hasIssue: false, ticketNo: null, symptomLabel: null, note: null };
   const isAvailableToBorrow =
-    asset.isBorrowable &&
-    !isFixedLocation &&
-    !borrowedByMe &&
-    !borrowedByOther &&
-    !brokenBorrowState &&
-    !activeIssue.hasIssue;
+    !!asset?.isBorrowable && !isFixedLocation && !borrowedByMe && !borrowedByOther && !brokenBorrowState && !activeIssue.hasIssue;
 
-  const quickReportContext = getAssetIssueReportContext({
-    user: assetUser?.uid
-      ? {
-          uid: assetUser.uid,
-          name: assetUser.name || "",
-          email: assetUser.email || "",
-          role: role || assetUser.role || "staff",
-        }
-      : null,
-    asset,
-    activeBorrowing,
-    allowQrPhysicalObservation: true,
-  });
-  // Section 5 — kalau SUDAH ada laporan aktif, jangan tawarkan "laporkan
-  // kendala baru" lagi — arahkan ke "Lihat Laporan Aktif"/"Tambahkan Bukti"
-  // di bawah supaya tidak ada dua tiket kendala yang tumpang tindih.
-  const canReportIssue = quickReportContext.canReport && !activeIssue.hasIssue;
-  const reportIssueLabel = borrowedByMe
-    ? "Laporkan Kendala"
-    : borrowedByOther
-    ? "Laporkan Temuan Fisik"
-    : "Laporkan Temuan";
-  const usageLabel = getAssetUsageLabel(asset, activeBorrowing);
-  const usageColor = getAssetUsageColor(asset, activeBorrowing);
-  const rawHolder = getCurrentAssetHolder(asset, activeBorrowing);
-  // Section 1 — kalau sistem cuma tahu UID pemegang (nama belum ke-resolve
-  // di data borrowing/asset), coba resolve dari direktori karyawan
-  // (employee_profiles/users) SEBELUM menyerah ke "Data pemegang belum
-  // tersinkron" — ini langkah fallback TERAKHIR persis seperti diminta.
+  const usageLabel = asset ? getAssetUsageLabel(asset, activeBorrowing) : publicAsset?.statusLabel || "";
+  const usageColor = asset ? getAssetUsageColor(asset, activeBorrowing) : "bg-slate-100 text-slate-500 border-slate-200";
+  const rawHolder = asset ? getCurrentAssetHolder(asset, activeBorrowing) : null;
   const resolvedHolderName =
-    rawHolder.name || employeeDirectory.resolveName(rawHolder.uid, rawHolder.email) || null;
-  const holder = { ...rawHolder, name: resolvedHolderName };
-  const holderDisplayText = getCurrentAssetHolderDisplayText(holder);
-  const dataAnomalies = detectAssetDataAnomalies(asset, activeBorrowings);
+    rawHolder?.name || (rawHolder ? employeeDirectory.resolveName(rawHolder.uid, rawHolder.email) : null) || null;
+  const holder = rawHolder ? { ...rawHolder, name: resolvedHolderName } : null;
+  const holderDisplayText = holder ? getCurrentAssetHolderDisplayText(holder) : "";
+  const dataAnomalies = asset ? detectAssetDataAnomalies(asset, activeBorrowings) : [];
   const canSeeAnomalies = role === "super_admin" || role === "asset_admin";
 
   const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
-  const isLocationPicOwner = isLocationPicScoped && isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid);
-  // Section P — /assets/{id} punya guard sidebar sendiri (Super Admin/Asset
-  // Admin/Asset Finance/Tim IT selalu boleh, PIC Lokasi hanya untuk asset di
-  // lokasinya). Staff biasa (atau PIC di luar lokasinya) akan langsung
-  // dilempar balik oleh guard itu — jadi utk mereka "Lihat Detail" TIDAK
-  // boleh navigasi ke sana, cukup buka ringkasan tambahan di halaman ini.
+  const isLocationPicOwner =
+    asset && isLocationPicScoped ? isAssetInMyPicLocation(asset, assignedPicLocations, assetUser?.uid) : false;
   const canOpenFullDetailPage =
     role === "super_admin" || role === "asset_admin" || role === "asset_finance" || role === "it_team" || isLocationPicOwner;
   const canRepairBrokenState = role === "super_admin" || role === "asset_admin";
 
-  // Section 4 — indikator kelengkapan identitas fisik + status QR.
-  const verificationIndicators = getAssetVerificationIndicators(asset);
-  const identityIncomplete = isAssetIdentityIncomplete(asset);
-  const photo = resolveAssetPhotoSrc(asset);
+  const verificationIndicators = asset ? getAssetVerificationIndicators(asset) : [];
+  const identityIncomplete = asset ? isAssetIdentityIncomplete(asset) : false;
+  const photo = asset ? resolveAssetPhotoSrc(asset) : { src: publicAsset?.photoUrl || null };
 
-  // Section 5 — tiket kendala aktif: arahkan "Lihat Laporan Aktif" ke tempat
-  // yang tepat sesuai peran (QHSE/Admin ke board Maintenance & Kendala,
-  // staff pelapor ke Laporan Saya).
-  const activeTicketLink = asset.activeIssueTicketId
+  const activeTicketLink = asset?.activeIssueTicketId
     ? canSeeAnomalies
       ? `/maintenance?tab=staff-reports&ticketId=${asset.activeIssueTicketId}`
       : `/my-reports?ticketId=${asset.activeIssueTicketId}`
     : null;
-  const isActiveIssueReporter = !!assetUser?.uid && asset.issueReportedByUid === assetUser.uid;
+  const isActiveIssueReporter = !!assetUser?.uid && asset?.issueReportedByUid === assetUser.uid;
 
-  // Section C — validasi lengkap sebelum buka modal Pinjam. borrowedByMe
-  // dicek lebih dulu supaya klik "Pinjam Asset" yang ternyata sudah jadi
-  // "Kembalikan Asset" (data baru saja berubah) tetap membuka modal yang
-  // benar, bukan menolak diam-diam.
+  // Section 2 — SATU pintu gerbang: kalau belum login, arahkan ke
+  // /login?returnUrl=/asset-action?code=X&action=Y (baca lagi setelah login
+  // via effect auto-continue di bawah); kalau sudah login, jalankan aksinya
+  // LANGSUNG tanpa redirect apa pun.
+  const handleGatedAction = useCallback(
+    (actionKey: GatedActionKey, run?: () => void) => {
+      if (!firebaseUser) {
+        const returnUrl = `/asset-action?code=${encodeURIComponent(code)}&action=${actionKey}`;
+        router.push(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
+        return;
+      }
+      run?.();
+    },
+    [firebaseUser, code, router]
+  );
+
+  // Section — SENGAJA bukan useCallback: `holder` dihitung ulang tiap render
+  // (bukan objek stabil), jadi identitas callback yang di-"memo" pun ikut
+  // berubah tiap render juga — dua fungsi ini hanya dipakai langsung di JSX
+  // komponen yang sama (bukan dioper ke child yang butuh identitas stabil),
+  // jadi plain function cukup dan lebih sederhana.
   const handleBorrowClick = () => {
+    if (!asset) return;
     if (!asset.isBorrowable) {
       setToast({ type: "error", message: "Asset ini tidak dapat dipinjam." });
       return;
@@ -404,7 +416,7 @@ function AssetActionContent() {
     if (borrowedByOther) {
       setToast({
         type: "error",
-        message: `Asset sedang dipinjam oleh ${holder.name || "user lain"}.`,
+        message: `Asset sedang dipinjam oleh ${holder?.name || "user lain"}.`,
       });
       return;
     }
@@ -419,12 +431,40 @@ function AssetActionContent() {
     setBorrowOpen(true);
   };
 
+  const handleDetailClick = () => {
+    if (!asset) return;
+    if (canOpenFullDetailPage) {
+      router.push(`/assets/${asset.id}`);
+      return;
+    }
+    setShowFullDetail((prev) => !prev);
+  };
+
+  // Section 2 — setelah login sukses & data lengkap asset selesai dimuat,
+  // baca query `action` SEKALI lalu jalankan aksi yang tadi dipilih otomatis
+  // (user tidak perlu klik ulang), baru bersihkan query itu dari URL supaya
+  // refresh/kembali dari modal tidak memicunya lagi.
+  const autoActionRunRef = useRef(false);
+  useEffect(() => {
+    if (autoActionRunRef.current) return;
+    if (!firebaseUser || !asset || !actionParam) return;
+    autoActionRunRef.current = true;
+
+    if (actionParam === "verify") queueMicrotask(() => setVerifyOpen(true));
+    else if (actionParam === "report") queueMicrotask(() => setProblemOpen(true));
+    else if (actionParam === "borrow") queueMicrotask(() => handleBorrowClick());
+    else if (actionParam === "detail") queueMicrotask(() => handleDetailClick());
+
+    router.replace(`/asset-action?code=${encodeURIComponent(code)}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [firebaseUser, asset, actionParam, code]);
+
   const handleRepairStatus = async () => {
-    if (!assetUser?.uid) return;
+    if (!assetUser?.uid || !asset) return;
     try {
       await repairBrokenBorrowState({
         asset,
-        performedBy: { uid: assetUser.uid, name: assetUser.name || firebaseUser.email || "" },
+        performedBy: { uid: assetUser.uid, name: assetUser.name || firebaseUser?.email || "" },
       });
       setToast({ type: "success", message: "Status asset berhasil diperbaiki menjadi Tersedia." });
       refreshAsset();
@@ -439,14 +479,14 @@ function AssetActionContent() {
   };
 
   const handleSubmitVerification = async (checklist: VerificationChecklist) => {
-    if (!assetUser?.uid) return;
+    if (!assetUser?.uid || !asset) return;
     setVerifySubmitting(true);
     try {
       await submitAssetVerification({
         asset,
         checklist,
         performedByUid: assetUser.uid,
-        performedByName: assetUser.name || firebaseUser.email || "",
+        performedByName: assetUser.name || firebaseUser?.email || "",
       });
       setToast({ type: "success", message: "Asset dikonfirmasi sesuai dan tercatat sebagai terverifikasi." });
       setVerifyOpen(false);
@@ -466,115 +506,127 @@ function AssetActionContent() {
     }
   };
 
-  const handleSubmitMismatch = async (reasons: string[], note: string) => {
-    if (!assetUser?.uid) return;
-    setMismatchSubmitting(true);
-    try {
-      await submitAssetMismatchReport({
-        asset,
-        reasons,
-        note,
-        performedByUid: assetUser.uid,
-        performedByName: assetUser.name || firebaseUser.email || "",
-      });
-      setToast({ type: "success", message: "Laporan ketidaksesuaian berhasil dikirim ke QHSE." });
-      setMismatchOpen(false);
-    } catch (error) {
-      const err = error as { code?: string; message?: string; name?: string };
-      console.error("[Asset Action] gagal mengirim laporan ketidaksesuaian", {
-        collection: "asset_verification_logs",
-        assetId: asset.id,
-        errorCode: err?.code,
-        errorMessage: err?.message,
-        errorName: err?.name,
-      });
-      setToast({ type: "error", message: "Gagal mengirim laporan ketidaksesuaian." });
-    } finally {
-      setMismatchSubmitting(false);
+  // Section 1/10 — urutan tampil: asset LENGKAP (sudah login) didahulukan,
+  // fallback ke data PUBLIK (belum login), baru "tidak ditemukan"/"gagal
+  // memuat" — supaya info selalu tampil secepat mungkin tanpa menunggu auth.
+  if (!code) {
+    return (
+      <PageShell>
+        <ErrorState message="Kode asset tidak ditemukan dari QR." />
+      </PageShell>
+    );
+  }
+
+  if (!asset && !publicAsset) {
+    if (publicState === "not_found") {
+      return (
+        <PageShell>
+          <ErrorState title="QR Asset Tidak Dikenali" message="Kode ini tidak terdaftar pada sistem." />
+        </PageShell>
+      );
     }
-  };
+    if (publicState === "error" && !firebaseUser) {
+      return (
+        <PageShell>
+          <ErrorState message="Gagal memuat data asset. Coba lagi." />
+        </PageShell>
+      );
+    }
+    if (firebaseUser && notFound && !loadingAsset) {
+      return (
+        <PageShell>
+          <ErrorState message={`Asset dengan kode "${code}" tidak ditemukan.`} />
+        </PageShell>
+      );
+    }
+    return (
+      <PageShell>
+        <LoadingState />
+      </PageShell>
+    );
+  }
+
+  // Section 10 — bagian info (foto/kode/status/nama/lokasi/kondisi/PIC)
+  // dipakai BAIK saat sudah login (data `asset` lengkap) MAUPUN belum (data
+  // `publicAsset` whitelist saja) — satu tampilan yang sama, cuma sumber
+  // datanya beda, supaya tidak ada "kedipan" layout begitu login selesai.
+  const displayCode = asset?.assetCode || publicAsset?.assetCode || "";
+  const displayName = asset?.assetName || publicAsset?.assetName || "";
+  const displayConditionLabel = asset ? getAssetConditionLabel(asset) : publicAsset?.conditionLabel || "-";
+  const displayLocationText = asset ? asset.location || asset.locationText || "-" : publicAsset?.locationText || "-";
+  const displayPicName = asset?.areaPicName || publicAsset?.picName || null;
+  const displayPhotoSrc = photo.src;
 
   return (
     <PageShell>
       <div className="w-full max-w-md">
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          {/* Section 2/10 — foto ASLI aset SELALU di paling atas card (urutan
-              mobile: foto -> status QR -> nama/kode -> ...). */}
           <AssetPhotoBlock
-            photo={photo}
-            assetName={asset.assetName}
+            photoSrc={displayPhotoSrc}
+            assetName={displayName}
             loaded={photoLoaded}
             failed={photoFailed}
-            onLoad={() => {
-              console.log("[Asset Photo] berhasil dimuat", { assetId: asset.id, previewUrl: photo.src });
-              setPhotoLoaded(true);
-            }}
-            onError={() => {
-              console.error("[Asset Photo] gagal dimuat dari proxy", { assetId: asset.id, previewUrl: photo.src });
-              setPhotoFailed(true);
-            }}
-            onPreview={() => photo.src && !photoFailed && setPhotoPreviewOpen(true)}
-            canManage={canSeeAnomalies}
-            onCompletePhoto={() => router.push(`/assets/${asset.id}/edit`)}
+            onLoad={() => setPhotoLoaded(true)}
+            onError={() => setPhotoFailed(true)}
+            onPreview={() => displayPhotoSrc && !photoFailed && setPhotoPreviewOpen(true)}
+            canManage={!!asset && canSeeAnomalies}
+            onCompletePhoto={() => asset && router.push(`/assets/${asset.id}/edit`)}
           />
 
           <div className="mt-4 flex items-start justify-between gap-2">
             <div className="min-w-0">
-              <p className="font-mono text-xs text-slate-400">{asset.assetCode}</p>
-              <h2 className="truncate text-lg font-bold text-slate-900">{asset.assetName}</h2>
+              <p className="font-mono text-xs text-slate-400">{displayCode}</p>
+              <h2 className="truncate text-lg font-bold text-slate-900">{displayName}</h2>
             </div>
-            {/* Section 3 — Status Pemakaian TERPISAH dari Kondisi Aset (Row di
-                bawah) — badge ini SELALU lewat getAssetUsageLabel/Color, bukan
-                baca assetStatus mentah, supaya tidak lagi bisa bertentangan
-                dengan pesan "dipinjam oleh user lain" di bawah. */}
             <Badge label={usageLabel} colorClass={usageColor} />
           </div>
 
+          {/* Section 9 — badge kecil "Ada Laporan Aktif" harus tampil
+              SEKETIKA laporan berhasil dibuat (state `asset` di-update
+              optimistis oleh handleProblemSubmitted), tidak menunggu refresh
+              manual. */}
           {activeIssue.hasIssue && (
-            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-amber-800">
-              <p className="font-semibold text-sm">Asset Dilaporkan Bermasalah</p>
-              <p className="text-sm mt-0.5">Laporan {activeIssue.ticketNo || "-"} sedang menunggu review QHSE.</p>
-              {activeIssue.symptomLabel && <p className="text-xs mt-1">Gejala: {activeIssue.symptomLabel}</p>}
-              {activeIssue.note && <p className="text-xs mt-0.5">Catatan: &ldquo;{activeIssue.note}&rdquo;</p>}
+            <div className="mt-1.5 flex justify-end">
+              <Badge label="Ada Laporan Aktif" colorClass="bg-amber-100 text-amber-700 border-amber-200" />
             </div>
           )}
 
-          {/* Section 13 — anomali data HANYA untuk Asset Admin/QHSE, bahasa
-              netral (bukan "korupsi data"), tidak pernah memblokir staff. */}
-          {canSeeAnomalies &&
+          {activeIssue.hasIssue && (
+            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-amber-800">
+              <p className="text-sm font-semibold">Asset Dilaporkan Bermasalah</p>
+              <p className="mt-0.5 text-sm">Laporan {activeIssue.ticketNo || "-"} sedang menunggu review QHSE.</p>
+              {activeIssue.symptomLabel && <p className="mt-1 text-xs">Gejala: {activeIssue.symptomLabel}</p>}
+              {activeIssue.note && <p className="mt-0.5 text-xs">Catatan: &ldquo;{activeIssue.note}&rdquo;</p>}
+            </div>
+          )}
+
+          {asset &&
+            canSeeAnomalies &&
             dataAnomalies.map((anomaly) => (
-              <div
-                key={anomaly.code}
-                className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700"
-              >
+              <div key={anomaly.code} className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700">
                 <p className="font-semibold">{anomaly.title}</p>
                 <p className="mt-0.5">{anomaly.message}</p>
               </div>
             ))}
 
           <div className="mt-4 space-y-2 text-sm text-slate-600">
-            <Row label="Lokasi" value={asset.location || asset.locationText || "-"} />
-            <Row label="Kondisi Aset" value={getAssetConditionLabel(asset)} />
-            {asset.areaPicName && <Row label="PIC Operasional" value={asset.areaPicName} />}
-            {!isFixedLocation && <Row label="Pemegang Saat Ini" value={holderDisplayText} />}
-            {!isFixedLocation && activeBorrowing?.estimatedReturnAt && (
+            <Row label="Lokasi" value={displayLocationText} />
+            <Row label="Kondisi Asset" value={displayConditionLabel} />
+            {displayPicName && <Row label="PIC Operasional" value={displayPicName} />}
+            {asset && !isFixedLocation && <Row label="Pemegang Saat Ini" value={holderDisplayText} />}
+            {asset && !isFixedLocation && activeBorrowing?.estimatedReturnAt && (
               <Row label="Estimasi Kembali" value={formatExpectedReturn(activeBorrowing.estimatedReturnAt)} />
             )}
-            {/* Section 1 — sistem TAHU ada pemegang tapi namanya belum
-                ke-resolve (uid ada, nama kosong walau sudah dicoba dari
-                direktori karyawan) — cuma tampil untuk Asset Admin/QHSE,
-                bukan noise buat staff, dan TIDAK PERNAH tampil kalau status
-                pemakaian sudah jelas "Sedang Dipakai"/"Sedang Dipinjam" dan
-                nama berhasil ditemukan lewat fallback di atas. */}
-            {!isFixedLocation && canSeeAnomalies && holder.hasHolderSignal && !holder.name && (
+            {asset && !isFixedLocation && canSeeAnomalies && holder?.hasHolderSignal && !holder?.name && (
               <p className="text-right text-[11px] text-amber-600">Perlu sinkronisasi data pemegang</p>
             )}
           </div>
 
-          {/* Section P — ringkasan tambahan TANPA finance, dipakai staff/PIC
-              yang tidak punya akses ke /assets/{id} — jadi "Lihat Detail"
-              tidak perlu navigasi sama sekali untuk mereka. */}
-          {!canOpenFullDetailPage && showFullDetail && (
+          {/* Section 2 — detail lebih lanjut (Kategori/Tanggal Perolehan/Qty/
+              Mode Tracking/Catatan Operasional) TERMASUK bagian "Lihat Detail
+              Internal" yang wajib login — hanya dirender begitu `asset`
+              (data lengkap, berarti sudah login) tersedia. */}
+          {asset && !canOpenFullDetailPage && showFullDetail && (
             <div className="mt-3 space-y-2 border-t border-slate-100 pt-3 text-sm text-slate-600">
               <Row label="Kategori" value={asset.categoryName || "Belum tersedia"} />
               <Row
@@ -591,153 +643,149 @@ function AssetActionContent() {
             </div>
           )}
 
-          {/* Section 3/10 — "Identitas Aset Terverifikasi", accordion supaya
-              card tetap ringkas di mobile. */}
-          <div className="mt-4 border-t border-slate-100 pt-3">
-            <button
-              type="button"
-              onClick={() => setShowIdentityDetail((prev) => !prev)}
-              className="flex w-full items-center justify-between text-left"
-            >
-              <span className="flex items-center gap-1.5 text-sm font-semibold text-slate-700">
-                <ShieldCheck size={15} className="text-blue-600" />
-                Identitas Aset Terverifikasi
-              </span>
-              {showIdentityDetail ? (
-                <ChevronUp size={16} className="text-slate-400" />
-              ) : (
-                <ChevronDown size={16} className="text-slate-400" />
-              )}
-            </button>
-
-            {showIdentityDetail && (
-              <div className="mt-3 space-y-3">
-                <div className="rounded-xl border border-blue-100 bg-blue-50/60 p-3 text-xs text-blue-800">
-                  <p className="font-semibold">Status QR: Terdaftar di Sistem</p>
-                  <p className="mt-1">
-                    Tag QR ini terdaftar dalam sistem. Cocokkan foto, nama, dan kode aset dengan barang di
-                    hadapan Anda.
-                  </p>
-                </div>
-
-                {/* Section "Rapikan Detail Asset scan QR" — mengikuti struktur
-                    Create/Edit Asset terbaru (Merek/Model/Nomor Seri/Nomor
-                    Tag Fisik sudah tidak jadi field utama, dihapus supaya
-                    tidak menghasilkan baris "-" terus-menerus). Bagian atas
-                    halaman ini sudah menampilkan Kode Aset/Nama Aset/Status/
-                    Lokasi/Kondisi/PIC — jadi di sini fokus ke data
-                    registrasi: identitas, tanggal & jumlah, kepemilikan, dan
-                    riwayat verifikasi. */}
-                <div className="space-y-2 text-sm text-slate-600">
-                  <Row
-                    label="No. Aset"
-                    value={getAssetNumber(asset) !== null ? String(getAssetNumber(asset)) : "Belum tersedia"}
-                  />
-                  <Row label="Nama Aset" value={asset.assetName || "Belum tersedia"} />
-                  <Row label="Kode Aset" value={asset.assetCode || "Belum tersedia"} />
-                  <Row label="Kategori Aset" value={asset.categoryName || "Belum tersedia"} />
-                  <Row
-                    label="Tanggal Perolehan"
-                    value={
-                      asset.acquisitionDate || asset.purchaseDate
-                        ? formatDateLong(asset.acquisitionDate || asset.purchaseDate)
-                        : "Belum tersedia"
-                    }
-                  />
-                  <Row label="Qty" value={`${getAssetQuantity(asset)} Unit`} />
-                  <Row label="Perusahaan" value={asset.companyOwnerName || "Belum tersedia"} />
-                  {asset.divisionOwnerName && <Row label="Divisi" value={asset.divisionOwnerName} />}
-                  <Row label="Lokasi Terdaftar" value={asset.location || asset.locationText || "Belum tersedia"} />
-                  <Row
-                    label="Terakhir Diverifikasi"
-                    value={asset.lastVerifiedAt ? formatDate(asset.lastVerifiedAt) : "Belum pernah"}
-                  />
-                  {asset.lastVerifiedByName && <Row label="Diverifikasi Oleh" value={asset.lastVerifiedByName} />}
-                </div>
-
-                <div className="space-y-1.5 rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  {verificationIndicators.map((indicator) => (
-                    <div key={indicator.key} className="flex items-center gap-2 text-xs">
-                      {indicator.ok ? (
-                        <CheckCircle2 size={14} className="shrink-0 text-emerald-600" />
-                      ) : (
-                        <XCircle size={14} className="shrink-0 text-slate-300" />
-                      )}
-                      <span className={indicator.ok ? "text-slate-700" : "text-slate-400"}>{indicator.label}</span>
-                    </div>
-                  ))}
-                </div>
-
-                {identityIncomplete && (
-                  <p className="text-xs text-amber-600">
-                    Identitas aset belum lengkap dan perlu diverifikasi QHSE.
-                  </p>
+          {asset && (
+            <div className="mt-4 border-t border-slate-100 pt-3">
+              <button
+                type="button"
+                onClick={() => setShowIdentityDetail((prev) => !prev)}
+                className="flex w-full items-center justify-between text-left"
+              >
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-slate-700">
+                  <ShieldCheck size={15} className="text-blue-600" />
+                  Identitas Aset Terverifikasi
+                </span>
+                {showIdentityDetail ? (
+                  <ChevronUp size={16} className="text-slate-400" />
+                ) : (
+                  <ChevronDown size={16} className="text-slate-400" />
                 )}
-              </div>
-            )}
-          </div>
+              </button>
 
-          {/* Section B/G — data tidak sinkron: status bilang Dipinjam tapi
-              tidak ada penanda pemegangnya sama sekali. */}
-          {brokenBorrowState && (
-            <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-              <span>
-                Data peminjaman asset ini tidak sinkron. Status asset Dipinjam, tetapi pemegang asset belum tercatat.
-              </span>
+              {showIdentityDetail && (
+                <div className="mt-3 space-y-3">
+                  <div className="rounded-xl border border-blue-100 bg-blue-50/60 p-3 text-xs text-blue-800">
+                    <p className="font-semibold">Status QR: Terdaftar di Sistem</p>
+                    <p className="mt-1">
+                      Tag QR ini terdaftar dalam sistem. Cocokkan foto, nama, dan kode aset dengan barang di
+                      hadapan Anda.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2 text-sm text-slate-600">
+                    <Row
+                      label="No. Aset"
+                      value={getAssetNumber(asset) !== null ? String(getAssetNumber(asset)) : "Belum tersedia"}
+                    />
+                    <Row label="Nama Aset" value={asset.assetName || "Belum tersedia"} />
+                    <Row label="Kode Aset" value={asset.assetCode || "Belum tersedia"} />
+                    <Row label="Kategori Aset" value={asset.categoryName || "Belum tersedia"} />
+                    <Row
+                      label="Tanggal Perolehan"
+                      value={
+                        asset.acquisitionDate || asset.purchaseDate
+                          ? formatDateLong(asset.acquisitionDate || asset.purchaseDate)
+                          : "Belum tersedia"
+                      }
+                    />
+                    <Row label="Qty" value={`${getAssetQuantity(asset)} Unit`} />
+                    <Row label="Perusahaan" value={asset.companyOwnerName || "Belum tersedia"} />
+                    {asset.divisionOwnerName && <Row label="Divisi" value={asset.divisionOwnerName} />}
+                    <Row label="Lokasi Terdaftar" value={asset.location || asset.locationText || "Belum tersedia"} />
+                    <Row
+                      label="Terakhir Diverifikasi"
+                      value={asset.lastVerifiedAt ? formatDate(asset.lastVerifiedAt) : "Belum pernah"}
+                    />
+                    {asset.lastVerifiedByName && <Row label="Diverifikasi Oleh" value={asset.lastVerifiedByName} />}
+                  </div>
+
+                  <div className="space-y-1.5 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                    {verificationIndicators.map((indicator) => (
+                      <div key={indicator.key} className="flex items-center gap-2 text-xs">
+                        {indicator.ok ? (
+                          <CheckCircle2 size={14} className="shrink-0 text-emerald-600" />
+                        ) : indicator.neutral ? (
+                          <Circle size={14} className="shrink-0 text-slate-300" />
+                        ) : (
+                          <XCircle size={14} className="shrink-0 text-red-400" />
+                        )}
+                        <span className={indicator.ok ? "text-slate-700" : "text-slate-400"}>{indicator.label}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {identityIncomplete ? (
+                    <p className="text-xs text-amber-600">Identitas aset belum lengkap. Lengkapi data yang ditandai.</p>
+                  ) : asset.lastVerifiedAt ? (
+                    <p className="text-xs text-emerald-600">Identitas aset lengkap dan terdaftar di sistem.</p>
+                  ) : (
+                    <p className="text-xs text-slate-500">Identitas aset lengkap. Verifikasi fisik belum pernah dilakukan.</p>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
-          {!brokenBorrowState && borrowedByOther && (
+          {asset && brokenBorrowState && (
             <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
               <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-              <span>Asset sedang dipinjam oleh {holder.name || "user lain"}.</span>
+              <span>Data peminjaman asset ini tidak sinkron. Status asset Dipinjam, tetapi pemegang asset belum tercatat.</span>
             </div>
           )}
 
-          {borrowedByMe && (
+          {asset && !brokenBorrowState && borrowedByOther && (
+            <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+              <span>Asset sedang dipinjam oleh {holder?.name || "user lain"}.</span>
+            </div>
+          )}
+
+          {asset && borrowedByMe && (
             <div className="mt-4 flex items-start gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
               <AlertTriangle size={14} className="mt-0.5 shrink-0" />
               <span>Asset ini sedang Anda pinjam.</span>
             </div>
           )}
 
+          {/* Section 3/10 — layout aksi FINAL: Lihat Detail / Pinjam Asset /
+              (Konfirmasi Asset, Laporkan Masalah berdampingan) / Scan Asset
+              Lain. "Laporkan Masalah" SATU-SATUNYA entry point laporan
+              (bekas "Laporkan Temuan" + "Laporkan Ketidaksesuaian" digabung). */}
           <div className="mt-5 space-y-2">
             <ActionButton
-              icon={showFullDetail && !canOpenFullDetailPage ? ChevronUp : Eye}
+              icon={asset && showFullDetail && !canOpenFullDetailPage ? ChevronUp : Eye}
               label="Lihat Detail"
-              onClick={() => {
-                if (canOpenFullDetailPage) {
-                  router.push(`/assets/${asset.id}`);
-                  return;
-                }
-                setShowFullDetail((prev) => !prev);
-              }}
+              onClick={() => handleGatedAction("detail", handleDetailClick)}
             />
 
-            {isLocationPicOwner && (
-              <ActionButton
-                icon={Pencil}
-                label="Edit Asset"
-                onClick={() => router.push(`/assets/${asset.id}/edit`)}
-              />
+            {asset && isLocationPicOwner && (
+              <ActionButton icon={Pencil} label="Edit Asset" onClick={() => router.push(`/assets/${asset.id}/edit`)} />
             )}
 
-            {brokenBorrowState && canRepairBrokenState && (
+            {asset && brokenBorrowState && canRepairBrokenState && (
               <ActionButton icon={RotateCw} label="Perbaiki Status Asset" onClick={handleRepairStatus} />
             )}
 
-            {/* Section 5 — status pemakaian tetap dulu (kembalikan/pinjam),
-                lalu laporan aktif (kalau ada), lalu laporan baru. */}
-            {!isFixedLocation && !brokenBorrowState && borrowedByMe && (
+            {asset && !isFixedLocation && !brokenBorrowState && borrowedByMe && (
               <ActionButton icon={Undo2} label="Kembalikan Asset" onClick={() => setReturnOpen(true)} />
             )}
 
-            {!isFixedLocation && isAvailableToBorrow && (
+            {/* Section 2/3 — belum login: selalu tampilkan "Pinjam Asset" (klik
+                akan digerbang ke login, action=borrow). Sudah login: ikuti
+                logika bisnis asli (disembunyikan untuk lokasi tetap/sedang
+                dipinjam orang lain/data tidak sinkron/laporan aktif — kondisi
+                itu sudah dijelaskan lewat banner peringatan di atas). */}
+            {!asset && (
+              <ActionButton
+                icon={ArrowRightLeft}
+                label="Pinjam Asset"
+                onClick={() => handleGatedAction("borrow", handleBorrowClick)}
+              />
+            )}
+            {asset && !isFixedLocation && isAvailableToBorrow && (
               <ActionButton icon={ArrowRightLeft} label="Pinjam Asset" onClick={handleBorrowClick} />
             )}
 
-            {activeIssue.hasIssue && activeTicketLink && (
+            {asset && activeIssue.hasIssue && activeTicketLink && (
               <ActionButton
                 icon={FileWarning}
                 label="Lihat Laporan Aktif"
@@ -746,7 +794,7 @@ function AssetActionContent() {
               />
             )}
 
-            {activeIssue.hasIssue && isActiveIssueReporter && activeTicketLink && (
+            {asset && activeIssue.hasIssue && isActiveIssueReporter && activeTicketLink && (
               <ActionButton
                 icon={Camera}
                 label="Tambahkan Bukti"
@@ -755,32 +803,21 @@ function AssetActionContent() {
               />
             )}
 
-            {canReportIssue && (
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <ActionButton
+                icon={CheckCircle2}
+                label="Konfirmasi Asset"
+                onClick={() => handleGatedAction("verify", () => setVerifyOpen(true))}
+              />
               <ActionButton
                 icon={AlertTriangle}
-                label={reportIssueLabel}
+                label="Laporkan Masalah"
                 tone="warning"
-                onClick={() => setReportOpen(true)}
-              />
-            )}
-
-            {/* Section 6 — verifikasi identitas fisik, TERPISAH dari laporan
-                kerusakan/kendala di atas. Selalu tersedia (tidak tergantung
-                status pemakaian) supaya siapa pun yang scan bisa mencocokkan
-                barang di depannya dengan data sistem. */}
-            <div className="grid grid-cols-2 gap-2 pt-1">
-              <ActionButton icon={CheckCircle2} label="Konfirmasi Aset Sesuai" onClick={() => setVerifyOpen(true)} />
-              <ActionButton
-                icon={FileWarning}
-                label="Laporkan Ketidaksesuaian"
-                tone="warning"
-                onClick={() => setMismatchOpen(true)}
+                onClick={() => handleGatedAction("report", () => setProblemOpen(true))}
               />
             </div>
           </div>
 
-          {/* Section N/Q — scan ulang HANYA lewat tombol ini, tidak pernah
-              otomatis/dipaksa saat klik aksi lain di halaman ini. */}
           <button
             type="button"
             onClick={() => router.push("/scan")}
@@ -792,8 +829,8 @@ function AssetActionContent() {
         </div>
       </div>
 
-      {photoPreviewOpen && photo.src && (
-        <PhotoPreviewOverlay src={photo.src} assetName={asset.assetName} onClose={() => setPhotoPreviewOpen(false)} />
+      {photoPreviewOpen && displayPhotoSrc && (
+        <PhotoPreviewOverlay src={displayPhotoSrc} assetName={displayName} onClose={() => setPhotoPreviewOpen(false)} />
       )}
 
       {verifyOpen && (
@@ -801,44 +838,47 @@ function AssetActionContent() {
           submitting={verifySubmitting}
           onClose={() => setVerifyOpen(false)}
           onSubmit={handleSubmitVerification}
+          onReportProblem={() => {
+            setVerifyOpen(false);
+            setProblemOpen(true);
+          }}
         />
       )}
 
-      {mismatchOpen && (
-        <MismatchReportModal
-          submitting={mismatchSubmitting}
-          onClose={() => setMismatchOpen(false)}
-          onSubmit={handleSubmitMismatch}
+      {asset && (
+        <ReportProblemModal
+          asset={asset}
+          open={problemOpen}
+          activeBorrowing={activeBorrowing}
+          onClose={() => setProblemOpen(false)}
+          onSubmitted={handleProblemSubmitted}
         />
       )}
 
-      <ReportIssueModal
-        asset={asset}
-        open={reportOpen}
-        activeBorrowing={activeBorrowing}
-        allowQrPhysicalObservation
-        onClose={() => setReportOpen(false)}
-      />
-      <BorrowModal
-        asset={asset}
-        open={borrowOpen}
-        onClose={() => setBorrowOpen(false)}
-        onDone={() => {
-          setBorrowOpen(false);
-          setToast({ type: "success", message: "Asset berhasil dipinjam." });
-          refreshAsset();
-        }}
-      />
-      <ReturnModal
-        asset={asset}
-        open={returnOpen}
-        onClose={() => setReturnOpen(false)}
-        onDone={(message) => {
-          setReturnOpen(false);
-          setToast({ type: "success", message: message || "Asset berhasil dikembalikan." });
-          refreshAsset();
-        }}
-      />
+      {asset && (
+        <BorrowModal
+          asset={asset}
+          open={borrowOpen}
+          onClose={() => setBorrowOpen(false)}
+          onDone={() => {
+            setBorrowOpen(false);
+            setToast({ type: "success", message: "Asset berhasil dipinjam." });
+            refreshAsset();
+          }}
+        />
+      )}
+      {asset && (
+        <ReturnModal
+          asset={asset}
+          open={returnOpen}
+          onClose={() => setReturnOpen(false)}
+          onDone={(message) => {
+            setReturnOpen(false);
+            setToast({ type: "success", message: message || "Asset berhasil dikembalikan." });
+            refreshAsset();
+          }}
+        />
+      )}
       <Toast toast={toast} onClose={() => setToast(null)} />
     </PageShell>
   );
@@ -880,10 +920,8 @@ function ActionButton({
   );
 }
 
-// Section 2/10 — blok foto ASLI aset dengan skeleton loading + fallback
-// error, TIDAK PERNAH menampilkan logo QHSE sebagai pengganti foto.
 function AssetPhotoBlock({
-  photo,
+  photoSrc,
   assetName,
   loaded,
   failed,
@@ -893,7 +931,7 @@ function AssetPhotoBlock({
   canManage,
   onCompletePhoto,
 }: {
-  photo: { src: string | null };
+  photoSrc: string | null;
   assetName: string;
   loaded: boolean;
   failed: boolean;
@@ -903,7 +941,7 @@ function AssetPhotoBlock({
   canManage: boolean;
   onCompletePhoto: () => void;
 }) {
-  const showImage = !!photo.src && !failed;
+  const showImage = !!photoSrc && !failed;
 
   return (
     <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
@@ -913,7 +951,7 @@ function AssetPhotoBlock({
             {!loaded && <div className="absolute inset-0 animate-pulse bg-slate-200" />}
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
-              src={photo.src as string}
+              src={photoSrc as string}
               alt={assetName}
               onLoad={onLoad}
               onError={onError}
@@ -926,16 +964,13 @@ function AssetPhotoBlock({
         ) : (
           <div className="flex h-full w-full flex-col items-center justify-center gap-1.5 px-4 text-center">
             <ImageIcon size={28} className="text-slate-300" />
-            {/* Section 8 — BEDAKAN "belum pernah diunggah" (photo.src kosong)
-                dari "gagal dimuat" (src ada tapi <img> error, mis. proxy
-                Drive gagal) — jangan disamakan supaya tidak menyesatkan. */}
             <p className="text-xs text-slate-400">
-              {photo.src && failed ? "Foto aset gagal dimuat." : "Foto verifikasi aset belum tersedia."}
+              {photoSrc && failed ? "Foto aset gagal dimuat." : "Foto verifikasi aset belum tersedia."}
             </p>
           </div>
         )}
       </div>
-      {canManage && (!photo.src || failed) && (
+      {canManage && (!photoSrc || failed) && (
         <button
           type="button"
           onClick={onCompletePhoto}
@@ -959,10 +994,7 @@ function PhotoPreviewOverlay({
   onClose: () => void;
 }) {
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
-      onClick={onClose}
-    >
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4" onClick={onClose}>
       <button
         type="button"
         onClick={onClose}
@@ -981,34 +1013,49 @@ function PhotoPreviewOverlay({
   );
 }
 
-const VERIFICATION_CHECKLIST_ITEMS: { key: keyof VerificationChecklist; label: string }[] = [
-  { key: "photoMatches", label: "Foto sesuai dengan aset fisik" },
-  { key: "codeMatches", label: "Kode aset sesuai" },
-  { key: "serialMatches", label: "Nomor seri sesuai" },
-  { key: "qrOnRightItem", label: "QR terpasang pada barang yang benar" },
-  { key: "locationAndHolderMatch", label: "Lokasi dan pemegang sesuai" },
+// Section 8/9 — checklist UI disederhanakan jadi 3 poin (Serial Number sudah
+// tidak dipakai di struktur Asset terbaru). "Kode / QR sesuai" mewakili DUA
+// field lama sekaligus (codeMatches + qrOnRightItem) supaya bentuk data
+// VerificationChecklist yang ditulis ke asset_verification_logs TIDAK
+// berubah — hanya tampilannya yang dipadatkan.
+const VERIFICATION_UI_ITEMS: { key: "photo" | "code" | "location"; label: string }[] = [
+  { key: "photo", label: "Barang / foto sesuai" },
+  { key: "code", label: "Kode / QR sesuai" },
+  { key: "location", label: "Lokasi / PIC sesuai" },
 ];
 
-// Section 7 — checklist "Konfirmasi Aset Sesuai". Semua item HARUS dicentang
-// sebelum submit diaktifkan, supaya konfirmasi tidak jadi klik kosong.
 function VerificationChecklistModal({
   submitting,
   onClose,
   onSubmit,
+  onReportProblem,
 }: {
   submitting: boolean;
   onClose: () => void;
   onSubmit: (checklist: VerificationChecklist) => void;
+  onReportProblem: () => void;
 }) {
-  const [checklist, setChecklist] = useState<VerificationChecklist>({
-    photoMatches: false,
-    codeMatches: false,
-    serialMatches: false,
-    qrOnRightItem: false,
-    locationAndHolderMatch: false,
+  const [checked, setChecked] = useState<Record<"photo" | "code" | "location", boolean>>({
+    photo: false,
+    code: false,
+    location: false,
   });
 
-  const allChecked = VERIFICATION_CHECKLIST_ITEMS.every((item) => checklist[item.key]);
+  const allChecked = checked.photo && checked.code && checked.location;
+
+  const toggleAll = () => {
+    const next = !allChecked;
+    setChecked({ photo: next, code: next, location: next });
+  };
+
+  const handleSubmit = () => {
+    onSubmit({
+      photoMatches: checked.photo,
+      codeMatches: checked.code,
+      qrOnRightItem: checked.code,
+      locationAndHolderMatch: checked.location,
+    });
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-0 sm:items-center sm:p-4">
@@ -1024,15 +1071,25 @@ function VerificationChecklistModal({
         </p>
 
         <div className="mt-4 space-y-2.5">
-          {VERIFICATION_CHECKLIST_ITEMS.map((item) => (
+          <label className="flex cursor-pointer items-center gap-2.5 rounded-xl border border-blue-200 bg-blue-50/60 px-3 py-2.5 text-sm font-medium text-blue-800">
+            <input
+              type="checkbox"
+              checked={allChecked}
+              onChange={toggleAll}
+              className="h-4 w-4 rounded border-slate-300 text-blue-600"
+            />
+            Semua sesuai
+          </label>
+
+          {VERIFICATION_UI_ITEMS.map((item) => (
             <label
               key={item.key}
               className="flex cursor-pointer items-center gap-2.5 rounded-xl border border-slate-200 px-3 py-2.5 text-sm text-slate-700"
             >
               <input
                 type="checkbox"
-                checked={checklist[item.key]}
-                onChange={(e) => setChecklist((prev) => ({ ...prev, [item.key]: e.target.checked }))}
+                checked={checked[item.key]}
+                onChange={(e) => setChecked((prev) => ({ ...prev, [item.key]: e.target.checked }))}
                 className="h-4 w-4 rounded border-slate-300 text-blue-600"
               />
               {item.label}
@@ -1043,94 +1100,20 @@ function VerificationChecklistModal({
         <button
           type="button"
           disabled={!allChecked || submitting}
-          onClick={() => onSubmit(checklist)}
+          onClick={handleSubmit}
           className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Check size={16} />
           {submitting ? "Menyimpan..." : "Simpan Verifikasi"}
         </button>
-      </div>
-    </div>
-  );
-}
-
-const MISMATCH_REASON_OPTIONS = [
-  "Foto aset berbeda",
-  "Nomor seri berbeda",
-  "QR ditempel pada aset lain",
-  "Lokasi tidak sesuai",
-  "Pemegang tidak sesuai",
-  "QR diduga dipindahkan",
-  "Aset tidak ditemukan",
-  "Tag rusak atau hilang",
-];
-
-// Section 6 — "Laporkan Ketidaksesuaian" SENGAJA punya alasan sendiri
-// (bukan gejala kerusakan seperti ReportIssueModal) karena ini soal
-// identitas/kecocokan barang, bukan kondisi rusak.
-function MismatchReportModal({
-  submitting,
-  onClose,
-  onSubmit,
-}: {
-  submitting: boolean;
-  onClose: () => void;
-  onSubmit: (reasons: string[], note: string) => void;
-}) {
-  const [selected, setSelected] = useState<string[]>([]);
-  const [note, setNote] = useState("");
-
-  const toggle = (reason: string) => {
-    setSelected((prev) => (prev.includes(reason) ? prev.filter((r) => r !== reason) : [...prev, reason]));
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-0 sm:items-center sm:p-4">
-      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-t-2xl bg-white p-5 shadow-xl sm:rounded-2xl">
-        <div className="flex items-center justify-between">
-          <h3 className="text-base font-bold text-slate-900">Laporkan Ketidaksesuaian</h3>
-          <button type="button" onClick={onClose} className="text-slate-400 hover:text-slate-600">
-            <X size={18} />
-          </button>
-        </div>
-        <p className="mt-1 text-xs text-slate-500">
-          Pilih satu atau lebih ketidaksesuaian yang Anda temukan. Ini BUKAN laporan kerusakan — gunakan
-          &ldquo;Laporkan Kendala/Temuan&rdquo; untuk kondisi rusak.
-        </p>
-
-        <div className="mt-4 space-y-2">
-          {MISMATCH_REASON_OPTIONS.map((reason) => (
-            <label
-              key={reason}
-              className="flex cursor-pointer items-center gap-2.5 rounded-xl border border-slate-200 px-3 py-2.5 text-sm text-slate-700"
-            >
-              <input
-                type="checkbox"
-                checked={selected.includes(reason)}
-                onChange={() => toggle(reason)}
-                className="h-4 w-4 rounded border-slate-300 text-amber-600"
-              />
-              {reason}
-            </label>
-          ))}
-        </div>
-
-        <textarea
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          placeholder="Catatan tambahan (opsional)"
-          rows={3}
-          className="mt-3 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-blue-400 focus:outline-none"
-        />
 
         <button
           type="button"
-          disabled={selected.length === 0 || submitting}
-          onClick={() => onSubmit(selected, note)}
-          className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-amber-600 px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={onReportProblem}
+          className="mt-3 flex w-full items-center justify-center gap-1.5 text-xs font-medium text-amber-600 hover:text-amber-700"
         >
-          <FileWarning size={16} />
-          {submitting ? "Mengirim..." : "Kirim Laporan"}
+          <AlertTriangle size={13} />
+          Ada yang tidak sesuai? Laporkan Masalah
         </button>
       </div>
     </div>
@@ -1159,9 +1142,10 @@ function LoadingState() {
   return <div className="h-9 w-9 rounded-full border-2 border-slate-200 border-t-blue-600 animate-spin" />;
 }
 
-function ErrorState({ message }: { message: string }) {
+function ErrorState({ title, message }: { title?: string; message: string }) {
   return (
     <div className="w-full max-w-md rounded-2xl border border-red-200 bg-red-50 p-5 text-center text-sm text-red-700">
+      {title && <p className="mb-1 font-semibold">{title}</p>}
       {message}
     </div>
   );

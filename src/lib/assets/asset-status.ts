@@ -8,6 +8,7 @@ import {
   normalizeAssetUsageStatus,
 } from "@/lib/utils";
 import { extractDriveFileId, getAssetFilePreviewUrl, resolveDriveFileSrc } from "@/lib/drive-file-id";
+import { getAssetNumber } from "@/lib/assets/inventory";
 
 // AssetBorrowing (types.ts) tidak punya index signature, jadi tidak bisa
 // langsung diintersect dengan Record<string, unknown> — union longgar ini
@@ -401,25 +402,65 @@ export interface AssetVerificationIndicator {
   key: string;
   label: string;
   ok: boolean;
+  // Section "Rapikan checklist Identitas Aset Terverifikasi" — true untuk
+  // indikator RIWAYAT (mis. "Pernah diverifikasi") yang TIDAK dihitung
+  // sebagai bagian kelengkapan IDENTITAS aset (lihat isAssetIdentityComplete
+  // di bawah) — ditampilkan dengan simbol netral (lingkaran kosong) saat
+  // false, BUKAN tanda silang seperti field identitas yang benar-benar
+  // kosong/belum diisi.
+  neutral?: boolean;
 }
 
-// Section 4 — indikator kelengkapan identitas fisik aset, dipakai untuk
-// blok "Identitas Aset Terverifikasi" di Aksi Cepat. "Pernah diverifikasi"
-// HANYA true kalau sudah pernah ada "Konfirmasi Aset Sesuai" (verificationStatus
-// === "verified") — scan QR semata tidak pernah mengubah nilai ini.
+// Section 4 — indikator kelengkapan identitas aset, dipakai blok "Identitas
+// Aset Terverifikasi" di Aksi Cepat (halaman hasil Scan QR). SEKARANG
+// mengikuti field canonical Create/Edit Asset terbaru — brand/model/
+// serialNumber/qrTagId/physicalTag SUDAH TIDAK jadi field utama sejak
+// ticket "Create/Edit Asset ikuti Excel", jadi dihapus total dari sini,
+// bukan cuma disembunyikan (checklist lama selalu menampilkan ✕ untuk
+// keduanya karena field-nya memang tidak pernah lagi diisi manapun).
+// "Pernah diverifikasi" TETAP tampil (riwayat verifikasi berguna buat
+// QHSE) tapi diberi neutral:true — dicek dari lastVerifiedAt, SAMA dengan
+// field "Terakhir Diverifikasi" di card atasnya (dulu keliru pakai
+// verificationStatus === "verified", bisa beda sumber dari card).
 export function getAssetVerificationIndicators(asset: Asset): AssetVerificationIndicator[] {
   const photo = resolveAssetPhotoSrc(asset);
+  const everVerified = !!asset.lastVerifiedAt;
   return [
+    { key: "assetNumber", label: "No. Aset tercatat", ok: getAssetNumber(asset) !== null },
+    { key: "assetName", label: "Nama aset tercatat", ok: !!asset.assetName?.trim() },
+    { key: "assetCode", label: "Kode aset terdaftar", ok: !!asset.assetCode?.trim() },
+    { key: "category", label: "Kategori aset tercatat", ok: !!asset.categoryName?.trim() },
+    {
+      key: "acquisitionDate",
+      label: "Tanggal perolehan tercatat",
+      ok: !!(asset.acquisitionDate || asset.purchaseDate),
+    },
+    {
+      key: "location",
+      label: "Lokasi aset terdaftar",
+      ok: !!(asset.locationId || asset.location?.trim() || asset.locationText?.trim()),
+    },
     { key: "photo", label: "Foto aset tersedia", ok: !!photo.src },
-    { key: "code", label: "Kode aset sesuai", ok: !!asset.assetCode },
-    { key: "serial", label: "Nomor seri tercatat", ok: !!asset.serialNumber },
-    { key: "tag", label: "Tag fisik aktif", ok: !!asset.qrTagId },
-    { key: "verified", label: "Pernah diverifikasi", ok: asset.verificationStatus === "verified" },
+    {
+      key: "verified",
+      label: everVerified ? "Pernah diverifikasi" : "Belum pernah diverifikasi",
+      ok: everVerified,
+      neutral: true,
+    },
   ];
 }
 
+// Section "Rapikan checklist..." — HANYA field identitas INTI yang dihitung
+// (indikator neutral seperti "Pernah diverifikasi" dikecualikan — riwayat
+// verifikasi bukan syarat kelengkapan data aset).
+export function isAssetIdentityComplete(asset: Asset): boolean {
+  return getAssetVerificationIndicators(asset)
+    .filter((indicator) => !indicator.neutral)
+    .every((indicator) => indicator.ok);
+}
+
 export function isAssetIdentityIncomplete(asset: Asset): boolean {
-  return getAssetVerificationIndicators(asset).some((i) => !i.ok);
+  return !isAssetIdentityComplete(asset);
 }
 
 // Re-export supaya konsumen tidak perlu import dari dua tempat.

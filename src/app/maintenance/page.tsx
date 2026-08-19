@@ -2042,7 +2042,13 @@ function MaintenancePageContent() {
                       <td className="px-4 py-3 text-slate-600">
                         <p className="font-medium text-slate-800">{ticketTitle(t)}</p>
                         <p className="line-clamp-2 text-xs text-slate-400">{t.description}</p>
-                        <p className="text-xs text-slate-400">{t.assetName ? `${t.assetName} (${t.assetCode || "-"})` : "Tanpa asset"}</p>
+                        <p className="text-xs text-slate-400">
+                          {t.assetName
+                            ? `${t.assetName} (${t.assetCode || "-"})${
+                                typeof t.assetNumber === "number" ? ` · No. Aset ${t.assetNumber}` : ""
+                              }`
+                            : "Tanpa asset"}
+                        </p>
                       </td>
                       <td className="px-4 py-3">
                         <Badge label={ticketReportTypeLabel(t)} colorClass={ticketReportTypeColor(t)} />

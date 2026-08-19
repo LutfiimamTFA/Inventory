@@ -975,9 +975,17 @@ service cloud.firestore {
     // Cepat) — BUKAN verifikasi fisik, cuma catatan "QR ini pernah dibaca".
     // Siapa pun yang aktif boleh menulis log scan miliknya sendiri; hanya
     // QHSE/manajemen yang boleh membaca seluruh riwayat.
+    // Section "Rombak flow Scan QR" — dilonggarkan dari isActiveAssetUser()
+    // ke isSignedIn(): user yang baru login (belum/sedang proses dapat
+    // dokumen asset_users aktif) sebelumnya selalu permission-denied saat
+    // scan log ditulis. Ownership check (scannedByUid == uid) tetap wajib
+    // supaya user tidak bisa menulis log atas nama orang lain. Scan oleh
+    // pengunjung ANONYMOUS (belum login sama sekali) SENGAJA tidak dicatat
+    // di sini (lihat asset-action/page.tsx — logAssetQrScan hanya dipanggil
+    // setelah assetUser diketahui), bukan kegagalan rules.
     match /asset_qr_scan_logs/{logId} {
       allow get, list: if canViewAssetMaintenance();
-      allow create: if isActiveAssetUser() && request.resource.data.scannedByUid == request.auth.uid;
+      allow create: if isSignedIn() && request.resource.data.scannedByUid == request.auth.uid;
       allow update, delete: if isSuperAdmin();
     }
 

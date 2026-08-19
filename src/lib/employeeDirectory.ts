@@ -28,12 +28,22 @@ export interface EmployeeDirectory {
   resolveDivision: (uid?: string | null, email?: string | null) => string | null;
 }
 
-export function useEmployeeDirectory(): EmployeeDirectory {
+// Section "Rombak flow Scan QR" — enabled default true supaya SEMUA call
+// site lama tidak berubah perilaku. Diset false dari asset-action/page.tsx
+// selama viewer belum jadi active asset_users (termasuk pengunjung publik
+// yang belum login sama sekali) karena rules employee_profiles mewajibkan
+// isActiveAssetUser() — fetch di keadaan itu SELALU permission-denied dan
+// tidak pernah dibutuhkan untuk flow Laporkan Masalah dari QR.
+export function useEmployeeDirectory(enabled: boolean = true): EmployeeDirectory {
   const [byUid, setByUid] = useState<Map<string, EmployeeOption>>(new Map());
   const [byEmail, setByEmail] = useState<Map<string, EmployeeOption>>(new Map());
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(enabled);
 
   useEffect(() => {
+    if (!enabled) {
+      queueMicrotask(() => setLoading(false));
+      return;
+    }
     let cancelled = false;
     loadEmployeeOptionsCached()
       .then((options) => {
@@ -54,7 +64,7 @@ export function useEmployeeDirectory(): EmployeeDirectory {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [enabled]);
 
   const resolveName = (uid?: string | null, email?: string | null) => {
     const byUidMatch = uid ? byUid.get(uid) : undefined;
