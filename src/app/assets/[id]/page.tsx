@@ -13,8 +13,10 @@ import {
   where,
 } from "firebase/firestore";
 import { QRCodeSVG } from "qrcode.react";
-import { Pencil, Download, ArrowLeft, Image as ImageIcon, History as HistoryIcon, Power, FileBarChart, FileDown, UserCog, ArrowRightLeft, Undo2, ShieldAlert } from "lucide-react";
+import { Pencil, Download, ArrowLeft, Image as ImageIcon, History as HistoryIcon, Power, FileBarChart, FileDown, UserCog, ArrowRightLeft, Undo2, ShieldAlert, Trash2 } from "lucide-react";
 import { db } from "@/lib/firebase";
+import { deleteAssetPermanently, DeleteAssetError } from "@/lib/assets/delete-asset";
+import PermanentDeleteAssetModal from "@/components/PermanentDeleteAssetModal";
 import {
   cleanFirestoreData,
   EmployeeOption,
@@ -81,11 +83,11 @@ export default function AssetDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const { firebaseUser, assetUser, role, loading, isLocationPicRole, assignedPicLocations } = useAuth();
-  const employeeDirectory = useEmployeeDirectory();
   // Section C — staff yang ditunjuk PIC di Master Lokasi diperlakukan sama
   // seperti role "location_pic" literal untuk halaman ini.
   const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
   const authReady = !loading && !!firebaseUser && !!assetUser && !!role;
+  const employeeDirectory = useEmployeeDirectory(authReady);
   const [asset, setAsset] = useState<Asset | null>(null);
   const [photoImgError, setPhotoImgError] = useState(false);
   const [borrowings, setBorrowings] = useState<AssetBorrowing[]>([]);
@@ -94,6 +96,9 @@ export default function AssetDetailPage() {
   const [tickets, setTickets] = useState<AssetIssueTicket[]>([]);
   const [deactivateOpen, setDeactivateOpen] = useState(false);
   const [deactivating, setDeactivating] = useState(false);
+  const [permanentDeleteOpen, setPermanentDeleteOpen] = useState(false);
+  const [deletingPermanently, setDeletingPermanently] = useState(false);
+  const [permanentDeleteError, setPermanentDeleteError] = useState<string | null>(null);
   const [invoicePreviewOpen, setInvoicePreviewOpen] = useState(false);
   const [editFinanceOpen, setEditFinanceOpen] = useState(false);
   const [evidenceLightbox, setEvidenceLightbox] = useState<{ images: LightboxImage[]; initialIndex: number } | null>(null);
@@ -393,6 +398,41 @@ export default function AssetDetailPage() {
       setDeactivateOpen(false);
     } finally {
       setDeactivating(false);
+    }
+  };
+
+  // Section "Hapus Permanen Asset" — proteksi role SEBENARNYA ada di server
+  // (src/app/api/assets/[id]/route.ts, dicek dari asset_users/{uid} lewat
+  // Admin SDK) — tombol ini hanya UX, bukan satu-satunya penjagaan. Setelah
+  // sukses, JANGAN kembali ke asset yang baru dihapus — arahkan ke daftar.
+  const handlePermanentDelete = async () => {
+    if (!firebaseUser) return;
+    setDeletingPermanently(true);
+    setPermanentDeleteError(null);
+    try {
+      await deleteAssetPermanently(firebaseUser, asset.id);
+      setPermanentDeleteOpen(false);
+      setToast({ type: "success", message: "Asset berhasil dihapus permanen." });
+      // Section — beri jeda singkat supaya toast sukses sempat terlihat
+      // sebelum halaman ini navigasi keluar (asset yang baru dihapus tidak
+      // boleh tetap ditampilkan/dibuka lagi).
+      setTimeout(() => router.push("/assets"), 700);
+    } catch (error) {
+      const err = error instanceof DeleteAssetError ? error : null;
+      // Section "Perbaiki Console Error kosong" — 401/403/404/409 adalah
+      // penolakan yang diharapkan (bukan bug), pakai warn supaya tidak
+      // memicu overlay error Next.js untuk exception tak terduga.
+      const isExpectedRejection = !!err && [401, 403, 404, 409].includes(err.status);
+      const logFn = isExpectedRejection ? console.warn : console.error;
+      logFn(`[Asset Detail] gagal menghapus asset permanen: ${err?.message || String(error)}`, {
+        assetId: asset.id,
+        errorCode: err?.code || "UNKNOWN",
+        errorMessage: err?.message || String(error),
+        status: err?.status ?? null,
+      });
+      setPermanentDeleteError(err?.message || "Gagal menghapus asset.");
+    } finally {
+      setDeletingPermanently(false);
     }
   };
 
@@ -707,6 +747,18 @@ export default function AssetDetailPage() {
             >
               <Power size={15} />
               Nonaktifkan
+            </button>
+          )}
+          {role === "super_admin" && (
+            <button
+              onClick={() => {
+                setPermanentDeleteError(null);
+                setPermanentDeleteOpen(true);
+              }}
+              className="inline-flex items-center gap-2 rounded-xl border border-red-300 bg-white px-4 py-2.5 text-sm font-medium text-red-700 hover:bg-red-50 shadow-sm"
+            >
+              <Trash2 size={15} />
+              Hapus Permanen
             </button>
           )}
         </div>
@@ -1283,6 +1335,18 @@ export default function AssetDetailPage() {
         danger
         onConfirm={handleDeactivate}
         onCancel={() => setDeactivateOpen(false)}
+      />
+
+      <PermanentDeleteAssetModal
+        asset={asset}
+        open={permanentDeleteOpen}
+        submitting={deletingPermanently}
+        error={permanentDeleteError}
+        onConfirm={handlePermanentDelete}
+        onCancel={() => {
+          setPermanentDeleteOpen(false);
+          setPermanentDeleteError(null);
+        }}
       />
 
       <ConfirmModal

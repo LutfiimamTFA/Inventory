@@ -29,8 +29,11 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronsRight,
+  Trash2,
 } from "lucide-react";
 import { db } from "@/lib/firebase";
+import { deleteAssetPermanently, DeleteAssetError } from "@/lib/assets/delete-asset";
+import PermanentDeleteAssetModal from "@/components/PermanentDeleteAssetModal";
 import { useAuth } from "@/lib/auth-context";
 import { Asset, AssetCategory } from "@/lib/types";
 import {
@@ -96,7 +99,7 @@ function AssetsPageContent() {
   const isLocationPicScoped = role === "location_pic" || isLocationPicRole;
   // Section H/I — resolve nama asli PIC/custodian dari direktori karyawan
   // kalau custodianName asset kebetulan cuma email/kosong (data lama).
-  const employeeDirectory = useEmployeeDirectory();
+  const employeeDirectory = useEmployeeDirectory(authReady);
   const custodianDisplay = (a: Asset) =>
     getResolvedPersonDisplay(
       { name: a.custodianName || a.picName || a.responsiblePersonName, email: a.custodianEmail || a.picEmail, uid: a.custodianUid || a.picUid },
@@ -156,6 +159,9 @@ function AssetsPageContent() {
   const [assetsLoading, setAssetsLoading] = useState(true);
   const [deactivateTarget, setDeactivateTarget] = useState<Asset | null>(null);
   const [processing, setProcessing] = useState(false);
+  const [permanentDeleteTarget, setPermanentDeleteTarget] = useState<Asset | null>(null);
+  const [deletingPermanently, setDeletingPermanently] = useState(false);
+  const [permanentDeleteError, setPermanentDeleteError] = useState<string | null>(null);
   const [qrLabelTarget, setQrLabelTarget] = useState<Asset | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkModalOpen, setBulkModalOpen] = useState(false);
@@ -581,6 +587,39 @@ function AssetsPageContent() {
       setDeactivateTarget(null);
     } finally {
       setProcessing(false);
+    }
+  };
+
+  // Section "Hapus Permanen Asset" — proteksi role SEBENARNYA ada di server
+  // (src/app/api/assets/[id]/route.ts). List ini pakai onSnapshot, jadi baris
+  // asset yang dihapus otomatis hilang begitu Firestore commit — tidak perlu
+  // refetch manual.
+  const handlePermanentDelete = async () => {
+    if (!permanentDeleteTarget || !firebaseUser) return;
+    setDeletingPermanently(true);
+    setPermanentDeleteError(null);
+    try {
+      await deleteAssetPermanently(firebaseUser, permanentDeleteTarget.id);
+      setPermanentDeleteTarget(null);
+      setPageToast({ type: "success", message: "Asset berhasil dihapus permanen." });
+    } catch (error) {
+      const err = error instanceof DeleteAssetError ? error : null;
+      // Section "Perbaiki Console Error kosong" — 401/403/404/409 adalah
+      // PENOLAKAN YANG DIHARAPKAN (bukan bug: user tidak berizin, asset
+      // sudah tidak ada, atau masih ada dependency aktif) — pakai warn
+      // supaya tidak memicu overlay error Next.js yang dirancang untuk
+      // exception tak terduga. Kegagalan lain (500/network) tetap error.
+      const isExpectedRejection = !!err && [401, 403, 404, 409].includes(err.status);
+      const logFn = isExpectedRejection ? console.warn : console.error;
+      logFn(`[Assets List] gagal menghapus asset permanen: ${err?.message || String(error)}`, {
+        assetId: permanentDeleteTarget.id,
+        errorCode: err?.code || "UNKNOWN",
+        errorMessage: err?.message || String(error),
+        status: err?.status ?? null,
+      });
+      setPermanentDeleteError(err?.message || "Gagal menghapus asset.");
+    } finally {
+      setDeletingPermanently(false);
     }
   };
 
@@ -1154,6 +1193,19 @@ function AssetsPageContent() {
                             <Power size={15} />
                           </button>
                         )}
+                        {role === "super_admin" && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPermanentDeleteError(null);
+                              setPermanentDeleteTarget(a);
+                            }}
+                            title="Hapus Permanen"
+                            className="p-1.5 rounded-lg cursor-pointer transition-colors hover:bg-red-50 text-slate-500 hover:text-red-700"
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -1426,6 +1478,18 @@ function AssetsPageContent() {
         danger
         onConfirm={handleDeactivate}
         onCancel={() => setDeactivateTarget(null)}
+      />
+
+      <PermanentDeleteAssetModal
+        asset={permanentDeleteTarget}
+        open={!!permanentDeleteTarget}
+        submitting={deletingPermanently}
+        error={permanentDeleteError}
+        onConfirm={handlePermanentDelete}
+        onCancel={() => {
+          setPermanentDeleteTarget(null);
+          setPermanentDeleteError(null);
+        }}
       />
 
       {qrLabelTarget && (

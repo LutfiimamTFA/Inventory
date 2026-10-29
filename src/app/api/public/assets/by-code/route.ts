@@ -3,6 +3,7 @@ import { ASSET_STATUS_LABEL, getAssetConditionLabel } from "@/lib/utils";
 import { getAssetNumber, getAssetQuantity } from "@/lib/assets/inventory";
 import { resolveAssetPhotoSrc } from "@/lib/assets/asset-status";
 import { Asset } from "@/lib/types";
+import { findAssetByCode as findAssetByCodeShared } from "@/app/api/public/_lib/findAssetByCode";
 
 // Section "Perbaiki bug kritis QR Asset public" — route ini WAJIB
 // server-only: hanya Firebase Admin SDK (getAdminFirestore, helper existing
@@ -48,6 +49,42 @@ interface PublicAssetPayload {
   photoDriveFileId: string | null;
   hasActiveIssue: boolean;
   activeIssueTicketNo: string | null;
+  // Section "Halaman Utama Peminjaman Tanpa Login" — field tambahan untuk
+  // alur kios publik (pinjam/kembalikan tanpa login). TETAP tidak ada
+  // uid/email pemegang di sini (lihat whitelist ketat di bawah) — hanya
+  // nama+divisi, cukup untuk ditampilkan sebagai konfirmasi di alur
+  // Kembalikan Barang.
+  trackingMode: string | null;
+  isBorrowable: boolean;
+  borrowAvailability: PublicBorrowAvailability;
+  currentHolderName: string | null;
+  currentHolderDivision: string | null;
+  currentBorrowingId: string | null;
+}
+
+// Section — status gabungan (trackingMode + currentUsageStatus/assetStatus)
+// yang sudah dihitung SERVER-SIDE supaya client publik (PublicBorrowLanding)
+// tidak perlu menduplikasi aturan bisnis "kapan aset boleh dipinjam" sendiri.
+type PublicBorrowAvailability =
+  | "available_to_borrow"
+  | "not_borrowable_tracking_mode"
+  | "currently_borrowed"
+  | "unavailable_other";
+
+function computeBorrowAvailability(asset: Asset): PublicBorrowAvailability {
+  if (asset.trackingMode !== "shared_borrowable" || asset.isBorrowable === false) {
+    return "not_borrowable_tracking_mode";
+  }
+  if (asset.currentUsageStatus === "borrowed" || asset.assetStatus === "borrowed") {
+    return "currently_borrowed";
+  }
+  if (asset.currentUsageStatus && asset.currentUsageStatus !== "available") {
+    return "unavailable_other";
+  }
+  if (asset.assetStatus !== "available") {
+    return "unavailable_other";
+  }
+  return "available_to_borrow";
 }
 
 // Section 7 "Perbaiki serializer" — SETIAP field dibungkus try/catch
@@ -109,6 +146,16 @@ function toPublicAssetPayload(id: string, asset: Asset): PublicAssetPayload {
       "hasActiveIssue"
     ),
     activeIssueTicketNo: safeField(() => asset.activeIssueTicketNo || null, null, "activeIssueTicketNo"),
+    trackingMode: safeField(() => asset.trackingMode || null, null, "trackingMode"),
+    isBorrowable: safeField(() => asset.isBorrowable !== false, true, "isBorrowable"),
+    borrowAvailability: safeField(
+      () => computeBorrowAvailability(asset),
+      "unavailable_other",
+      "borrowAvailability"
+    ),
+    currentHolderName: safeField(() => asset.currentHolderName || asset.currentBorrowerName || null, null, "currentHolderName"),
+    currentHolderDivision: safeField(() => asset.currentHolderDivision || null, null, "currentHolderDivision"),
+    currentBorrowingId: safeField(() => asset.currentBorrowingId || null, null, "currentBorrowingId"),
   };
 }
 
@@ -177,27 +224,8 @@ async function findAssetByCode(code: string): Promise<{ id: string; data: Asset 
   const db = await getAdminDb();
 
   try {
-    console.log("[Public Asset Lookup] QUERY", { collection: "assets", field: "assetCode", code });
-    const byCode = await db.collection("assets").where("assetCode", "==", code).limit(1).get();
-    if (!byCode.empty) {
-      const d = byCode.docs[0];
-      return { id: d.id, data: d.data() as Asset };
-    }
-
-    console.log("[Public Asset Lookup] QUERY", { collection: "assets", field: "qrTagId", code });
-    const byTag = await db.collection("assets").where("qrTagId", "==", code).limit(1).get();
-    if (!byTag.empty) {
-      const d = byTag.docs[0];
-      return { id: d.id, data: d.data() as Asset };
-    }
-
-    console.log("[Public Asset Lookup] QUERY", { collection: "assets", field: "__doc_id__", code });
-    const byId = await db.collection("assets").doc(code).get();
-    if (byId.exists) {
-      return { id: byId.id, data: byId.data() as Asset };
-    }
-
-    return null;
+    console.log("[Public Asset Lookup] QUERY", { collection: "assets", code });
+    return await findAssetByCodeShared(db, code);
   } catch (error) {
     const err = error as { code?: unknown; message?: unknown };
     throw new PublicAssetApiError(
